@@ -8,6 +8,49 @@ This distribution contains the engine, a neutral example configuration,
 Git hooks, scheduler templates and tests. Private corpora, configuration,
 integration fixtures and historical documents are not part of the package.
 
+## Why this exists
+
+The author works with a coding assistant across several agents (Claude
+Code in a terminal and a desktop app, Codex, a Telegram bot) and several
+machines, for a personal life and for more than one client at a time.
+Every agent kept its own memory, or none, and the useful facts lived in
+chat transcripts. Svod grew out of a short list of requirements that no
+existing tool covered together:
+
+1. **One memory for every agent.** A fact learned in one session must
+   reach the next session of any agent on any machine, without a
+   per-agent store and without pasting notes by hand.
+2. **Plain files a human can read and edit.** Markdown records in Git,
+   diffable, greppable, restorable from any clone. No model, vector
+   database or search service in the read path.
+3. **Clients never mix.** Each client corpus is its own repository; a
+   machine or a corporate tool sees only the repositories it is allowed
+   to clone. A session is pinned to one scope by its first message and
+   never re-routed by a stray mention of another name. Isolation comes
+   from what is not cloned, not from a prompt asking the model to behave.
+4. **A small, deterministic context.** A hook injects the standing rules
+   and at most a couple of matching records per prompt, within a fixed
+   character budget. The selection is lexical and reproducible, so a
+   miss can be explained and measured.
+5. **Writes are validated, not trusted.** A record is accepted only when
+   the same selection that serves prompts can find it (`probe`), when it
+   carries a source and an observation date, when links resolve, when
+   sections fit their delivery caps, and when a regression stand over
+   known questions does not get worse.
+6. **Secrets stay on the machine.** Added lines and every outgoing commit
+   range are scanned before a push; without a scanner nothing is pushed.
+7. **Machines converge without a human.** A timer fetches, rebases,
+   verifies and pushes; ordinary divergence resolves itself, a real
+   conflict is named in words and left to a person. `saved` means the
+   server accepted the commit, not that a file was written locally.
+8. **Nothing to back up except Git.** Pending candidates and caches are
+   the only state outside the repositories; a fresh clone plus the hooks
+   is a working installation.
+
+The design decisions behind these points, and what was tried and removed,
+are kept in the author's private notes; the engine here is the part that
+does not depend on any particular corpus.
+
 ## Requirements
 
 Linux or macOS, Python 3.10+, Git, and gitleaks supporting `detect` and
