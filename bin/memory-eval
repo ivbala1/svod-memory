@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Стенд памяти: тридцать вопросов и двенадцать отрицательных.
+
+  memory-eval run        прогон по живой федерации, сводка (--json полностью)
+  memory-eval baseline   записать прогон исходной точкой и закоммитить её в конфигурации
+  memory-eval compare    прогон и попарное сравнение с исходной точкой
+  memory-eval selfcheck  заведомая поломка: стенд обязан её поймать
+"""
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+import memoryeval as ev  # noqa: E402
+from memorycontext import default_root  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="memory-eval")
+    parser.add_argument("command", choices=("run", "baseline", "compare", "selfcheck"))
+    parser.add_argument("--root", type=Path, default=default_root())
+    parser.add_argument("--json", action="store_true", help="полный результат в JSON")
+    args = parser.parse_args()
+    root = args.root.expanduser().resolve()
+    if args.command == "selfcheck":
+        итог = ev.selfcheck(root)
+        print(json.dumps(итог, ensure_ascii=False, indent=1))
+        return 0 if итог["ok"] else 1
+    результат = ev.run(root)
+    сводка = ev.summarize(результат)
+    if args.command == "run":
+        print(json.dumps(результат if args.json else сводка, ensure_ascii=False, indent=1))
+        return 0
+    if args.command == "baseline":
+        try:
+            заметки = ev.replace_baseline(результат)
+        except (ev.EvalError, ev.svodgit.GitError, OSError) as exc:
+            print(f"memory-eval: {exc}", file=sys.stderr)
+            return 3
+        for слова in заметки:
+            print(слова)
+        print(json.dumps(сводка, ensure_ascii=False, indent=1))
+        return 0
+    if not ev.BASELINE_PATH.is_file():
+        print("memory-eval: исходная точка не снята, запусти baseline", file=sys.stderr)
+        return 2
+    базис = json.loads(ev.BASELINE_PATH.read_text(encoding="utf-8"))
+    сравнение = ev.compare(базис, результат)
+    print(json.dumps({"сводка": сводка, "сравнение": сравнение}, ensure_ascii=False, indent=1))
+    return 0 if сравнение["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

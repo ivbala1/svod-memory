@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""pre-commit для ручного git в репозитории памяти: дерево индекса
+проверяется тем же модулем, что у писателя, против дерева HEAD. Вид корня
+берётся из .svod.json. Движок на хук не полагается: свои коммиты он
+проверяет сам до commit-tree."""
+from pathlib import Path
+import os
+import sys
+
+ENGINE = Path(__file__).resolve().parents[1]
+os.environ.setdefault("MEMORY_CONFIG_DIR", str(Path.home() / ".agent-memory-config"))
+sys.path.insert(0, str(ENGINE / "lib"))
+
+import memoryremember  # noqa: E402
+import svodgit  # noqa: E402
+
+
+def main() -> int:
+    root = Path(svodgit.out(Path.cwd(), "rev-parse", "--show-toplevel"))
+    scope = svodgit.read_marker(root)
+    if scope is None:
+        print(f"pre-commit: в {root} нет {svodgit.MARKER_NAME}; это не репозиторий памяти Свода",
+              file=sys.stderr)
+        return 1
+    tree = svodgit.write_tree(root)
+    head = svodgit.head(root)
+    if head and tree == svodgit.tree_of(root, head):
+        return 0
+    report = memoryremember.verify_trees(root, scope, tree, head, memoryremember.load_config(),
+                                         None, None)
+    # Предупреждения только по файлам этого коммита: старые сироты вики-ссылок
+    # в нетронутых файлах каждый коммит перечислять незачем.
+    changed = set(svodgit.out(root, "diff", "--cached", "--name-only").splitlines())
+    for line in report.warnings:
+        if line.split(":", 1)[0] in changed:
+            print(f"pre-commit: предупреждение: {line}", file=sys.stderr)
+    if report.ok:
+        return 0
+    print("pre-commit: коммит отклонён проверками памяти:", file=sys.stderr)
+    for line in report.errors:
+        print(f"  {line}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,74 @@
+{
+  "federationMembers": [
+    "acme"
+  ],
+  "topics": {
+    "acme": {
+      "rollup": "acme.md",
+      "owner": "clients/acme",
+      "label": "Acme",
+      "tokens": [
+        "acme"
+      ],
+      "hotKeep": [],
+      "aliases": [
+        "acme"
+      ],
+      "cwdNames": [
+        "acme"
+      ],
+      "cwdPrefixes": [],
+      "defaultSections": [
+        "обзор"
+      ],
+      "sectionTerms": {
+        "обзор": [
+          "обзор",
+          "устройств*"
+        ],
+        "доступы": [
+          "доступ*",
+          "ssh"
+        ]
+      }
+    },
+    "home": {
+      "rollup": "home.md",
+      "label": "Home",
+      "tokens": [
+        "home"
+      ],
+      "hotKeep": [],
+      "aliases": [
+        "home"
+      ],
+      "cwdNames": [
+        "home"
+      ],
+      "cwdPrefixes": [],
+      "defaultSections": [
+        "обзор"
+      ],
+      "sectionTerms": {
+        "обзор": [
+          "обзор"
+        ]
+      }
+    }
+  },
+  "topicOrder": [
+    "acme",
+    "home"
+  ],
+  "scopeRoots": {
+    "personal": [
+      "~/src"
+    ],
+    "acme": [
+      "~/src-work/acme"
+    ],
+    "home": [
+      "~/notes"
+    ]
+  }
+}

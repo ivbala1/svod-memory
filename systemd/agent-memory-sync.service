@@ -1,0 +1,25 @@
+[Unit]
+Description=Shared agent memory synchronization
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsDirectory=%h/.agent-memory/global/.git
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+UMask=0077
+Environment=MEMORY_REPO=%h/.agent-memory
+Environment=MEMORY_CONFIG_DIR=%h/.agent-memory-config
+Environment=MEMORYCTL_STATE_DIR=%h/.local/state/agent-memory
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/src/svod
+ExecStart=%h/src/svod/bin/memory-sync
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.agent-memory %h/.local/state/agent-memory
+LockPersonality=true
+RestrictSUIDSGID=true

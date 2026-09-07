@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Шаблон LaunchAgent для macOS. install.sh подставляет @@HOME@@ и кладёт
+  результат в ~/Library/LaunchAgents/com.ivbala.agent-memory-sync.plist.
+
+  Почему именно так:
+  - launchd не раскрывает ~ и переменные внутри plist, поэтому пути абсолютные;
+  - StartCalendarInterval объединяет пропущенные срабатывания и запускается
+    один раз после пробуждения, тогда как StartInterval их просто теряет;
+  - PATH задан явно: launchd не наследует окружение shell, а memory-sync
+    вызывает git и gitleaks, причём Homebrew на Apple Silicon ставит их
+    в /opt/homebrew/bin;
+  - MEMORY_REPO и MEMORYCTL_STATE_DIR намеренно НЕ заданы: программы
+    вычисляют их сами, а расхождение с интерактивной командой развело бы
+    замок и состояние по разным каталогам;
+  - режима нет: таймер публикует всегда (решение владельца 04.09.2026),
+    машина без ключа push получает отказ сети словами в статусе.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ivbala.agent-memory-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@HOME@@/src/svod/bin/memory-sync</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@@HOME@@/src/svod</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@@HOME@@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>MEMORY_CONFIG_DIR</key>
+        <string>@@HOME@@/.agent-memory-config</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Minute</key><integer>45</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>Umask</key>
+    <string>0077</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>@@HOME@@/Library/Logs/agent-memory-sync.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@@HOME@@/Library/Logs/agent-memory-sync.log</string>
+</dict>
+</plist>
