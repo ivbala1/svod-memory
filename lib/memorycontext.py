@@ -24,6 +24,7 @@ from memoryctl import (
     federation_roots,
     parse_frontmatter,
     reader_lock,
+    reader_locks,
     require_repo,
     utc_now,
 )
@@ -207,7 +208,9 @@ def _load_topics() -> dict[str, TopicSpec]:
     try:
         TOPICS_RAW = path.read_bytes()
     except OSError as exc:
-        raise MemoryctlError(f"не читается конфиг тем {path}: {exc}") from exc
+        hint = "" if os.environ.get(configpaths.CONFIG_ENV) else (
+            f"; задай {configpaths.CONFIG_ENV} (каталог конфигурации с topics.json)")
+        raise MemoryctlError(f"не читается конфиг тем {path}: {exc}{hint}") from exc
     return parse_topics(TOPICS_RAW, path)
 
 
@@ -305,7 +308,15 @@ def parse_topics(raw_bytes: bytes, path) -> dict[str, TopicSpec]:
 
 
 TOPICS_RAW: bytes = b""
-TOPICS: dict[str, TopicSpec] = _load_topics()
+TOPICS_ERROR: str | None = None
+try:
+    TOPICS: dict[str, TopicSpec] = _load_topics()
+except MemoryctlError as _error:
+    # Конфигурации нет или она битая. Модуль всё равно импортируется, чтобы
+    # хук ответил мягким блоком, а команды словами; без тем работа невозможна,
+    # и каждый вход обязан проверить TOPICS_ERROR.
+    TOPICS = {}
+    TOPICS_ERROR = str(_error)
 _READER_FEDERATION: dict = {}
 
 
@@ -636,6 +647,12 @@ def today_utc() -> dt.date:
     return dt.datetime.now(dt.timezone.utc).date()
 
 
+# Шапка читается в пределах допустимого размера записи (потолок писателя
+# 256 КиБ): короткий срез в 4 096 символов терял valid_until и ссылки
+# замещения у записей с длинным крючком, и роутер отдавал просроченное.
+HEADER_READ_LIMIT = 262_144
+
+
 def _entry_expired(root: Path, entry: IndexEntry, today: dt.date) -> bool:
     """Истёк ли valid_until записи. Семантика границы: запись действительна
     ПО дату valid_until включительно (UTC), просрочена со следующего дня.
@@ -645,7 +662,7 @@ def _entry_expired(root: Path, entry: IndexEntry, today: dt.date) -> bool:
     if target is None or not target.is_file():
         return False
     try:
-        fields, _ = parse_frontmatter(_read_limited(target, 4_096))
+        fields, _ = parse_frontmatter(_read_limited(target, HEADER_READ_LIMIT))
     except OSError:
         return False
     значение = fields.get("valid_until")
@@ -676,7 +693,7 @@ def resolve_final_successor(root: Path, slug: str) -> str | None:
         if файл.parent.name != "archive":
             активные.add(собственный)
         try:
-            поля, _ = parse_frontmatter(_read_limited(файл, 4_096))
+            поля, _ = parse_frontmatter(_read_limited(файл, HEADER_READ_LIMIT))
         except OSError:
             continue
         цель = поля.get("supersedes")
@@ -703,7 +720,7 @@ def _entry_link_fields(root: Path, slug_md: str) -> dict[str, tuple[str, ...]]:
     if target is None or not target.is_file():
         return {}
     try:
-        поля, _ = parse_frontmatter(_read_limited(target, 4_096))
+        поля, _ = parse_frontmatter(_read_limited(target, HEADER_READ_LIMIT))
     except OSError:
         return {}
     результат: dict[str, tuple[str, ...]] = {}
@@ -1276,9 +1293,45 @@ def _clear_pin(state_dir: Path, session_id: str) -> None:
         pass
 
 
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+
+def scan_code_fences(lines) -> tuple[list[bool], bool]:
+    """(маска, открыт ли блок в конце). True в маске у строк ограждённого
+    кода, включая сами ограждения. Правила CommonMark: открывающее из
+    обратных кавычек не содержит их в строке-описании, закрывающее того же
+    знака не короче открывшего и без хвоста; четыре кавычки могут содержать
+    пример из трёх."""
+    mask = []
+    open_char, open_len = None, 0
+    for line in lines:
+        match = _FENCE_RE.match(line)
+        if open_char is None:
+            if match and not (match.group(1)[0] == "`" and "`" in line[match.end():]):
+                open_char, open_len = match.group(1)[0], len(match.group(1))
+                mask.append(True)
+            else:
+                mask.append(False)
+            continue
+        mask.append(True)
+        if match and match.group(1)[0] == open_char and len(match.group(1)) >= open_len \
+                and not line[match.end():].strip():
+            open_char, open_len = None, 0
+    return mask, open_char is not None
+
+
+def code_fence_mask(lines) -> list[bool]:
+    return scan_code_fences(lines)[0]
+
+
 def parse_sections(text: str) -> tuple[MarkdownSection, ...]:
+    """Разделы по заголовкам `## `; строка `## …` внутри ограждённого кода
+    заголовком не считается, иначе хвост раздела уезжал бы в раздел-призрак,
+    который роутер никогда не выберет. Та же маска у писателя указателей."""
     lines = text.splitlines(keepends=True)
-    starts = [index for index, line in enumerate(lines) if re.match(r"^##\s+", line)]
+    fenced = code_fence_mask(lines)
+    starts = [index for index, line in enumerate(lines)
+              if not fenced[index] and re.match(r"^##\s+", line)]
     sections = []
     for order, start in enumerate(starts):
         end = starts[order + 1] if order + 1 < len(starts) else len(lines)
@@ -1696,7 +1749,9 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
                 # разных клиентских роллапа. Продолжать такую сессию нельзя.
                 pin_failed = _pinned_scope(state_dir, session_id) is None
         global_root, personal_root = index_roots(root)
-        with reader_lock(personal_root or global_root):
+        # Замки на все корни чтения: сводка темы приходит из клиентского
+        # корня, а его писатель держит только свой замок.
+        with reader_locks(reader_federation(root).available_roots):
             index = (personal_root or global_root) / "memory" / "MEMORY.md"
             if not index.is_file():
                 raise FileNotFoundError(index)
@@ -1782,7 +1837,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
         session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
         scope_hint = os.environ.get("AGENT_MEMORY_SCOPE_HINT", "")
         global_root, personal_root = index_roots(root)
-        with reader_lock(personal_root or global_root):
+        with reader_locks(reader_federation(root).available_roots):
             index = (personal_root or global_root) / "memory" / "MEMORY.md"
             if not index.is_file():
                 raise FileNotFoundError(index)
@@ -1913,6 +1968,8 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
 
 def process_json(command: str, raw: str, root: Path, state_dir: Path) -> dict:
     event = SESSION_EVENT if command in ("session-start", "session") else PROMPT_EVENT
+    if TOPICS_ERROR:
+        return _fail_soft(event, TOPICS_ERROR)
     try:
         payload = json.loads(raw)
         if not isinstance(payload, dict):

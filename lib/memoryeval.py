@@ -70,6 +70,10 @@ MEASUREMENT_FILES = (
     Path(__file__),
     HERE / "topiclayout.py",
     HERE / "configpaths.py",
+    # Шапки записей (заголовок, крючок, срок) разбирает memoryverify, а
+    # memoryctl его реэкспортирует: правка разбора меняет ранги.
+    HERE / "memoryverify.py",
+    HERE / "memoryctl.py",
     configpaths.config_path("topics.json"),
 )
 

@@ -218,6 +218,15 @@ class Base(unittest.TestCase):
     def failed(self, machine: str, scope: str = "personal") -> list[Path]:
         return sorted(svodgit.failed_dir(scope, self.fed.states[machine]).glob("*.json"))
 
+    def manual_commit(self, root: Path, path: str, data: bytes, message: str,
+                      no_verify: bool = False) -> str:
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        sh(root, "add", "-A", "--", path)
+        sh(root, "commit", "--quiet", *(["--no-verify"] if no_verify else []), "-m", message)
+        return svodgit.head(root)
+
 
 NEW_BODY = fresh_record("reference_kettle", "как кипятить воду в чайнике",
                         "кипятить воду чайник", "Чайник кипятит воду.\n")
@@ -500,15 +509,6 @@ class WriterTests(Base):
 
 
 class SyncTests(Base):
-    def manual_commit(self, root: Path, path: str, data: bytes, message: str,
-                      no_verify: bool = False) -> str:
-        target = root / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        sh(root, "add", "-A", "--", path)
-        sh(root, "commit", "--quiet", *(["--no-verify"] if no_verify else []), "-m", message)
-        return svodgit.head(root)
-
     def test_server_ahead_is_fast_forwarded(self):
         self.fed.remember("a", "personal", "kettle-1", NEW_BODY, {"record_slug": "reference_kettle"})
         root_b = self.fed.root("b")
@@ -819,3 +819,326 @@ class SplitTests(Base):
         outcomes = ms.sync_all(data_root=data, today=TODAY, state=self.fed.states["c"])
         self.assertEqual({o["scope"] for o in outcomes}, {"global", "clients/acme"})
         self.assertTrue(all(not o["problems"] for o in outcomes), outcomes)
+
+
+class ReviewRegressionTests(Base):
+    """Ревью публикации 07.09.2026: каждый тест это воспроизведённый дефект."""
+
+    def _older_pythons(self) -> list[str]:
+        found = []
+        for name in ("python3.10", "python3.11"):
+            path = shutil.which(name)
+            if path:
+                found.append(path)
+        for path in sorted(Path.home().glob(".local/share/uv/python/cpython-3.1[01]*/bin/python3.1?")):
+            found.append(str(path))
+        return found
+
+    def test_sources_compile_on_python_310_and_311(self):
+        interpreters = self._older_pythons()
+        if not interpreters:
+            self.skipTest("нет интерпретатора 3.10/3.11 для проверки синтаксиса")
+        files = [f for f in (*(REPO_SOURCE / "lib").glob("*.py"), *(REPO_SOURCE / "bin").iterdir(),
+                             *(REPO_SOURCE / "githooks").iterdir(), *(REPO_SOURCE / "tests").glob("*.py"))
+                 if f.is_file()]
+        for python in interpreters:
+            for file in files:
+                result = subprocess.run([python, "-m", "py_compile", str(file)],
+                                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertEqual(result.returncode, 0, f"{python}: {file.name}: {result.stderr}")
+
+    def test_manual_rebase_is_left_to_the_operator(self):
+        root_b = self.fed.root("b")
+        path = "memory/reference_printer.md"
+        self.manual_commit(root_b, path, fresh_record(
+            "reference_printer", "как чинить зелёный принтер", "чем чинить принтер",
+            "Версия Б: зелёный принтер.\n"), "memory: printer-b")
+        self.fed.remember("a", "personal", "printer-a", fresh_record(
+            "reference_printer", "как чинить зелёный принтер", "чем чинить принтер",
+            "Версия А: зелёный принтер.\n"), {"record_slug": "reference_printer"})
+        sh(root_b, "fetch", "--quiet", "origin")
+        rebase = subprocess.run(["git", "-C", str(root_b), "rebase", "origin/main"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(rebase.returncode, 0, "конфликт ожидался")
+        self.assertTrue(svodgit.rebase_in_progress(root_b))
+        resolved = fresh_record("reference_printer", "как чинить зелёный принтер",
+                                "чем чинить принтер", "Версии А и Б сведены: зелёный принтер.\n")
+        (root_b / path).write_bytes(resolved)
+        sh(root_b, "add", "--", path)
+        outcome = self.fed.sync("b")
+        self.assertTrue(svodgit.rebase_in_progress(root_b), "таймер не отменил ручной rebase")
+        self.assertTrue(any("ручной rebase" in p for p in outcome["problems"]), outcome)
+        self.assertEqual((root_b / path).read_bytes(), resolved, "разрешение конфликта цело")
+        code, result = self.fed.remember("b", "personal", "kettle-1", NEW_BODY,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        self.assertIn("ручной rebase", result["reason"])
+        self.assertTrue(svodgit.rebase_in_progress(root_b))
+        env = dict(os.environ, GIT_EDITOR="true")
+        subprocess.run(["git", "-C", str(root_b), "rebase", "--continue"], check=True, env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        outcome = self.fed.sync("b")
+        self.assertEqual(outcome["problems"], [], outcome)
+        self.assertEqual(svodgit.branch(root_b), "main")
+        self.assertIn("сведены".encode("utf-8"), self.fed.origin_tree()[path])
+
+    def test_writer_does_not_publish_unverified_commit_ahead_of_server(self):
+        root_b = self.fed.root("b")
+        self.manual_commit(root_b, "memory/reference_bad.md",
+                           record("reference_bad", type="reference", title="Плохая",
+                                  index="плохая запись без источника",
+                                  probe="что за плохая запись без источника",
+                                  body="Без происхождения.\n"),
+                           "memory: bad", no_verify=True)
+        code, result = self.fed.remember("b", "personal", "kettle-1", NEW_BODY,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        self.assertIn("красное", result["reason"])
+        self.assertNotIn("memory/reference_bad.md", self.fed.origin_tree())
+        self.assertNotIn("memory/reference_kettle.md", self.fed.origin_tree())
+
+    def test_check_that_cannot_run_is_a_refusal_with_words(self):
+        root = self.fed.root("a", "clients/acme")
+        self.manual_commit(root, "memory/topics/acme.md",
+                           b"# Acme\n\n## \xd0\x9e\xd0\xb1\xd0\xb7\xd0\xbe\xd1\x80\n\n\xff\xfe\n",
+                           "rollup broken", no_verify=True)
+        code, result = self.fed.remember(
+            "a", "clients/acme", "acme-1",
+            fresh_record("reference_gate", "как открыть ворота", "открыть ворота", "Кодом.\n"),
+            {"record_slug": "reference_gate", "index_line": "- [Ворота](reference_gate.md) - как открыть",
+             "index_section": "Обзор"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertIn("проверка не выполнилась", result["reason"])
+        self.assertEqual(len(self.failed("a", "clients/acme")), 1)
+        self.assertEqual(self.pending("a", "clients/acme"), [])
+        self.assertEqual(svodgit.dirty_paths(root), set())
+        outcome = self.fed.sync("a", "clients/acme")
+        self.assertNotIn("traceback", outcome)
+
+    def test_refusal_before_candidate_is_recorded_in_failed(self):
+        body = fresh_record("reference_gate", "как открыть ворота", "открыть ворота", "Кодом.\n")
+        code, result = self.fed.remember("a", "clients/acme", "acme-1", body,
+                                         {"record_slug": "reference_gate", "index_line": "- [Ворота](reference_gate.md) - x"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertEqual(len(self.failed("a", "clients/acme")), 1)
+        self.assertIn("index_section", svodgit.read_json(self.failed("a", "clients/acme")[0])["reason"])
+        code, result = self.fed.remember("a", "personal", "../x", NEW_BODY, {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertNotIn("file", result, "небезопасный id файла не получает")
+        self.assertEqual(self.failed("a"), [])
+
+    def test_pointer_moves_to_the_named_section(self):
+        rollup = "# Acme\n\n## Обзор\n\nЗаказчик.\n\n## Доступы\n\n- [Ворота](reference_gate.md) - старый\n"
+        new = mr.insert_rollup_pointer(rollup, "Обзор", "- [Ворота](reference_gate.md) - новый")
+        self.assertEqual(new, "# Acme\n\n## Обзор\n\nЗаказчик.\n- [Ворота](reference_gate.md) - новый\n\n## Доступы\n\n")
+        same = mr.insert_rollup_pointer(rollup, "Доступы", "- [Ворота](reference_gate.md) - новый")
+        self.assertIn("- новый\n", same)
+        self.assertNotIn("- старый", same)
+        with self.assertRaises(mr.Refusal):
+            mr.insert_rollup_pointer(rollup, "Нет такого", "- [Ворота](reference_gate.md) - новый")
+
+    def test_base_is_taken_from_main_not_from_a_detached_head(self):
+        root_a = self.fed.root("a")
+        self.fed.remember("a", "personal", "kettle-1", NEW_BODY, {"record_slug": "reference_kettle"})
+        sh(root_a, "checkout", "--quiet", "--detach", "HEAD~1")
+        updated = fresh_record("reference_kettle", "как кипятить воду в чайнике",
+                               "кипятить воду чайник", "Чайник: версия два.\n")
+        code, result = self.fed.remember("a", "personal", "kettle-2", updated,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_SAVED, result)
+        self.assertIn("версия два".encode("utf-8"), self.fed.origin_tree()["memory/reference_kettle.md"])
+
+    def test_git_pathspecs_are_literal(self):
+        root_a = self.fed.root("a")
+        (root_a / "memory" / "reference_star.md").write_bytes(NEW_BODY)
+        result = svodgit.git(root_a, "add", "-A", "--", "memory/*.md", check=False)
+        self.assertNotEqual(result.returncode, 0, "шаблон не раскрылся в имена записей")
+        self.assertEqual(sh(root_a, "diff", "--cached", "--name-only"), "")
+
+    def test_missing_config_is_words_not_a_traceback(self):
+        env = dict(os.environ)
+        env.pop("MEMORY_CONFIG_DIR", None)
+        env["MEMORY_REPO"] = str(self.fed.machines["a"])
+        env["MEMORYCTL_STATE_DIR"] = str(self.fed.states["a"])
+        hook = subprocess.run([sys.executable, str(REPO_SOURCE / "bin" / "memory-context"), "session-start"],
+                              input='{"session_id": "s1", "cwd": "/"}', text=True, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertIn("временно недоступна", hook.stdout)
+        self.assertIn("MEMORY_CONFIG_DIR", hook.stdout)
+        self.assertNotIn("Traceback", hook.stderr)
+        status = subprocess.run([sys.executable, str(REPO_SOURCE / "bin" / "memory"), "status"],
+                                text=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(status.returncode, 0)
+        self.assertIn("MEMORY_CONFIG_DIR", status.stderr)
+        self.assertNotIn("Traceback", status.stderr)
+
+    def test_status_names_a_data_directory_without_git(self):
+        shutil.rmtree(self.fed.root("a", "clients/acme") / ".git")
+        result = ms.status(data_root=self.fed.machines["a"], state=self.fed.states["a"])
+        self.assertFalse(result["ok"])
+        acme = next(r for r in result["repos"] if r["scope"] == "clients/acme")
+        self.assertIn("без git-репозитория", acme["problem"])
+
+    def test_long_header_keeps_expiry_and_fenced_headings_are_not_sections(self):
+        import memorycontext as mc
+        root_a = self.fed.root("a")
+        probe = "как открыть ворота " * 300
+        (root_a / "memory" / "reference_gate.md").write_bytes(record(
+            "reference_gate", type="reference", title="Ворота", index="как открыть ворота",
+            source="разговор", observed_at="2026-09-04", probe=f'"{probe.strip()}"',
+            valid_until="2020-01-01", body="Кодом.\n"))
+        entry = next(e for e in mc.parse_index(mc.build_index(root_a))
+                     if e.slug.removesuffix(".md") == "reference_gate")
+        self.assertTrue(mc._entry_expired(root_a, entry, TODAY), "длинная шапка не прячет срок")
+        sections = mc.parse_sections("## Обзор\n\n```sh\n## не заголовок\n```\nхвост\n\n## Доступы\n\nssh\n")
+        self.assertEqual([s.title for s in sections], ["Обзор", "Доступы"])
+        self.assertIn("хвост", sections[0].text)
+
+    def test_measurement_fingerprint_covers_the_header_parser(self):
+        import memoryeval
+        covered = {p.resolve() for p in memoryeval.MEASUREMENT_FILES}
+        self.assertIn(Path(mv.__file__).resolve(), covered)
+
+    def test_unreachable_records_tolerate_a_non_utf8_rollup(self):
+        orphans = mv.unreachable_records({"memory/topics/acme.md": b"\xff\xfe## x\n",
+                                          "memory/reference_gate.md": b"---\n---\n"},
+                                         {"topics/acme.md"})
+        self.assertIn("reference_gate.md", orphans)
+
+    def test_reader_locks_wait_for_a_client_writer(self):
+        import threading
+        import time
+        import memoryctl
+        root = self.fed.root("a", "clients/acme")
+        released = threading.Event()
+
+        def hold():
+            with svodgit.lock(root, exclusive=True):
+                time.sleep(1.0)
+            released.set()
+
+        worker = threading.Thread(target=hold)
+        worker.start()
+        time.sleep(0.2)
+        started = time.monotonic()
+        with memoryctl.reader_locks([self.fed.root("a"), root]):
+            self.assertTrue(released.is_set(), "чтение началось только после писателя")
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        worker.join()
+
+    def test_push_timeout_covers_the_hook_scanner(self):
+        self.assertGreaterEqual(svodgit.PUSH_TIMEOUT_SEC,
+                                svodgit.NETWORK_TIMEOUT_SEC + svodgit.SCANNER_TIMEOUT_SEC)
+
+
+class CodexRoundTests(Base):
+    """Замечания независимой проверки 07.09.2026 к правкам по ревью."""
+
+    def test_early_refusal_keeps_a_waiting_candidate(self):
+        root_a = self.fed.root("a")
+        sh(root_a, "remote", "set-url", "origin", str(self.fed.base / "nowhere.git"))
+        code, _ = self.fed.remember("a", "personal", "kettle-1", NEW_BODY, {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING)
+        other = fresh_record("reference_toaster", "как поджарить хлеб", "поджарить хлеб", "Тостер.\n")
+        code, result = self.fed.remember("a", "personal", "kettle-1", other, {"record_slug": "reference_toaster"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertIn("другим телом", result["reason"])
+        self.assertEqual(len(self.pending("a")), 1, "ожидающий кандидат не стёрт ранним отказом")
+        self.assertEqual(self.failed("a"), [])
+
+    def test_partial_write_is_rolled_back(self):
+        root_a = self.fed.root("a")
+        manifest = {"changes": [
+            {"operation": "put", "path": "memory/reference_kettle.md", "content": NEW_BODY.decode()},
+            {"operation": "put", "path": "memory/reference_toaster.md",
+             "content": fresh_record("reference_toaster", "как поджарить хлеб", "поджарить хлеб", "Тостер.\n").decode()},
+        ]}
+        original = mr._write
+
+        def broken_write(root, files):
+            first = sorted(files)[0]
+            (root / first).write_bytes(files[first])
+            raise OSError("диск переполнен")
+
+        with mock.patch.object(mr, "_write", broken_write):
+            code, result = self.fed.remember("a", "personal", "pair-1", json.dumps(manifest).encode(),
+                                             content_type="manifest")
+        self.assertIs(mr._write, original)
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertIn("OSError", result["reason"])
+        self.assertEqual(svodgit.dirty_paths(root_a), set(), "начатая запись откачена")
+        self.assertEqual(len(self.failed("a")), 1)
+
+    def test_error_after_commit_keeps_the_candidate_pending(self):
+        root_a = self.fed.root("a")
+        with mock.patch.object(mr, "publish", side_effect=RuntimeError("учёт упал")):
+            code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY, {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        self.assertIn("после коммита", result["reason"])
+        self.assertIn("memory/reference_kettle.md", svodgit.read_tree(root_a, svodgit.head(root_a)))
+        self.assertEqual(self.failed("a"), [])
+        outcome = self.fed.sync("a")
+        self.assertEqual([c["state"] for c in outcome["candidates"]], ["delivered"], outcome)
+        self.assertIn("memory/reference_kettle.md", self.fed.origin_tree())
+
+    def test_pointer_lands_after_the_last_line_of_the_section(self):
+        rollup = "## A\nfirst\nlast\n## B\n- [x](reference_x.md) - старый\n"
+        moved = mr.insert_rollup_pointer(rollup, "A", "- [x](reference_x.md) - новый")
+        self.assertEqual(moved, "## A\nfirst\nlast\n- [x](reference_x.md) - новый\n## B\n")
+
+    def test_fenced_examples_are_neither_sections_nor_pointers(self):
+        import memorycontext as mc
+        text = ("## Обзор\n\n````md\n```\n## пример\n- [x](reference_x.md) - пример\n```\n````\n"
+                "хвост\n\n## Доступы\n\nssh\n")
+        sections = mc.parse_sections(text)
+        self.assertEqual([s.title for s in sections], ["Обзор", "Доступы"])
+        self.assertIn("хвост", sections[0].text)
+        moved = mr.insert_rollup_pointer(text, "Доступы", "- [x](reference_x.md) - новый")
+        self.assertIn("- [x](reference_x.md) - пример\n", moved, "пример в коде не тронут")
+        self.assertTrue(moved.endswith("ssh\n- [x](reference_x.md) - новый\n"), moved)
+
+    def test_unwritable_lock_file_does_not_stop_a_reader(self):
+        import memoryctl
+        root = self.fed.root("a", "clients/acme")
+        lock_file = root / ".git" / svodgit.LOCK_NAME
+        lock_file.touch()
+        lock_file.chmod(0)
+        try:
+            with svodgit.lock(root, exclusive=False) as taken:
+                self.assertIsNone(taken, "замка нет, это не занятость")
+            with memoryctl.reader_locks([self.fed.root("a"), root]) as all_taken:
+                self.assertTrue(all_taken, "чтение без замка там, где замка нет, согласовано")
+            with self.assertRaises(svodgit.GitError):
+                with svodgit.lock(root, exclusive=True):
+                    pass
+        finally:
+            lock_file.chmod(0o600)
+
+    def test_heal_aborts_only_the_engine_marked_rebase(self):
+        root_b = self.fed.root("b")
+        path = "memory/reference_printer.md"
+        self.manual_commit(root_b, path, fresh_record(
+            "reference_printer", "как чинить зелёный принтер", "чем чинить принтер",
+            "Версия Б: зелёный принтер.\n"), "memory: printer-b")
+        self.fed.remember("a", "personal", "printer-a", fresh_record(
+            "reference_printer", "как чинить зелёный принтер", "чем чинить принтер",
+            "Версия А: зелёный принтер.\n"), {"record_slug": "reference_printer"})
+        sh(root_b, "fetch", "--quiet", "origin")
+        subprocess.run(["git", "-C", str(root_b), "rebase", "origin/main"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertTrue(svodgit.rebase_in_progress(root_b))
+        self.assertEqual(svodgit.heal(root_b), [], "чужой rebase без метки не трогается")
+        self.assertTrue(svodgit.rebase_in_progress(root_b))
+        svodgit.engine_rebase_marker(root_b).write_text("x")
+        self.assertEqual(svodgit.heal(root_b), ["rebase --abort"])
+        self.assertFalse(svodgit.rebase_in_progress(root_b))
+        self.assertFalse(svodgit.engine_rebase_marker(root_b).exists())
+        self.assertEqual(svodgit.branch(root_b), "main")
+
+    def test_fence_opener_with_backtick_in_info_is_text_and_unclosed_fence_refuses(self):
+        import memorycontext as mc
+        sections = mc.parse_sections("## A\n```foo`bar\n## B\ntext\n")
+        self.assertEqual([s.title for s in sections], ["A", "B"])
+        with self.assertRaises(mr.Refusal):
+            mr.insert_rollup_pointer("## A\n```\nкод без конца\n", "A", "- [x](reference_x.md) - новый")

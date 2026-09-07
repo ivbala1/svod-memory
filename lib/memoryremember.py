@@ -206,33 +206,51 @@ def index_line_slug(line: str) -> str | None:
 
 
 def insert_rollup_pointer(rollup_text: str, section: str, line: str) -> str:
-    """Строка-указатель в раздел сводки темы: строка этой записи заменяется
-    на месте, иначе дописывается в конец раздела (по заголовку, регистр и
-    краевые пробелы не значимы)."""
+    """Строка-указатель в названный раздел сводки темы (по заголовку, регистр
+    и краевые пробелы не значимы). Прежняя строка этой записи внутри раздела
+    заменяется на месте; строка в другом разделе убирается оттуда, и новая
+    дописывается в конец названного раздела."""
     slug = index_line_slug(line)
     if slug is None:
         raise Refusal("index_line без ссылки на запись указателем не является")
+    import memorycontext as mc
     lines = rollup_text.splitlines()
-    for i, existing in enumerate(lines):
-        if index_line_slug(existing) == slug:
-            lines[i] = line
-            return "\n".join(lines) + ("\n" if rollup_text.endswith("\n") else "")
+    fenced, _open = mc.scan_code_fences(lines)
     wanted = section.strip().casefold()
-    inside, position = False, None
+    start, end = None, len(lines)
     for i, current in enumerate(lines):
-        heading = re.match(r"^##\s+(.+?)\s*$", current)
-        if heading:
-            if inside:
-                break
-            inside = heading.group(1).strip().casefold() == wanted
-            if inside:
-                position = i
+        heading = None if fenced[i] else re.match(r"^##\s+(.+?)\s*$", current)
+        if not heading:
             continue
-        if inside and current.strip():
-            position = i
-    if position is None:
+        if start is not None:
+            end = i
+            break
+        if heading.group(1).strip().casefold() == wanted:
+            start = i
+    if start is None:
         raise Refusal(f"раздела {section!r} нет в сводке темы")
-    lines.insert(position + 1, line)
+    existing = [i for i, current in enumerate(lines)
+                if not fenced[i] and index_line_slug(current) == slug]
+    inside = [i for i in existing if start < i < end]
+    if inside:
+        lines[inside[0]] = line
+        for i in sorted(set(existing) - {inside[0]}, reverse=True):
+            del lines[i]
+    else:
+        for i in sorted(existing, reverse=True):
+            del lines[i]
+            if i < start:
+                start -= 1
+            if i < end:
+                end -= 1
+        position = start
+        for i in range(start + 1, end):
+            if lines[i].strip():
+                position = i
+        if mc.scan_code_fences(lines[start:end])[1]:
+            raise Refusal(f"раздел {section!r} заканчивается незакрытым блоком кода; "
+                          "указатель класть некуда")
+        lines.insert(position + 1, line)
     return "\n".join(lines) + ("\n" if rollup_text.endswith("\n") else "")
 
 
@@ -328,7 +346,10 @@ def submit(*, scope: str, candidate_id: str, source: str, session: str,
     paths = direct_paths(candidate)
     for path in paths:
         require_no_symlinks(root, path)
-    base = base_revision or svodgit.head(root)
+    # Без base_revision основа это ветка main, а не HEAD: посреди rebase
+    # движка вершина отсоединена и мгновенна, и ожидания от неё позже
+    # отказали бы кандидату как «запись менялась».
+    base = base_revision or svodgit.rev(root, "refs/heads/main") or svodgit.head(root)
     if base_revision and svodgit.rev(root, base_revision) is None:
         raise Refusal(f"base_revision {base_revision} нет в истории репозитория")
     candidate["base"] = base
@@ -345,6 +366,31 @@ def submit(*, scope: str, candidate_id: str, source: str, session: str,
     if old_failure.exists():
         old_failure.unlink()
     return path, candidate
+
+
+def refuse_before_submit(*, scope: str, candidate_id: str, source: str, session: str,
+                         content_type: str, reason: str, state: Path | None = None) -> Path | None:
+    """Отказ до кандидата (плохая проекция, тело, id занят другим телом)
+    сохраняется в failed/ той же формой, что и отказ проверок: статус его
+    покажет, повторная подача с тем же id заменит. Небезопасный id или
+    область файла не получают: имя файла строится из них."""
+    if not ID_RE.fullmatch(candidate_id) or not svodgit.SCOPE_RE.fullmatch(scope):
+        return None
+    if candidate_path(scope, candidate_id, state).exists():
+        # Под этим id уже ждёт другое намерение: его не стирать и не
+        # заслонять отказом, слова отказа уходят вызывающему.
+        return None
+    candidate = {
+        "scope": scope, "id": candidate_id, "source": source, "session": session,
+        "content_type": content_type, "projection": None, "body": None,
+        "submitted_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+        .replace("+00:00", "Z"),
+        "base": None, "expectations": {}, "commit": None, "result": {}, "reason": reason,
+    }
+    target = failed_path(scope, candidate_id, state)
+    svodgit.replace_file(target, json.dumps(candidate, ensure_ascii=False, indent=1,
+                                            sort_keys=True).encode("utf-8"))
+    return target
 
 
 def save_candidate(path: Path, candidate: dict) -> None:
@@ -453,18 +499,25 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
     """Один проход по кандидату под замком. Результат: state saved,
     pending либо failed, слова, коммит."""
     notes: list[str] = []
+    written = False
+    files: dict[str, bytes | None] = {}
+    head_tree: dict[str, bytes] = {}
     try:
         healed = svodgit.heal(root)
         notes += [f"вылечено: {h}" for h in healed]
+        if svodgit.rebase_in_progress(root):
+            raise Wait("идёт ручной rebase ветки main; закончи его (git rebase --continue) "
+                       "или отмени (git rebase --abort), кандидат ждёт")
         if svodgit.branch(root) != "main":
-            raise Wait(f"репозиторий не на ветке main ({svodgit.branch(root) or 'отсоединённая '
-                       'вершина'}); верни main руками")
+            where = svodgit.branch(root) or "отсоединённая вершина"
+            raise Wait(f"репозиторий не на ветке main ({where}); верни main руками")
         head = svodgit.head(root)
         head_tree = svodgit.read_tree(root, head)
         files, file_notes = compute_files(candidate, head_tree, scope, config)
         notes += file_notes
         _clean_leftovers(root, files, head_tree)
         fetched, why = svodgit.fetch(root)
+        remote = None
         if fetched:
             remote = svodgit.remote_head(root)
             if remote and head and remote != head and svodgit.is_ancestor(root, head, remote):
@@ -480,6 +533,11 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
         else:
             notes.append(f"сети нет ({why}); работаем от локальной вершины, таймер отправит")
         _check_base(candidate, root, head, head_tree, files)
+        # Вершина впереди сервера (чужие ручные коммиты, первая публикация):
+        # публикация сверяет дерево против сервера, как это делает таймер,
+        # иначе коммит без происхождения уехал бы на сервер вместе с кандидатом.
+        verify_ahead = fetched and remote != head
+        written = True
         _write(root, files)
         tree = svodgit.write_tree(root)
         report = memoryverify.Report(ok=True, errors=[], warnings=[])
@@ -507,6 +565,7 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
                 _restore(root, files, head_tree)
                 raise Wait("дерево коммита не равно проверенному; повтор в следующем проходе")
             svodgit.update_ref(root, "refs/heads/main", commit, head)
+            candidate["commit"] = commit
         candidate["commit"] = commit
         candidate["result"] = {p: svodgit.blob(root, commit, p) for p in direct_paths(candidate)}
         candidate["reason"] = None
@@ -516,11 +575,12 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
             save_candidate(path, candidate)
             return {"state": "pending", "commit": commit, "reason": candidate["reason"],
                     "notes": notes, "warnings": report.warnings}
-        state, words, final = publish(root, scope, commit, config, scanner=scanner, today=today)
+        outcome, words, final = publish(root, scope, commit, config, scanner=scanner, today=today,
+                                        verify_ahead=verify_ahead)
         if final != commit:
             candidate["commit"] = final
             candidate["result"] = {p: svodgit.blob(root, final, p) for p in direct_paths(candidate)}
-        if state == "saved":
+        if outcome == "saved":
             path.unlink()
             return {"state": "saved", "commit": final, "notes": notes, "warnings": report.warnings}
         candidate["reason"] = words
@@ -535,6 +595,29 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
         save_candidate(path, candidate)
         return {"state": "pending", "commit": candidate.get("commit"), "reason": str(exc),
                 "notes": notes}
+    except svodgit.GitError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - закрытый ответ словами, не трассировка
+        words = f"{type(exc).__name__}: {exc}"
+        if candidate.get("commit"):
+            # Коммит уже в main: ошибка публикации или учёта. Кандидат ждёт,
+            # таймер докажет доставку git-ом либо повторит.
+            candidate["reason"] = f"после коммита: {words}; таймер повторит"
+            save_candidate(path, candidate)
+            return {"state": "pending", "commit": candidate["commit"],
+                    "reason": candidate["reason"], "notes": notes}
+        # Проверка не смогла выполниться (битая кодировка сводки, тема без
+        # tokens, отказ стенда): это не «ждём таймера», а отказ с причиной.
+        # Иначе кандидат зависал в ожидании без слов и каждый прогон таймера
+        # падал на нём, не доходя до остальных. Начатая запись откатывается.
+        if written:
+            try:
+                _restore(root, files, head_tree)
+            except svodgit.GitError:
+                pass
+        reason = f"проверка не выполнилась: {words}"
+        target = fail_candidate(path, candidate, reason, state)
+        return {"state": "failed", "reason": reason, "file": str(target), "notes": notes}
 
 
 # ---------------------------------------------------------------------------
@@ -546,11 +629,20 @@ def rebase_onto(root: Path, scope: str, commit: str, remote: str,
     """Rebase на отсоединённой вершине; main переводится на результат
     только после зелёной проверки против дерева сервера."""
     old_main = svodgit.rev(root, "refs/heads/main")
+    marker = svodgit.engine_rebase_marker(root)
     svodgit.git(root, "checkout", "--quiet", "--detach", commit)
-    result = svodgit.git(root, "rebase", "--quiet", remote, check=False)
+    marker.write_text(commit, encoding="utf-8")
+    try:
+        result = svodgit.git(root, "rebase", "--quiet", remote, check=False)
+        if result.returncode != 0:
+            conflicts = svodgit.out(root, "diff", "--name-only", "--diff-filter=U", check=False).split()
+            svodgit.git(root, "rebase", "--abort", check=False)
+    finally:
+        # Метка снимается только когда rebase действительно кончился: после
+        # таймаута git он может продолжаться, и лечение обязано знать, чей он.
+        if marker.exists() and not svodgit.rebase_in_progress(root):
+            marker.unlink()
     if result.returncode != 0:
-        conflicts = svodgit.out(root, "diff", "--name-only", "--diff-filter=U", check=False).split()
-        svodgit.git(root, "rebase", "--abort", check=False)
         svodgit.git(root, "checkout", "--quiet", "main")
         where = ", ".join(conflicts) if conflicts else result.stderr.decode("utf-8", "replace").strip()
         return "pending", f"конфликт с сервером: {where}; две версии нужно свести руками", commit
@@ -643,17 +735,24 @@ def retry_pending(root: Path, scope: str, config: memoryverify.Config, *,
         if candidate is None or candidate.get("id") != path.stem:
             outcomes.append({"id": path.stem, "state": "unreadable", "file": str(path)})
             continue
-        if candidate.get("commit"):
-            if fetched and delivered(root, candidate):
-                path.unlink()
-                outcomes.append({"id": candidate["id"], "state": "delivered"})
-                continue
-            if committed_locally(root, candidate):
-                outcomes.append({"id": candidate["id"], "state": "committed",
-                                 "reason": candidate.get("reason")})
-                continue
-        result = apply(path, candidate, root=root, scope=scope, config=config,
-                       scanner=scanner, today=today, state=state)
+        try:
+            if candidate.get("commit"):
+                if fetched and delivered(root, candidate):
+                    path.unlink()
+                    outcomes.append({"id": candidate["id"], "state": "delivered"})
+                    continue
+                if committed_locally(root, candidate):
+                    outcomes.append({"id": candidate["id"], "state": "committed",
+                                     "reason": candidate.get("reason")})
+                    continue
+            result = apply(path, candidate, root=root, scope=scope, config=config,
+                           scanner=scanner, today=today, state=state)
+        except svodgit.GitError as exc:
+            # Один кандидат с отказом git не останавливает остальных; причина
+            # остаётся в его файле, чтобы статус сказал словами.
+            candidate["reason"] = f"git отказал: {exc}"
+            save_candidate(path, candidate)
+            result = {"state": "error", "reason": candidate["reason"]}
         outcomes.append({"id": candidate["id"], **{k: v for k, v in result.items()
                                                    if k in ("state", "reason", "commit")}})
     return outcomes
@@ -671,13 +770,23 @@ def run_remember(*, scope: str, candidate_id: str, source: str, session: str,
         svodgit.require_marker(root, scope)
     except ValueError as exc:
         return EXIT_ERROR, {"state": "error", "reason": str(exc)}
-    config = load_config()
+    try:
+        config = load_config()
+    except OSError as exc:
+        return EXIT_ERROR, {"state": "error", "reason": f"конфигурация не читается ({exc}); "
+                            f"задай {configpaths.CONFIG_ENV}"}
     try:
         path, candidate = submit(scope=scope, candidate_id=candidate_id, source=source,
                                  session=session, content_type=content_type, body=body,
                                  projection=projection, root=root, state=state)
     except Refusal as exc:
-        return EXIT_FAILED, {"state": "failed", "reason": str(exc)}
+        target = refuse_before_submit(scope=scope, candidate_id=candidate_id, source=source,
+                                      session=session, content_type=content_type,
+                                      reason=str(exc), state=state)
+        result = {"state": "failed", "reason": str(exc)}
+        if target is not None:
+            result["file"] = str(target)
+        return EXIT_FAILED, result
     try:
         with svodgit.lock(root, exclusive=True):
             result = apply(path, candidate, root=root, scope=scope, config=config,

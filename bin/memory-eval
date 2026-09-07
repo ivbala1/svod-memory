@@ -14,6 +14,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import memoryeval as ev  # noqa: E402
+import memorycontext as mc  # noqa: E402
 from memorycontext import default_root  # noqa: E402
 
 
@@ -23,6 +24,9 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument("--json", action="store_true", help="полный результат в JSON")
     args = parser.parse_args()
+    if mc.TOPICS_ERROR:
+        print(f"memory-eval: {mc.TOPICS_ERROR}", file=sys.stderr)
+        return 2
     root = args.root.expanduser().resolve()
     if args.command == "selfcheck":
         итог = ev.selfcheck(root)

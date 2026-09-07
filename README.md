@@ -38,7 +38,13 @@ python3 -u -m unittest discover -s tests
 
 Unit tests use neutral fixtures and a simulated scanner. The separate
 drill exercises the actual scanner and CLI. These tests do not establish
-that a scheduler or credentials work on another physical machine.
+that a scheduler or credentials work on another physical machine. The
+public suite covers the writer, verifier, sync and config paths; the
+router (`memorycontext`), `memoryrecall` and `memoryeval` are covered only
+by the author's private suite, which reads a private corpus.
+
+CLI output, refusal reasons and hook messages are in Russian; the code
+identifiers and this README are English.
 
 ## Data layout
 
@@ -74,8 +80,9 @@ git -C /absolute/path/to/data/personal config core.hooksPath /absolute/path/to/s
 
 Install the hooks in each data repository. Configure the scheduler using
 the provided systemd or launchd templates after reviewing their paths.
-No private dotfiles installer is required. The templates use conventional
-home-directory paths; custom layouts require corresponding edits. On
+No private dotfiles installer is required. The templates assume the engine
+checkout at `~/src/svod`; edit `WorkingDirectory`/`ExecStart` (systemd) or
+the program path (launchd) if your checkout lives elsewhere. On
 systemd, create the data and state directories before starting the service.
 On macOS, replace `@@HOME@@` with an absolute home path before loading the
 LaunchAgent.

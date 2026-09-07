@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""pre-commit для ручного git в репозитории памяти: дерево индекса
-проверяется тем же модулем, что у писателя, против дерева HEAD. Вид корня
+"""pre-commit для ручного git в репозитории памяти: область memory/
+дерева индекса проверяется тем же модулем, что у писателя, против дерева
+HEAD; файлы вне memory/ ловит только сканер отправки (pre-push). Вид корня
 берётся из .svod.json. Движок на хук не полагается: свои коммиты он
 проверяет сам до commit-tree."""
 from pathlib import Path
@@ -26,8 +27,13 @@ def main() -> int:
     head = svodgit.head(root)
     if head and tree == svodgit.tree_of(root, head):
         return 0
-    report = memoryremember.verify_trees(root, scope, tree, head, memoryremember.load_config(),
-                                         None, None)
+    try:
+        config = memoryremember.load_config()
+    except OSError as exc:
+        print(f"pre-commit: конфигурация памяти не читается ({exc}); задай MEMORY_CONFIG_DIR",
+              file=sys.stderr)
+        return 1
+    report = memoryremember.verify_trees(root, scope, tree, head, config, None, None)
     # Предупреждения только по файлам этого коммита: старые сироты вики-ссылок
     # в нетронутых файлах каждый коммит перечислять незачем.
     changed = set(svodgit.out(root, "diff", "--cached", "--name-only").splitlines())

@@ -26,6 +26,9 @@ import configpaths
 GIT_TIMEOUT_SEC = 60.0
 NETWORK_TIMEOUT_SEC = 120.0
 SCANNER_TIMEOUT_SEC = 180.0
+# Push запускает pre-push, а тот сканирует тот же диапазон ещё раз своим
+# бюджетом: предел push обязан вмещать и сеть, и сканер.
+PUSH_TIMEOUT_SEC = NETWORK_TIMEOUT_SEC + SCANNER_TIMEOUT_SEC
 EXCLUSIVE_WAIT_SEC = 60.0
 SHARED_WAIT_SEC = 10.0
 MARKER_NAME = ".svod.json"
@@ -52,6 +55,11 @@ def git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC,
         data: bytes | None = None) -> subprocess.CompletedProcess:
     """Один вызов git в репозитории. check: ненулевой код это GitError."""
     окружение = dict(os.environ)
+    # Ответы git разбираются по словам («couldn't find remote ref»), поэтому
+    # локаль сообщений фиксирована; пути кандидата это буквальные имена, а
+    # не шаблоны: `*`, `?`, `[` в имени записи не должны раскрываться.
+    окружение["LC_ALL"] = "C"
+    окружение["GIT_LITERAL_PATHSPECS"] = "1"
     if env:
         окружение.update(env)
     try:
@@ -113,13 +121,35 @@ def rebase_in_progress(root: Path) -> bool:
     return (directory / "rebase-merge").exists() or (directory / "rebase-apply").exists()
 
 
+ENGINE_REBASE_MARKER = "svod-rebase"
+
+
+def engine_rebase_marker(root: Path) -> Path:
+    """Файл-метка собственного rebase движка: ставится перед `git rebase`,
+    снимается после. Только помеченный rebase движок вправе отменить; любой
+    другой (ручной, на ветке или на отсоединённой вершине, `git am`) это
+    работа человека."""
+    return git_dir(root) / ENGINE_REBASE_MARKER
+
+
 def heal(root: Path) -> list[str]:
-    """Лечение после падения: rebase --abort, если шёл, и checkout main с
-    отсоединённой вершины. Ветка main при этом не двигается."""
+    """Лечение после падения: rebase --abort, если движок упал посреди
+    своего помеченного rebase, и checkout main с отсоединённой вершины.
+    Ветка main при этом не двигается. Чужой rebase не трогается: его
+    доводит человек, вызывающие говорят об этом словами."""
     done = []
+    marker = engine_rebase_marker(root)
     if rebase_in_progress(root):
-        git(root, "rebase", "--abort")
+        if not marker.exists():
+            return done
+        git(root, "rebase", "--abort", check=False)
+        if rebase_in_progress(root):
+            # Отмена не удалась: метка остаётся, чтобы следующий проход
+            # не принял rebase движка за ручной.
+            return done
         done.append("rebase --abort")
+    if marker.exists():
+        marker.unlink()
     if branch(root) is None and rev(root, "refs/heads/main") is not None:
         git(root, "checkout", "--quiet", "main")
         done.append("checkout main")
@@ -269,7 +299,7 @@ def push(root: Path, commit: str, expect: str | None) -> tuple[bool, str]:
     ещё та, что принёс fetch (lease). (принят, слова)."""
     lease = f"--force-with-lease=refs/heads/main:{expect or ''}"
     result = git(root, "push", "--quiet", lease, "origin", f"{commit}:refs/heads/main",
-                 timeout=NETWORK_TIMEOUT_SEC, check=False)
+                 timeout=PUSH_TIMEOUT_SEC, check=False)
     if result.returncode == 0:
         return True, ""
     text = result.stderr.decode("utf-8", "replace").strip()
@@ -328,19 +358,31 @@ def scan_range(root: Path, old: str | None, new: str, scanner: str | None = None
 def lock(root: Path, *, exclusive: bool, wait: float | None = None):
     """flock на .git/svod.lock. Эксклюзивный ждёт до 60 секунд, дальше Busy;
     разделяемый ждёт до 10 секунд и отдаёт управление даже без замка
-    (читатель читает всегда)."""
+    (читатель читает всегда). Отдаёт True, если замок взят; False, если
+    замок есть, но не взят (срок вышел, файл не открывается); None, если
+    замка у корня нет (выложенное дерево, фикстура без git)."""
     limit = wait if wait is not None else (EXCLUSIVE_WAIT_SEC if exclusive else SHARED_WAIT_SEC)
     path = None
     try:
-        path = git_dir(root) / LOCK_NAME
+        # Обычный клон: каталог .git известен без подпроцесса; читатель берёт
+        # замок на каждый корень федерации на каждом запросе.
+        path = ((root / ".git") if (root / ".git").is_dir() else git_dir(root)) / LOCK_NAME
     except GitError:
         if exclusive:
             raise
     if path is None:
         # Читатель без git-репозитория (выложенное дерево, фикстура) читает без замка.
-        yield False
+        yield None
         return
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        # Неписаный клон: замка у читателя здесь нет (None, как без git),
+        # писателю отказ словами. False остаётся за занятым замком.
+        if exclusive:
+            raise GitError(f"{root}: замок {path.name} не открывается: {exc}") from exc
+        yield None
+        return
     taken = False
     try:
         deadline = time.monotonic() + limit

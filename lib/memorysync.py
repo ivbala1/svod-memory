@@ -48,7 +48,7 @@ def hooks_state(root: Path) -> tuple[bool, str]:
     result = svodgit.git(root, "config", "--get", "core.hooksPath", check=False)
     value = result.stdout.decode().strip() if result.returncode == 0 else ""
     if not value:
-        return False, "core.hooksPath не задан; поставь установщиком (install.sh)"
+        return False, f"core.hooksPath не задан; укажи каталог хуков движка: git config core.hooksPath {HOOKS_DIR}"
     configured = Path(value).expanduser()
     if not configured.is_absolute():
         configured = root / configured
@@ -98,6 +98,12 @@ def sync_repo(scope: str, root: Path, config, *, scanner: str | None = None,
 def _sync_locked(scope: str, root: Path, config, outcome: dict, *, scanner, today, state) -> None:
     healed = svodgit.heal(root)
     outcome["done"] += [f"вылечено: {h}" for h in healed]
+    if svodgit.rebase_in_progress(root):
+        outcome["problems"].append("идёт ручной rebase ветки main, пропуск: закончи его "
+                                   "(git rebase --continue) или отмени (git rebase --abort)")
+        outcome["candidates"] = memoryremember.retry_pending(
+            root, scope, config, fetched=False, scanner=scanner, today=today, state=state)
+        return
     if svodgit.branch(root) != "main":
         outcome["problems"].append("репозиторий не на ветке main; верни main руками")
         return
@@ -270,6 +276,13 @@ def status(*, data_root: Path | None = None, fetch: bool = False,
     config = memoryremember.load_config()
     repos = [repo_status(scope, root, fetch=fetch, state=state, config=config)
              for scope, root in svodgit.repo_map(data_root).items()]
+    # Каталог области с memory/, но без .git: читатель его отдаёт, а
+    # синхронизация и писатель не видят. Молчать об этом нельзя.
+    for scope, root in svodgit.repo_map(data_root, on_disk_only=False).items():
+        if (root / "memory").is_dir() and not (root / ".git").exists():
+            repos.append({"scope": scope, "root": str(root),
+                          "problem": "каталог области без git-репозитория: читатель его "
+                                     "отдаёт, синхронизация и писатель не видят"})
     return {"at": utc_now(), "repos": repos, "ok": all(_repo_ok(r) for r in repos)}
 
 

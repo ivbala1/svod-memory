@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 from dataclasses import dataclass
 import datetime as dt
 import os
@@ -253,3 +255,17 @@ def revision_vector(root: Path, *, federation: RepoMap | None = None) -> dict[st
 def reader_lock(root: Path):
     """Разделяемый замок читателя: не дольше 10 секунд, читает и без него."""
     return svodgit.lock(root, exclusive=False)
+
+
+@contextlib.contextmanager
+def reader_locks(roots):
+    """Разделяемые замки на все корни чтения сразу: сводка темы читается из
+    клиентского корня, и его писатель держит только свой замок. Отдаёт
+    True, когда взяты все имеющиеся замки; False, если хоть один корень с
+    замком читается без него (истёк срок ожидания, файл не открывается).
+    Корень без git (выложенное дерево) замка не имеет и итог не портит."""
+    with contextlib.ExitStack() as stack:
+        taken = True
+        for root in roots:
+            taken = stack.enter_context(svodgit.lock(root, exclusive=False)) is not False and taken
+        yield taken

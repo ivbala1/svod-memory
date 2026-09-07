@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Шаблон LaunchAgent для macOS. install.sh подставляет @@HOME@@ и кладёт
-  результат в ~/Library/LaunchAgents/com.ivbala.agent-memory-sync.plist.
+  Шаблон LaunchAgent для macOS. Заменить @@HOME@@ на абсолютный домашний
+  каталог и положить файл в ~/Library/LaunchAgents/.
 
   Почему именно так:
   - launchd не раскрывает ~ и переменные внутри plist, поэтому пути абсолютные;

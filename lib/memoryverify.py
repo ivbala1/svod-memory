@@ -725,7 +725,7 @@ def unreachable_records(tree: dict[str, bytes], known_topics: set[str],
     это пути сводок вида topics/<файл>."""
     from_index = router_index_slugs(router_index_text(tree))
     rollups = "\n".join(
-        [text.decode("utf-8", "strict")
+        [text.decode("utf-8", "replace")
          for path, text in tree.items() if path[len(MEMORY_PREFIX):] in known_topics]
         + ([extra_rollups] if extra_rollups else []))
     orphans = set()

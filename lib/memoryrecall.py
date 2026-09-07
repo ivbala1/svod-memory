@@ -227,8 +227,13 @@ def _read_consistently(root: Path, state_dir: Path, построить):
     корня клиентского писателя тоже не держит, поэтому вектор сверяется и
     в ветке под замком.
     """
-    global_root, personal_root = mc.index_roots(root)
-    with memoryctl.reader_lock(personal_root or global_root):
+    with memoryctl.reader_locks(mc.reader_federation(root).available_roots) as все_взяты:
+        if not все_взяты:
+            # Писатель держит корень дольше срока ожидания: ревизии по HEAD
+            # не видят его незакоммиченную запись, так что читать сейчас
+            # значит рисковать половиной сводки. Хук читает всегда (его
+            # контракт), команде честнее отказать словами.
+            raise RecallError("корпус занят писателем дольше срока ожидания, повтори запрос")
         # Цикл до стабильной пары векторов: одиночный повтор принимал второй
         # результат вслепую, и длинная клиентская транзакция снова попадала
         # бы в промежуточное состояние. Предел попыток с явным отказом.
@@ -520,8 +525,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _refused_early(args, reason: str) -> int:
+    """Отказ до подачи (проекция, тело): в failed/, как у проверок."""
+    import memoryremember
+    target = memoryremember.refuse_before_submit(
+        scope=args.scope, candidate_id=args.proposal_id, source=args.source,
+        session=args.session, content_type=args.content_type, reason=reason)
+    result = {"state": "failed", "reason": reason}
+    if target is not None:
+        result["file"] = str(target)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return memoryremember.EXIT_FAILED
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if mc.TOPICS_ERROR:
+        print(f"memory {args.command}: {mc.TOPICS_ERROR}", file=sys.stderr)
+        return 7 if args.command == "remember" else 4
     try:
         if args.command in ("recall", "explain"):
             if args.command == "recall":
@@ -543,9 +564,7 @@ def main(argv: list[str] | None = None) -> int:
                         raise ValueError("projection файл больше предела")
                     проекция = json.loads(raw.decode("utf-8"))
                 except (OSError, ValueError) as exc:
-                    print(json.dumps({"state": "failed", "reason": f"projection: {exc}"},
-                                     ensure_ascii=False, sort_keys=True))
-                    return memoryremember.EXIT_FAILED
+                    return _refused_early(args, f"projection: {exc}")
             if args.birth_pair:
                 print("memory remember: --birth-pair больше не читается, крючок это поле "
                       "probe в шапке записи", file=sys.stderr)
@@ -553,9 +572,7 @@ def main(argv: list[str] | None = None) -> int:
                 тело = (Path(args.file).read_bytes() if args.file
                         else sys.stdin.buffer.read())
             except OSError as exc:
-                print(json.dumps({"state": "failed", "reason": f"тело: {exc}"},
-                                 ensure_ascii=False, sort_keys=True))
-                return memoryremember.EXIT_FAILED
+                return _refused_early(args, f"тело: {exc}")
             код, результат = memoryremember.run_remember(
                 scope=args.scope, candidate_id=args.proposal_id, source=args.source,
                 session=args.session, content_type=args.content_type, body=тело,
@@ -592,7 +609,8 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     except (MemoryctlError, OSError, UnicodeError, ValueError) as error:
         print(f"memory {args.command}: {type(error).__name__}: {error}", file=sys.stderr)
-        return 4
+        # У remember код 4 значит pending; посторонняя ошибка это 7 (error).
+        return 7 if args.command == "remember" else 4
     sys.stdout.write(text)
     if not text.endswith("\n"):
         sys.stdout.write("\n")
