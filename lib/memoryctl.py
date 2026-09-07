@@ -18,12 +18,9 @@ import stat
 
 import configpaths
 import svodgit
-from memoryverify import (  # noqa: F401 - переэкспорт для прежних вызывающих
-    CONFLICT_RE, DATE_FIELDS, DATE_RE, FENCE_RE, LINK_FIELDS, MARKDOWN_LINK_RE,
-    SECRET_PATTERNS, SLUG_RE, WIKI_LINK_RE, DESCRIPTIVE_TOP_FIELDS,
-    KNOWN_TOP_FIELDS, SCHEMA_FIELDS, find_gitleaks, index_field_errors, link_field_errors,
-    parse_frontmatter, strip_code, supersedes_errors, _snapshot_supersedes,
-    _slug_mentioned, _boundary_ok,
+from memoryverify import (  # noqa: F401 - имена, которые читатели берут через memoryctl
+    MARKDOWN_LINK_RE, SLUG_RE, body_without_frontmatter, parse_frontmatter,
+    strip_code, _slug_mentioned,
 )
 
 AREAS = ("memory",)
@@ -49,10 +46,6 @@ def utc_today() -> dt.date:
 
 def default_root() -> Path:
     return svodgit.default_root()
-
-
-def default_state_dir() -> Path:
-    return svodgit.state_dir()
 
 
 def ensure_private_dir(path: Path) -> None:
@@ -83,17 +76,6 @@ def require_real_directory(path: Path, label: str, *, required: bool = True) -> 
     if not stat.S_ISDIR(mode):
         raise ValidationError([f"{label} is not a directory: {path}"])
     return True
-
-
-def require_repo(root: Path) -> None:
-    errors = []
-    for area in AREAS:
-        try:
-            require_real_directory(root / area, f"data area {area}")
-        except ValidationError as exc:
-            errors.extend(exc.errors)
-    if errors:
-        raise ValidationError(errors)
 
 
 def iter_data_files(root: Path):
@@ -135,11 +117,14 @@ def collect_memory_files(root: Path) -> list[Path]:
 
 def compute_revision(root: Path) -> str:
     """Ревизия корпуса это хеш коммита HEAD; без git-репозитория (выложенное
-    дерево, фикстура) отпечаток содержимого."""
-    if svodgit.is_repo(root):
+    дерево, фикстура) отпечаток содержимого. Один запуск git на корень:
+    вершина несуществующего репозитория это просто None."""
+    try:
         head = svodgit.head(root)
-        if head:
-            return head
+    except svodgit.GitError:
+        head = None
+    if head:
+        return head
     import hashlib
     digest = hashlib.sha256()
     for relative, data in sorted(data_snapshot(root).items()):
@@ -211,7 +196,7 @@ class RootInfo:
 
 @dataclass(frozen=True)
 class RepoMap:
-    """Область -> путь. available: что есть на диске; missing_clients: чего нет."""
+    """Область -> путь. available: что есть на диске."""
     identities: dict[str, RootInfo]
     available: frozenset[str]
 
@@ -219,11 +204,6 @@ class RepoMap:
     def available_roots(self) -> tuple[Path, ...]:
         return tuple(self.identities[lid].worktree_root for lid in self.identities
                      if lid in self.available)
-
-    @property
-    def missing_clients(self) -> tuple[str, ...]:
-        return tuple(sorted(lid[len("clients/"):] for lid in self.identities
-                            if lid not in self.available and lid.startswith("clients/")))
 
 
 def federation_context(data_root: Path, state_dir: Path | None = None, *,
@@ -241,20 +221,9 @@ def federation_roots(source, *, state_dir: Path | None = None) -> list[Path]:
     return list(context.available_roots)
 
 
-def federation_client_names(source, *, state_dir: Path | None = None) -> tuple[str, ...]:
-    context = source if isinstance(source, RepoMap) else federation_context(source, state_dir)
-    return tuple(context.identities[lid].client_name for lid in context.identities
-                 if lid in context.available and context.identities[lid].client_name)
-
-
 def revision_vector(root: Path, *, federation: RepoMap | None = None) -> dict[str, str]:
     context = federation if federation is not None else federation_context(root)
     return {lid: compute_revision(context.identities[lid].worktree_root) for lid in context.available}
-
-
-def reader_lock(root: Path):
-    """Разделяемый замок читателя: не дольше 10 секунд, читает и без него."""
-    return svodgit.lock(root, exclusive=False)
 
 
 @contextlib.contextmanager

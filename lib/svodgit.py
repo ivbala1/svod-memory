@@ -184,13 +184,6 @@ def blob(root: Path, commit: str, path: str) -> str | None:
     return result.stdout.decode().strip()
 
 
-def read_blob(root: Path, commit: str, path: str) -> bytes | None:
-    result = git(root, "cat-file", "blob", f"{commit}:{path}", check=False)
-    if result.returncode != 0:
-        return None
-    return result.stdout
-
-
 def read_tree(root: Path, commit: str | None, prefix: str = "memory/") -> dict[str, bytes]:
     """Дерево области памяти коммита как отображение «путь -> байты».
     Пустое, если коммита нет (репозиторий без истории)."""
@@ -250,14 +243,19 @@ def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     return git(root, "merge-base", "--is-ancestor", ancestor, descendant, check=False).returncode == 0
 
 
-def rev_list(root: Path, spec: str) -> list[str]:
-    text = out(root, "rev-list", spec)
-    return text.split() if text else []
-
-
-def commit_subjects(root: Path, spec: str) -> list[str]:
-    text = out(root, "log", "--format=%s", spec)
-    return text.splitlines() if text else []
+def fast_forward(root: Path, head: str | None, remote: str | None) -> bool:
+    """Подтянуть рабочую ветку до вершины сервера, когда та впереди без
+    расхождения: без своих коммитов reset, иначе merge --ff-only. True,
+    если вершина сдвинулась; равенство и расхождение ничего не трогают."""
+    if not remote or remote == head:
+        return False
+    if head is None:
+        git(root, "reset", "--quiet", "--hard", remote)
+        return True
+    if not is_ancestor(root, head, remote):
+        return False
+    git(root, "merge", "--quiet", "--ff-only", remote)
+    return True
 
 
 def subject_exists(root: Path, subject: str, ref: str = "HEAD") -> bool:
@@ -515,39 +513,48 @@ def fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def create_file(path: Path, data: bytes) -> bool:
-    """Создание без замены: временный файл, fsync, link, fsync каталога.
-    False, если файл уже есть (его содержимое не трогается)."""
+def _write_temp(path: Path, data: bytes) -> Path:
+    """Временный файл рядом с целью: содержимое целиком и fsync. Короткая
+    запись опубликовала бы обрезанный файл, поэтому пишется до конца;
+    неудавшийся временный файл не остаётся."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        try:
+            written = 0
+            while written < len(data):
+                chunk = os.write(fd, data[written:])
+                if chunk <= 0:
+                    raise OSError(f"{temp}: запись не продвигается")
+                written += chunk
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+    return temp
+
+
+def create_file(path: Path, data: bytes) -> bool:
+    """Создание без замены: временный файл, fsync, link, fsync каталога.
+    False, если файл уже есть (его содержимое не трогается)."""
+    temp = _write_temp(path, data)
     try:
         os.link(temp, path)
     except FileExistsError:
-        os.unlink(temp)
         return False
     finally:
-        if temp.exists():
-            os.unlink(temp)
+        os.unlink(temp)
     fsync_dir(path.parent)
     return True
 
 
 def replace_file(path: Path, data: bytes) -> None:
     """Атомарная замена: временный файл, fsync, rename."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temp = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    temp = _write_temp(path, data)
     os.replace(temp, path)
     fsync_dir(path.parent)
 

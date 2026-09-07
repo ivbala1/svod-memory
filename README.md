@@ -84,7 +84,9 @@ drill exercises the actual scanner and CLI. These tests do not establish
 that a scheduler or credentials work on another physical machine. The
 public suite covers the writer, verifier, sync and config paths; the
 router (`memorycontext`), `memoryrecall` and `memoryeval` are covered only
-by the author's private suite, which reads a private corpus.
+by the author's private suite, which reads a private corpus. A hygiene test
+(`tests/test_hygiene.py`) keeps `lib/` free of functions without callers,
+unused imports and helpers defined twice.
 
 CLI output, refusal reasons and hook messages are in Russian; the code
 identifiers and this README are English.

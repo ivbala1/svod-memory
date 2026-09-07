@@ -12,24 +12,26 @@
 достижимость и крючок (4), чужой заказчик (2, 3), разделы сводки
 (2, 4), стенд (4, 2). Нет цели, нет проверки.
 
-Модуль лист зависимостей: роутер и стенд импортируются внутри функций,
-потому что роутер сам импортирует memoryctl, а memoryctl переэкспортирует
-переехавшие сюда имена.
+Из своих модулей на верхнем уровне сюда входят только svodgit и
+topiclayout: роутер и стенд импортируются внутри функций, потому что роутер
+сам импортирует memoryctl, а memoryctl переэкспортирует переехавшие сюда
+имена.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import datetime as dt
+import functools
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import subprocess
 import tempfile
 import unicodedata
 
+import svodgit
 import topiclayout
 
 
@@ -53,7 +55,6 @@ class Report:
 
 MEMORY_PREFIX = "memory/"
 MAX_RECORD_BYTES = 256 * 1024
-SCANNER_TIMEOUT_SEC = 180.0
 CONFLICT_RE = re.compile(r"^(?:<<<<<<<|=======|>>>>>>>)(?: .*)?$", re.MULTILINE)
 MARKDOWN_LINK_RE = re.compile(
     r"\]\((?!https?://|mailto:|#)([^)\s]+\.md)(?:#[^)]*)?\)")
@@ -259,13 +260,19 @@ class Topics:
     specs: dict                                   # тема -> TopicSpec роутера
     placement: dict[str, tuple[str, str | None]]  # файл сводки -> (тема, владелец)
     drift: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...]
+    budget: dict                                  # пороги индекса из topics.json
 
 
+@functools.lru_cache(maxsize=8)
 def load_topics(raw: bytes) -> Topics:
+    """Темы, раскладка, дрейф и бюджет индекса из байтов конфигурации.
+    Разбор один на процесс и версию байтов: писатель зовёт его на каждом
+    шаге прохода, статус на каждый репозиторий, а итог от вызова к вызову
+    не меняется. Новые байты дают новый разбор."""
     import memorycontext as mc
     label = Path("topics.json")
     parsed = json.loads(raw.decode("utf-8"))
-    specs = mc.parse_topics(raw, label)
+    specs = mc.topics_from_config(parsed, label)
     placement = topiclayout.placement_from_config(parsed, label)
     drift = []
     for name, entry in parsed["topics"].items():
@@ -273,7 +280,8 @@ def load_topics(raw: bytes) -> Topics:
         if not isinstance(tokens, list) or not tokens:
             raise ValueError(f"topics.json: у темы {name} нет tokens, дрейф не посчитать")
         drift.append((name, tuple(tokens), frozenset(entry.get("hotKeep") or ())))
-    return Topics(specs=specs, placement=placement, drift=tuple(drift))
+    return Topics(specs=specs, placement=placement, drift=tuple(drift),
+                  budget=dict(parsed.get("budget") or {}))
 
 
 def client_name(root: str) -> str | None:
@@ -282,16 +290,6 @@ def client_name(root: str) -> str | None:
 
 # ---------------------------------------------------------------------------
 # 1. Секреты по патчу (цель 5)
-
-def find_gitleaks() -> str | None:
-    """Путь к gitleaks: PATH, затем ~/.local/bin (standalone-установка
-    мимо пакетного менеджера в PATH неинтерактивных оболочек не попадает)."""
-    executable = shutil.which("gitleaks")
-    if executable:
-        return executable
-    local = Path.home() / ".local" / "bin" / "gitleaks"
-    return str(local) if local.is_file() and os.access(local, os.X_OK) else None
-
 
 def added_lines(base: dict[str, bytes], candidate: dict[str, bytes]) -> dict[str, list[str]]:
     """Строки, которых в основе не было: только они уезжают в историю
@@ -334,7 +332,7 @@ def secret_errors(base: dict[str, bytes], candidate: dict[str, bytes],
                 [scanner, "detect", "--no-git", "--source", tmp, "--no-banner",
                  "--redact", "--exit-code", "9"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=SCANNER_TIMEOUT_SEC)
+                stderr=subprocess.DEVNULL, timeout=svodgit.SCANNER_TIMEOUT_SEC)
         except (OSError, subprocess.SubprocessError) as exc:
             errors.append(f"сканер секретов не отработал ({exc}); запись не принимается")
             return errors
@@ -833,11 +831,19 @@ def tautology_candidates(slug: str, text: str) -> list[str]:
     return [c for c in out if c]
 
 
-def index_delivery(root: Path, question: str, today: dt.date) -> list[str]:
-    """Прогон вопроса рабочим отбором роутера по выложенному дереву; слаги
-    без расширения."""
+def index_entries(root: Path) -> tuple:
+    """Записи индекса выложенного дерева тем же сборщиком, что у роутера."""
     import memorycontext as mc
-    entries = mc.parse_index(mc.build_index(root)) if (root / "memory" / "MEMORY.md").is_file() else ()
+    if not (root / "memory" / "MEMORY.md").is_file():
+        return ()
+    return mc.parse_index(mc.build_index(root))
+
+
+def index_delivery(root: Path, question: str, today: dt.date, entries: tuple) -> list[str]:
+    """Прогон вопроса рабочим отбором роутера по выложенному дереву; слаги
+    без расширения. Записи индекса приходят готовыми: крючки всего дерева
+    проверяются по одному индексу, а не по индексу на каждую запись."""
+    import memorycontext as mc
     chosen = mc.select_index_entries(root, question, entries, today=today)
     return [Path(entry.slug).stem for entry, _ in chosen]
 
@@ -879,6 +885,7 @@ def probe_errors(base: dict[str, bytes], candidate: dict[str, bytes], *,
     if client is not None:
         spec = next((s for s in topics.specs.values() if s.owner == root), None)
     results: dict[str, bool] = {}
+    entries = index_entries(laid_out) if client is None else ()
     for slug, text in sorted(_records(candidate).items()):
         fields, error = parse_frontmatter(text)
         if error:
@@ -897,7 +904,7 @@ def probe_errors(base: dict[str, bytes], candidate: dict[str, bytes], *,
                           "напиши, как об этом спросят своими словами")
             continue
         if client is None:
-            found = slug in index_delivery(laid_out, probe, today)
+            found = slug in index_delivery(laid_out, probe, today, entries)
             hint = "отбор роутера по индексу его не выбирает; перепиши крючок или строку index"
         elif spec is None:
             results[slug] = True
@@ -994,18 +1001,6 @@ def foreign_errors(base: dict[str, bytes], candidate: dict[str, bytes],
 
 # ---------------------------------------------------------------------------
 # 8. Разделы сводки: потолок и выбираемость (цели 2, 4)
-
-def rollup_section_delivery_size(rollup_text: str, section: str) -> tuple[int, int]:
-    """Размер раздела сводки и его потолок доставки, в символах. Роутер
-    режет раздел своим потолком, а указатель дописывается в конец, то есть
-    в срезаемую часть: переросший раздел глотает указатель молча."""
-    import memorycontext as mc
-    wanted = section.strip().casefold()
-    for part in mc.parse_sections(rollup_text):
-        if part.title.strip().casefold() == wanted:
-            return len(part.text), mc.section_cap(part)
-    raise ValueError(f"раздела {section!r} нет в сводке темы")
-
 
 def section_errors(base: dict[str, bytes], candidate: dict[str, bytes],
                    topics: Topics, facts: dict) -> tuple[list[str], list[str]]:
@@ -1161,7 +1156,8 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
     facts: dict = {}
     errors: list[str] = []
     warnings: list[str] = []
-    errors += secret_errors(base, candidate, scanner if scanner is not None else find_gitleaks())
+    errors += secret_errors(base, candidate,
+                            scanner if scanner is not None else svodgit.find_gitleaks())
     errors += shape_errors(candidate)
     errors += header_errors(base, candidate)
     errors += probe_required_errors(candidate, root)
@@ -1185,7 +1181,6 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
             # доставляется сводкой, его проверяют крючки.
             errors += stand_errors(old_root, new_root, config.questions, today, facts, warnings)
     if root == "global":
-        import svodgit
         errors += contract_errors(candidate)
         warnings += client_name_warnings(candidate, topics, svodgit.federation_members(config.topics))
     touched = touched_records(base, candidate)

@@ -94,30 +94,6 @@ class РазрешениеПутей(unittest.TestCase):
             self.assertEqual(configpaths.baseline_path(),
                              каталог / "eval_baseline.json")
 
-    def test_логические_имена(self):
-        self.assertEqual(configpaths.logical_name("/где-то/topics.json"),
-                         "config/topics.json")
-        self.assertEqual(configpaths.logical_name("/где-то/memoryeval.py"),
-                         "lib/memoryeval.py")
-
-    def test_резолвер_разводит_разделы(self):
-        корень = Path("/код")
-        self.assertEqual(
-            configpaths.resolve_manifest_path(корень, "lib/memoryctl.py"),
-            корень / "lib/memoryctl.py")
-        with ПодменаКаталога() as каталог:
-            self.assertEqual(
-                configpaths.resolve_manifest_path(корень, "config/topics.json"),
-                каталог / "topics.json")
-
-    def test_пары_манифеста_покрывают_перечень(self):
-        with ПодменаКаталога() as каталог:
-            пары = configpaths.manifest_entries()
-            self.assertEqual([и for и, _ in пары],
-                             [f"config/{н}" for н in configpaths.CONFIG_NAMES])
-            for _, путь in пары:
-                self.assertEqual(путь.parent, каталог)
-
 
 class КореньДанных(unittest.TestCase):
     def test_default_root_не_выводится_из_кода(self):

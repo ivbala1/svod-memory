@@ -20,10 +20,10 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import traceback
 
+from memoryctl import utc_now
 import memoryremember
 import svodgit
 
@@ -32,16 +32,8 @@ HOOKS_DIR = (Path(__file__).resolve().parents[1] / "githooks")
 HOOK_NAMES = ("pre-commit", "pre-push")
 
 
-def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
 # ---------------------------------------------------------------------------
 # Хуки
-
-def hooks_path_expected() -> str:
-    return str(HOOKS_DIR)
-
 
 def hooks_state(root: Path) -> tuple[bool, str]:
     """(стоят, слова): core.hooksPath указывает на каталог хуков движка."""
@@ -119,11 +111,7 @@ def _sync_locked(scope: str, root: Path, config, outcome: dict, *, scanner, toda
     head = svodgit.head(root)
     remote = svodgit.remote_head(root) if fetched else None
     if fetched and remote and head != remote:
-        if head is None or svodgit.is_ancestor(root, head, remote):
-            if head is None:
-                svodgit.git(root, "reset", "--quiet", "--hard", remote)
-            else:
-                svodgit.git(root, "merge", "--quiet", "--ff-only", remote)
+        if svodgit.fast_forward(root, head, remote):
             outcome["done"].append(f"fast-forward до {remote[:12]}")
             head = remote
         else:
@@ -210,7 +198,7 @@ def repo_health(scope: str, root: Path, config) -> list[str]:
     if mv.client_name(scope) is None:
         text = mv.router_index_text(tree)
         chars, lines = len(text), len(text.splitlines())
-        budget = json.loads(config.topics.decode("utf-8")).get("budget") or {}
+        budget = topics.budget
         hard = (budget.get("hardBytes"), budget.get("hardLines"))
         soft = (budget.get("softBytes"), budget.get("softLines"))
         if all(hard) and (chars > hard[0] or lines > hard[1]):

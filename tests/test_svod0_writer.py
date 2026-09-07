@@ -732,6 +732,37 @@ class GitToolsTests(Base):
         with svodgit.lock(root, exclusive=False) as taken:
             self.assertTrue(taken)
 
+    def test_fast_forward_moves_only_without_divergence(self):
+        """Один fast-forward у писателя и таймера: равенство и расхождение
+        ничего не трогают, отставание подтягивается, пустой репозиторий
+        сбрасывается на вершину сервера."""
+        root_a, root_b = self.fed.root("a"), self.fed.root("b")
+        head = svodgit.head(root_a)
+        self.assertFalse(svodgit.fast_forward(root_a, head, head))
+        self.assertFalse(svodgit.fast_forward(root_a, head, None))
+        self.fed.remember("b", "personal", "lamp", fresh_record(
+            "reference_lamp", "как включить лампу", "включить лампу"),
+            {"record_slug": "reference_lamp"})
+        sh(root_a, "fetch", "--quiet", "origin")
+        remote = svodgit.remote_head(root_a)
+        self.assertTrue(svodgit.fast_forward(root_a, head, remote))
+        self.assertEqual(svodgit.head(root_a), remote)
+        local = self.manual_commit(root_a, "memory/reference_iron.md", fresh_record(
+            "reference_iron", "как гладить утюгом", "гладить утюг"), "memory: iron")
+        self.fed.remember("b", "personal", "clock", fresh_record(
+            "reference_clock", "как завести часы", "завести часы"),
+            {"record_slug": "reference_clock"})
+        sh(root_a, "fetch", "--quiet", "origin")
+        self.assertFalse(svodgit.fast_forward(root_a, local, svodgit.remote_head(root_a)))
+        self.assertEqual(svodgit.head(root_a), local)
+        empty = self.fed.base / "empty"
+        subprocess.run(["git", "init", "--quiet", "-b", "main", str(empty)], check=True)
+        sh(empty, "remote", "add", "origin", str(self.fed.origins / "personal.git"))
+        sh(empty, "fetch", "--quiet", "origin")
+        remote = svodgit.remote_head(empty)
+        self.assertTrue(svodgit.fast_forward(empty, None, remote))
+        self.assertEqual(svodgit.head(empty), remote)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -1142,3 +1173,33 @@ class CodexRoundTests(Base):
         self.assertEqual([s.title for s in sections], ["A", "B"])
         with self.assertRaises(mr.Refusal):
             mr.insert_rollup_pointer("## A\n```\nкод без конца\n", "A", "- [x](reference_x.md) - новый")
+
+
+class CleanupTests(Base):
+    """Долги чистоты 07.09.2026: горячий путь хука без лишних запусков git."""
+
+    def test_hook_hot_path_runs_git_once_per_index_root(self):
+        import memorycontext as mc
+        data, state = self.fed.machines["a"], self.fed.states["a"] / "claude"
+        seen: list[str] = []
+        original = svodgit.git
+
+        def counting(root, *args, **kw):
+            seen.append(" ".join(args[:2]))
+            return original(root, *args, **kw)
+
+        with mock.patch.object(svodgit, "git", counting):
+            session = mc.handle_session(
+                {"session_id": "hot-1", "cwd": str(data), "source": "startup"}, data, state)
+            session_calls = list(seen)
+            seen.clear()
+            prompt = mc.handle_prompt(
+                {"session_id": "hot-1", "cwd": str(data), "prompt": "как чинить зелёный принтер"},
+                data, state)
+        self.assertIn("[Общая память агента]", session["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("Зелёный принтер чинится молотком",
+                      prompt["hookSpecificOutput"]["additionalContext"])
+        # Ревизия корня индекса это один rev-parse: глобальный и личный на
+        # старте сессии, личный на запросе; замки и карта обходятся без git.
+        self.assertEqual(len(session_calls), 2, session_calls)
+        self.assertEqual(len(seen), 1, seen)

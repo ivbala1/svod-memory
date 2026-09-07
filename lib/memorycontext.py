@@ -15,17 +15,17 @@ from typing import Iterable
 import datetime as dt
 
 import configpaths
+import svodgit
 import topiclayout
 
 from memoryctl import (
     MemoryctlError,
     atomic_write,
+    body_without_frontmatter,
     compute_revision,
-    federation_roots,
+    default_root,
     parse_frontmatter,
-    reader_lock,
     reader_locks,
-    require_repo,
     utc_now,
 )
 
@@ -49,12 +49,6 @@ SECTION_CAP_MANDATORY = 2_500
 SECTION_CAP_RELEVANT = 3_400
 # Личный режим сессии. Не пробел и не ошибка, а осознанный выбор: в нём можно
 # обсуждать хоть все проекты сразу, и роллап заказчика не подмешивается.
-def uuid4hex() -> str:
-    import uuid
-
-    return uuid.uuid4().hex
-
-
 PERSONAL_SCOPE = "personal"
 
 # Почему сессия стала личной. Причина обязана быть честной: молча показывать
@@ -200,27 +194,28 @@ def _load_topics() -> dict[str, TopicSpec]:
     областей памяти. Теперь источник один.
     """
     path = configpaths.config_path("topics.json")
-    # Байты конфига читаются РОВНО ОДИН РАЗ на процесс и публикуются как
-    # TOPICS_RAW: memoryrecall разбирает свои структуры из этих же байтов,
-    # поэтому один вызов читателя не может собрать результат
-    # из двух поколений политики (Q7, Д25-З).
-    global TOPICS_RAW
+    # Байты конфига читаются и разбираются РОВНО ОДИН РАЗ на процесс и
+    # публикуются как TOPICS_RAW и TOPICS_CONFIG: memoryrecall берёт свои
+    # структуры из этого же разбора, поэтому один вызов читателя не может
+    # собрать результат из двух поколений политики (Q7, Д25-З).
+    global TOPICS_RAW, TOPICS_CONFIG
     try:
         TOPICS_RAW = path.read_bytes()
     except OSError as exc:
         hint = "" if os.environ.get(configpaths.CONFIG_ENV) else (
             f"; задай {configpaths.CONFIG_ENV} (каталог конфигурации с topics.json)")
         raise MemoryctlError(f"не читается конфиг тем {path}: {exc}{hint}") from exc
-    return parse_topics(TOPICS_RAW, path)
-
-
-def parse_topics(raw_bytes: bytes, path) -> dict[str, TopicSpec]:
-    """Темы из байтов конфига: проверки кандидата (memoryverify) получают
-    версию конфигурации входом и не читают живой файл."""
     try:
-        raw = json.loads(raw_bytes.decode("utf-8"))
+        parsed = json.loads(TOPICS_RAW.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise MemoryctlError(f"не читается конфиг тем {path}: {exc}") from exc
+    TOPICS_CONFIG = parsed if isinstance(parsed, dict) else {}
+    return topics_from_config(parsed, path)
+
+
+def topics_from_config(raw, path) -> dict[str, TopicSpec]:
+    """Темы из разобранного конфига: проверки кандидата (memoryverify)
+    получают версию конфигурации входом и не читают живой файл."""
     try:
         placement = topiclayout.placement_from_config(raw, path)
     except ValueError as exc:
@@ -308,6 +303,7 @@ def parse_topics(raw_bytes: bytes, path) -> dict[str, TopicSpec]:
 
 
 TOPICS_RAW: bytes = b""
+TOPICS_CONFIG: dict = {}
 TOPICS_ERROR: str | None = None
 try:
     TOPICS: dict[str, TopicSpec] = _load_topics()
@@ -344,17 +340,6 @@ def rollup_relative_source(spec: TopicSpec) -> str:
     не пробует: чтение старой копии при недоступном владельце запрещено (N10).
     """
     return topiclayout.rollup_relative_source(spec.filename, spec.owner)
-
-
-
-def default_root() -> Path:
-    configured = os.environ.get("MEMORY_REPO")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    # Корень ДАННЫХ не выводится из расположения кода: после разделения
-    # репозиториев это указывало бы на репозиторий кода. Значение по
-    # умолчанию документировано, переменная его перекрывает.
-    return (Path.home() / ".agent-memory").resolve()
 
 
 def default_state_dir() -> Path:
@@ -568,10 +553,10 @@ def index_roots(root: Path) -> tuple[Path, Path | None]:
     return context.identities["global"].worktree_root, personal
 
 
-def _revision_note(global_root: Path, personal_root: Path | None) -> str:
-    parts = [f"global {compute_revision(global_root)[:12]}"]
-    if personal_root is not None:
-        parts.append(f"personal {compute_revision(personal_root)[:12]}")
+def _revision_note(global_revision: str, personal_revision: str | None) -> str:
+    parts = [f"global {global_revision[:12]}"]
+    if personal_revision is not None:
+        parts.append(f"personal {personal_revision[:12]}")
     return ", ".join(parts)
 
 
@@ -622,24 +607,6 @@ def _entry_score(prompt: str, entry: IndexEntry) -> int:
     if label_hits >= 2:
         score += 2
     return score
-
-
-def rank_index_entries(prompt: str, entries: tuple[IndexEntry, ...]) -> tuple[tuple[IndexEntry, int], ...]:
-    ranked = [
-        (entry, _entry_score(prompt, entry))
-        for entry in entries
-        if entry.section in INDEX_SECTIONS.values()
-    ]
-    ranked = [item for item in ranked if item[1] >= 4]
-    ranked.sort(key=lambda item: (-item[1], item[0].index))
-    if not ranked:
-        return ()
-    selected = [ranked[0]]
-    if len(ranked) > 1:
-        second = ranked[1]
-        if second[1] >= 6 and (second[1] * 2) >= ranked[0][1]:
-            selected.append(second)
-    return tuple(selected)
 
 
 def today_utc() -> dt.date:
@@ -764,7 +731,7 @@ def _member_block(root: Path, slug_md: str, seed_slug_md: str, вид: str) -> s
     target = _safe_memory_path(root, slug_md)
     if target is None or not target.is_file():
         return None
-    body = _without_frontmatter(_read_limited(target)).strip()
+    body = body_without_frontmatter(_read_limited(target)).strip()
     связь = "противоречие" if вид == "contradicts" else "требуется"
     heading = (f"[Член комплекта {seed_slug_md}: {связь}]\n"
                f"Источник: memory/{slug_md}")
@@ -869,18 +836,11 @@ def _read_limited(path: Path, maximum: int = 65_536) -> str:
         return handle.read(maximum)
 
 
-def _without_frontmatter(text: str) -> str:
-    if not text.startswith("---\n"):
-        return text
-    end = text.find("\n---\n", 4)
-    return text[end + 5 :] if end >= 0 else text
-
-
 def _entry_block(root: Path, entry: IndexEntry, maximum: int = 2_400) -> str | None:
     target = _safe_memory_path(root, entry.slug)
     if target is None or not target.is_file():
         return None
-    body = _without_frontmatter(_read_limited(target)).strip()
+    body = body_without_frontmatter(_read_limited(target)).strip()
     heading = f"[Совпавшая запись индекса: {entry.label}]\nИсточник: memory/{entry.slug}"
     if entry.summary:
         heading += f"\nРезюме индекса: {entry.summary}"
@@ -1224,9 +1184,10 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tup
     Ровно то, ради предотвращения чего защёлка и делалась.
 
     Теперь значение пишется во временный файл целиком, синкается и только
-    потом атомарно связывается с итоговым именем через os.link: связывание
-    либо происходит с уже готовым содержимым, либо не происходит вовсе.
-    Проигравший читает заведомо полную запись.
+    потом атомарно связывается с итоговым именем через os.link
+    (svodgit.create_file): связывание либо происходит с уже готовым
+    содержимым, либо не происходит вовсе. Проигравший читает заведомо
+    полную запись.
     """
     path = _pin_path(state_dir, session_id)
     if path is None:
@@ -1236,43 +1197,13 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tup
         ensure_ascii=False,
     ).encode("utf-8")
     _sweep_pin_temps(path.parent)
-    temp = path.parent / f".{path.name}.{os.getpid()}.{uuid4hex()}"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            written = 0
-            while written < len(payload):
-                # Короткая запись опубликовала бы обрезанный JSON.
-                chunk = os.write(fd, payload[written:])
-                if chunk <= 0:
-                    # Иначе цикл вечный: устройство не принимает байты.
-                    raise OSError("запись закрепления не продвигается")
-                written += chunk
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        try:
-            os.link(temp, path)
-        except FileExistsError:
-            pass
-        else:
-            # Имя должно пережить потерю питания, а не только падение процесса.
-            dir_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+        svodgit.create_file(path, payload)
     except OSError:
         # Ни при каких обстоятельствах не возвращать собственный проект:
         # два процесса при сбое файловой системы получили бы РАЗНЫЕ роллапы,
         # то есть ту же межклиентскую утечку, только на отказе диска.
         return _pinned_scope(state_dir, session_id) or PERSONAL_SCOPE, "io-error"
-    finally:
-        try:
-            temp.unlink()
-        except OSError:
-            pass
     record = _read_pin_record(state_dir, session_id)
     won = record.get("scope")
     if won == PERSONAL_SCOPE or won in TOPICS:
@@ -1588,21 +1519,23 @@ def _topic_context(
     return context, tuple(included)
 
 
-def _personal_route(root: Path, prompt: str, entries: tuple[IndexEntry, ...]) -> RouteDecision:
+def _personal_route(root: Path, prompt: str, entries: tuple[IndexEntry, ...],
+                    ) -> tuple[RouteDecision, tuple[tuple[IndexEntry, int], ...]]:
     """Какую личную выдачу собрать. Вызывается ТОЛЬКО в личной сессии.
 
     Раньше эта же логика работала ПЕРЕД выбором проекта и могла увести
     закреплённую на проекте сессию в личную память подходящей фразой. Теперь
     сначала решается режим сессии, и только внутри личного режима выбирается,
     что именно отдать. Отбор здесь тот же, что в доставке (R7): просроченная
-    запись не должна рулить маршрутом.
+    запись не должна рулить маршрутом. Отобранные записи возвращаются
+    вместе с решением: доставка использует их, а не отбирает второй раз.
     """
     if _has_trigger(prompt, USER_CATALOG_TRIGGERS):
-        return RouteDecision(None, "user-catalog")
+        return RouteDecision(None, "user-catalog"), ()
     ranked = select_index_entries(root, prompt, entries)
     if ranked and ranked[0][0].section == "User":
-        return RouteDecision(None, "index-user")
-    return RouteDecision(None, "personal")
+        return RouteDecision(None, "index-user"), ranked
+    return RouteDecision(None, "personal"), ranked
 
 
 def _nonproject_context(
@@ -1616,6 +1549,7 @@ def _nonproject_context(
     *,
     include_hot: bool,
     state_dir: Path | None = None,
+    ranked: tuple[tuple[IndexEntry, int], ...] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     parts = [
         "[Канонический контекст общей памяти]",
@@ -1648,7 +1582,8 @@ def _nonproject_context(
             included.append("user-catalog")
             retrievals += 1
     else:
-        ranked = select_index_entries(root, prompt, entries)
+        if ranked is None:
+            ranked = select_index_entries(root, prompt, entries)
         доставленные = {entry.slug for entry, _ in ranked} | {"personal_inbox.md"}
         for entry, _score in ranked:
             if entry.slug == "personal_inbox.md":
@@ -1757,8 +1692,10 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
                 raise FileNotFoundError(index)
             hot_contract = _hot_contract(parse_index(build_index(global_root)))
             hot_key = contract_key(hot_contract)
-            revision = compute_revision(personal_root or global_root)
-            revision_note = _revision_note(global_root, personal_root)
+            global_revision = compute_revision(global_root)
+            personal_revision = compute_revision(personal_root) if personal_root else None
+            revision = personal_revision or global_revision
+            revision_note = _revision_note(global_revision, personal_revision)
             # Старт сессии проект НЕ выбирает: это работа первого сообщения.
             # Здесь только сообщаем состояние защёлки. После resume и compact
             # закрепление сохраняется, и его надо показать заново, потому что
@@ -1866,11 +1803,13 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             else:
                 pin_source = _pin_source(state_dir, session_id)
 
-            if pinned == PERSONAL_SCOPE:
-                decision = (_personal_route(personal_root, prompt, entries)
-                            if personal_root is not None else RouteDecision(None, "personal"))
-            else:
+            ranked = ()
+            if pinned != PERSONAL_SCOPE:
                 decision = RouteDecision(pinned, f"pinned:{pin_source}")
+            elif personal_root is not None:
+                decision, ranked = _personal_route(personal_root, prompt, entries)
+            else:
+                decision = RouteDecision(None, "personal")
             mismatch = _pin_mismatch(pinned, cwd)
             if decision.scope is None and personal_root is None:
                 context, selected = _contract_only_context(
@@ -1888,6 +1827,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     revision,
                     include_hot=include_hot,
                     state_dir=state_dir,
+                    ranked=ranked,
                 )
                 delivery = "global"
                 delivered_full = False

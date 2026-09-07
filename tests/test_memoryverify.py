@@ -14,6 +14,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO_SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_SOURCE / "lib"))
@@ -267,6 +268,25 @@ class ProbeTests(unittest.TestCase):
         report = check(self._tree("как чинить зелёный принтер"), base_tree())
         self.assertTrue(any("повторяет" in e for e in report.errors), report.errors)
 
+    def test_all_probes_share_one_index(self):
+        """Крючки всего дерева проверяются по одному индексу: чтение корпуса
+        на каждую запись росло квадратично с числом записей."""
+        import memorycontext as mc
+        cand = self._tree("чем чинить принтер зелёного цвета")
+        for name, hook, probe in (
+                ("reference_kettle", "как кипятить воду в чайнике", "кипятить воду чайник"),
+                ("reference_toaster", "как поджарить хлеб в тостере", "поджарить хлеб тостер")):
+            cand[f"memory/{name}.md"] = record(
+                name, type="reference", title=hook.capitalize(), index=hook,
+                source="разговор", observed_at="2026-09-04", probe=probe, body="Факт.\n")
+        with mock.patch.object(mc, "build_index", wraps=mc.build_index) as reads:
+            report = check(cand, base_tree(), questions=False)
+        self.assertTrue(report.ok, report.errors)
+        self.assertEqual(report.facts["probes"], {"reference_printer": True,
+                                                  "reference_kettle": True,
+                                                  "reference_toaster": True})
+        self.assertEqual(reads.call_count, 1)
+
     def test_client_probe_through_topic_delivery(self):
         rollup = ("# Acme\n\n## Обзор\n\nУстройство системы.\n\n"
                   "## Доступы\n\nSSH идёт через бастион, см. [[reference_acme_bastion]].\n")
@@ -282,6 +302,21 @@ class ProbeTests(unittest.TestCase):
             probe="какой у нас обзор устройства", body="Бастион.\n")
         report = check(cand, base, root="clients/acme")
         self.assertTrue(any("не содержит ссылки" in e for e in report.errors), report.errors)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_topics_are_parsed_once_per_bytes(self):
+        """Один разбор на версию байтов: писатель и статус зовут load_topics
+        по несколько раз за проход, другие байты дают другой разбор."""
+        first = mv.load_topics(TOPICS_RAW)
+        self.assertIs(first, mv.load_topics(TOPICS_RAW))
+        self.assertEqual(first.budget, {})
+        with_budget = dict(TOPICS, budget={"softBytes": 10, "softLines": 2,
+                                           "hardBytes": 20, "hardLines": 4})
+        other = mv.load_topics(json.dumps(with_budget, ensure_ascii=False).encode("utf-8"))
+        self.assertIsNot(first, other)
+        self.assertEqual(other.budget["hardBytes"], 20)
+        self.assertEqual(other.placement, first.placement)
 
 
 class ForeignTests(unittest.TestCase):

@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -51,6 +50,7 @@ sys.path.insert(0, str(HERE))
 
 import configpaths
 import memorycontext as mc
+import memoryverify
 import svodgit
 from memoryctl import compute_revision, federation_context
 
@@ -77,8 +77,6 @@ MEASUREMENT_FILES = (
     configpaths.config_path("topics.json"),
 )
 
-SLUG_RE = re.compile(r"[a-z0-9_]{1,64}")
-
 
 class EvalError(Exception):
     """Отказ стенда, который нельзя молча проглотить."""
@@ -95,14 +93,15 @@ def load_questions(path: Path = QUESTIONS_PATH) -> dict:
         if q.get("group") not in ("tuned", "heldout"):
             raise EvalError(f"{path}: у вопроса {q['id']} нет группы tuned/heldout")
         expect = q.get("expect")
-        if not isinstance(expect, str) or not SLUG_RE.fullmatch(expect):
+        if not isinstance(expect, str) or not memoryverify.SLUG_RE.fullmatch(expect):
             raise EvalError(f"{path}: у вопроса {q['id']} нет ожидаемой записи expect "
                             "(имя одной записи без .md)")
         if not q.get("markers"):
             raise EvalError(f"{path}: у вопроса {q['id']} нет признаков ответа markers")
         forbid = q.get("forbid", [])
         if (not isinstance(forbid, list)
-                or any(not isinstance(f, str) or not SLUG_RE.fullmatch(f) for f in forbid)):
+                or any(not isinstance(f, str) or not memoryverify.SLUG_RE.fullmatch(f)
+                       for f in forbid)):
             raise EvalError(f"{path}: у вопроса {q['id']} forbid не список имён записей")
     return data
 
@@ -146,7 +145,8 @@ def versions(root: Path) -> dict:
 
 def _evidence(path: Path, markers: list[str]) -> bool:
     """Признак ответа в ТЕЛЕ ожидаемой записи; шапка исключена."""
-    текст = mc._without_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+    текст = memoryverify.body_without_frontmatter(
+        path.read_text(encoding="utf-8", errors="replace"))
     return any(re.search(м, текст, re.IGNORECASE) for м in markers)
 
 
@@ -239,9 +239,7 @@ def replace_baseline(result: dict, path: Path | None = None) -> list[str]:
     слова о том, что сделано."""
     точка = Path(path) if path is not None else BASELINE_PATH
     байты = (json.dumps(result, ensure_ascii=False, indent=1) + "\n").encode("utf-8")
-    врем = точка.with_name(f".{точка.name}.new{os.getpid()}")
-    врем.write_bytes(байты)
-    os.replace(врем, точка)
+    svodgit.replace_file(точка, байты)
     заметки = [f"исходная точка записана: {точка}"]
     корень = точка.parent
     if not svodgit.is_repo(корень):

@@ -37,7 +37,6 @@ import argparse
 import datetime as dt
 import json
 import os
-import pathlib
 import sys
 from pathlib import Path
 
@@ -73,13 +72,9 @@ def _load_scope_roots() -> dict[str, tuple[Path, ...]]:
     свойства. Молча пустой или дублирующийся корень тихо снял бы потолок.
     """
     path = _config_path()
-    # Разбор из байтов, прочитанных memorycontext при импорте: scopeRoots и
-    # TOPICS одного вызова принадлежат одному поколению конфига (Q7).
-    try:
-        raw = json.loads(mc.TOPICS_RAW.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise MemoryctlError(f"не читается конфиг тем {path}: {exc}") from exc
-    section = raw.get("scopeRoots")
+    # Разбор, сделанный memorycontext при импорте: scopeRoots и TOPICS одного
+    # вызова принадлежат одному поколению конфига (Q7).
+    section = mc.TOPICS_CONFIG.get("scopeRoots")
     if not isinstance(section, dict) or not section:
         raise MemoryctlError(f"{path}: раздел scopeRoots пуст или не объект")
 
@@ -269,9 +264,10 @@ def build_body(root: Path, scope: str | None, prompt: str) -> tuple[str, tuple[s
             decision = mc.RouteDecision(None, "personal")
             return mc._contract_only_context(
                 index, hot_contract, decision, revision, include_hot=True)
-        decision = mc._personal_route(personal_root, prompt, entries)
+        decision, ranked = mc._personal_route(personal_root, prompt, entries)
         return mc._nonproject_context(
-            personal_root, index, entries, hot_contract, decision, prompt, revision, include_hot=True
+            personal_root, index, entries, hot_contract, decision, prompt, revision,
+            include_hot=True, ranked=ranked,
         )
     spec = mc.TOPICS[scope]
     # Не `pinned:`, потому что ничего не закрепляется. Слово «pinned» в
@@ -424,9 +420,8 @@ def explain(
             # Раскладка из поколения процесса (Q7), деревья владельцев из
             # контекста читателя (F8): зарегистрированное рабочее дерево
             # обслуживает и explain.
-            раскладка = topiclayout.placement_from_config(
-                json.loads(mc.TOPICS_RAW.decode("utf-8")), _config_path())
-        except (ValueError, UnicodeError, json.JSONDecodeError):
+            раскладка = topiclayout.placement_from_config(mc.TOPICS_CONFIG, _config_path())
+        except ValueError:
             раскладка = {}
         try:
             контекст = mc.reader_federation(root)

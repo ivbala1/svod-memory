@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import re
-
-import configpaths
 
 
 OWNER_RE = re.compile(r"^clients/[a-z0-9_]{1,64}$")
@@ -13,17 +10,6 @@ OWNER_RE = re.compile(r"^clients/[a-z0-9_]{1,64}$")
 
 def _error(path: Path, topic: object, detail: str) -> ValueError:
     return ValueError(f"{path}: тема {topic!r}: {detail}")
-
-
-def load_placement(path=None) -> dict[str, tuple[str, str | None]]:
-    """Читает строгую раскладку сводок из topics.json."""
-    config_path = (Path(path) if path is not None
-                   else configpaths.config_path("topics.json"))
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise _error(config_path, "<конфиг>", f"конфиг не читается ({exc})") from exc
-    return placement_from_config(raw, config_path)
 
 
 def placement_from_config(raw, config_path: Path) -> dict[str, tuple[str, str | None]]:

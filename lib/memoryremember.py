@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 
@@ -520,13 +519,7 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
         remote = None
         if fetched:
             remote = svodgit.remote_head(root)
-            if remote and head and remote != head and svodgit.is_ancestor(root, head, remote):
-                svodgit.git(root, "merge", "--quiet", "--ff-only", remote)
-                head = remote
-                head_tree = svodgit.read_tree(root, head)
-                files, _ = compute_files(candidate, head_tree, scope, config)
-            elif remote and not head:
-                svodgit.git(root, "reset", "--quiet", "--hard", remote)
+            if svodgit.fast_forward(root, head, remote):
                 head = remote
                 head_tree = svodgit.read_tree(root, head)
                 files, _ = compute_files(candidate, head_tree, scope, config)
