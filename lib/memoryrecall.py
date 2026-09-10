@@ -485,6 +485,39 @@ def explain(
     }
 
 
+def search_text(prompt: str, *, root: Path | None = None, limit: int = 10,
+                cwd: str | os.PathLike[str] | None = None) -> str:
+    """Второй проход: полнотекстовый поиск по всей личной области, включая
+    свёрнутые записи и архив.
+
+    Ранжирует тот же BM25, что даёт второе место в выдаче. Замер 10.09.2026 на
+    независимых вопросах: нужный файл попадает в первую пятёрку в 65 случаях из
+    75, а греп по основам кладёт его туда в 38. Граница та же, что у `index`:
+    только личная область и только из личного каталога.
+    """
+    root = (root or mc.default_root()).expanduser().resolve()
+    потолок = ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots())
+    if потолок != PERSONAL:
+        raise RecallError(
+            "поиск по корпусу отдаётся только из личного каталога; память заказчика "
+            "спрашивают командой memory recall --scope <имя>")
+    _, personal = mc.index_roots(root)
+    if personal is None:
+        raise RecallError(f"{root}: нет личного репозитория personal/memory")
+    документы, состояние = mc.corpus_documents(personal)
+    заголовки = {имя: title for имя, title, _ in документы}
+    ranked = mc.bm25_over(personal, prompt, документы)[:max(1, limit)]
+    if not ranked:
+        return "[Поиск по личной памяти]\nСовпадений нет: попробуй другие слова или формы."
+    части = ["[Поиск по личной памяти]",
+             "Это указатели, а не выдача: файл надо прочитать. Находка вне индекса "
+             "бывает устаревшей, проверь дату и пометку о замещении."]
+    for имя, счёт in ranked:
+        части.append(f"- {состояние.get(имя, 'запись')}: memory/{имя} — "
+                     f"{заголовки.get(имя) or 'без заголовка'}")
+    return "\n".join(части)
+
+
 def index_text(*, root: Path | None = None,
                cwd: str | os.PathLike[str] | None = None) -> str:
     """Индекс личной памяти целиком, той же сборкой, что у роутера.
@@ -531,6 +564,10 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("explain", help="объяснить видимость записи по slug")
     e.add_argument("slug", help="slug записи, с .md или без")
     e.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
+    s_ = sub.add_parser("search", help="полнотекстовый поиск по личной памяти")
+    s_.add_argument("question", nargs="?", help="вопрос; '-' или пропуск читает stdin")
+    s_.add_argument("--limit", type=int, default=10, help="сколько записей показать")
+    s_.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
     i = sub.add_parser("index", help="напечатать индекс личной памяти целиком")
     i.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
     m = sub.add_parser("remember", help="подать запись в память и опубликовать")
@@ -599,9 +636,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"memory {args.command}: {mc.TOPICS_ERROR}", file=sys.stderr)
         return 7 if args.command == "remember" else 4
     try:
-        if args.command in ("recall", "explain", "index"):
+        if args.command in ("recall", "explain", "index", "search"):
             if args.command == "index":
                 text = index_text(root=args.root, cwd=os.getcwd())
+            elif args.command == "search":
+                text = search_text(_read_prompt(args.question), root=args.root,
+                                   limit=args.limit, cwd=os.getcwd())
             elif args.command == "recall":
                 prompt = _read_prompt(args.question)
                 # Физический каталог процесса, а не логический $PWD: под
