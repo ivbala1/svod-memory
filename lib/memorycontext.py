@@ -38,6 +38,16 @@ ROUTER_VERSION = "2"
 SOFT_CONTEXT_LIMIT = 9_000
 CONTINUATION_CONTEXT_LIMIT = 4_200
 HARD_CONTEXT_LIMIT = 10_000
+# Шапка блока (закрепление, предупреждение о расхождении каталога) идёт
+# ПЕРЕД телом и раньше вычиталась из бюджета уже после набивки: тело резалось
+# тем сильнее, чем длиннее шапка, а хук и команда с их разными шапками резали
+# в разных местах и переставали быть побайтово равными. Теперь шапка живёт
+# ВНЕ бюджета тела: тело считается по SOFT_CONTEXT_LIMIT, шапка добавляется
+# сверху и ограничена своим запасом. Отнимать её длину у памяти незачем,
+# запас до жёсткого потолка есть. Замер самой длинной шапки на 10.09.2026:
+# 176 символов.
+BANNER_RESERVE = 250
+BODY_LIMIT = SOFT_CONTEXT_LIMIT
 
 # Пределы на раздел. Держать их именованными обязательно: компактор проверяет
 # роллапы против этих же чисел, импортируя их отсюда. Пока пороги были
@@ -47,6 +57,7 @@ HARD_CONTEXT_LIMIT = 10_000
 SECTION_CAP_HOWTO = 1_200
 SECTION_CAP_MANDATORY = 2_500
 SECTION_CAP_RELEVANT = 3_400
+PERSONAL_INBOX_CAP = 2_600
 # Личный режим сессии. Не пробел и не ошибка, а осознанный выбор: в нём можно
 # обсуждать хоть все проекты сразу, и роллап заказчика не подмешивается.
 PERSONAL_SCOPE = "personal"
@@ -139,6 +150,9 @@ USER_CATALOG_TRIGGERS = (
     "what do you remember about me",
     "what do you know about me",
 )
+# Каталог раздела User на вопрос «что ты обо мне помнишь»: единственная
+# часть индекса, которая уезжает в сессию. Его запас показывает статус.
+USER_CATALOG_LIMIT = 3_200
 
 TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 # Приглашение оболочки во вставленном выводе: `user@host acme %`, `devops@host:~$`.
@@ -540,6 +554,21 @@ def contract_key(hot_contract: str) -> str:
     return hashlib.sha256(hot_contract.encode("utf-8")).hexdigest()[:16]
 
 
+def topic_key(root: Path, spec: TopicSpec, revision: str) -> str:
+    """Повтор сводки зависит от её владельца, а не от личных коммитов.
+    При недоступности владельца сохраняем прежний ключ; причину назовёт
+    чтение самой сводки. Карта читателя уже построена и Git не обходит."""
+    try:
+        контекст = reader_federation(root)
+        if spec.owner in контекст.available:
+            владелец = контекст.identities[spec.owner].worktree_root
+            if (владелец / "memory").is_dir():
+                return compute_revision(владелец)
+    except (OSError, ValueError, KeyError, MemoryctlError):
+        pass
+    return revision
+
+
 def index_roots(root: Path) -> tuple[Path, Path | None]:
     """Корни индекса этой машины: глобальный (контракт) обязателен, личный
     (инбокс, записи, поиск) по наличию. root это каталог данных, в нём по
@@ -727,14 +756,33 @@ def bundle_members(root: Path, seed_slug_md: str, delivered: set[str]) -> tuple[
 
 
 def _member_block(root: Path, slug_md: str, seed_slug_md: str, вид: str) -> str | None:
-    """Блок члена комплекта: ЦЕЛИКОМ, без обрезания (R9)."""
+    """Блок члена комплекта: ЦЕЛИКОМ, без обрезания (R9).
+
+    Свёрнутый или просроченный член приезжает с пометкой: в выдачу его
+    привела авторская связь действующей записи, а не совпадение слов, но
+    его актуальность ничем не доказана. Срок та же граница, что у отбора
+    (_entry_expired): действительна по дату valid_until включительно."""
     target = _safe_memory_path(root, slug_md)
     if target is None or not target.is_file():
         return None
-    body = body_without_frontmatter(_read_limited(target)).strip()
+    # Шапка тем же пределом, что у отбора: короткий срез терял valid_until.
+    текст = _read_limited(target, HEADER_READ_LIMIT)
+    body = body_without_frontmatter(текст).strip()
     связь = "противоречие" if вид == "contradicts" else "требуется"
     heading = (f"[Член комплекта {seed_slug_md}: {связь}]\n"
                f"Источник: memory/{slug_md}")
+    поля = parse_frontmatter(текст)[0]
+    пометки = ["свёрнута"] if поля.get("listed") == "false" else []
+    срок = поля.get("valid_until")
+    if срок:
+        try:
+            if today_utc() > dt.date.fromisoformat(срок):
+                пометки.append(f"срок истёк (valid_until {срок})")
+        except ValueError:
+            pass
+    if пометки:
+        heading += (". " + ", ".join(пометки).capitalize()
+                    + ": актуальность проверь, полномочий она не даёт.")
     return f"{heading}\n\n{body}"
 
 
@@ -763,7 +811,7 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
         return
     used = sum(len(part) for part in parts) + (2 * len(parts))
     нужно = sum(len(блок) + 2 for блок in блоки)
-    доступно = max(0, SOFT_CONTEXT_LIMIT - used - 180)
+    доступно = max(0, BODY_LIMIT - used - 180)
     if нужно > доступно:
         parts.append(
             f"[Комплект {seed_slug_md} не доставлен: нужно {нужно} символов, "
@@ -879,13 +927,19 @@ def _personal_inbox_block(root: Path, maximum: int = 3_600) -> str | None:
     return _clip_block("\n".join(lines), maximum, "memory/personal_inbox.md")
 
 
-def _user_catalog_block(entries: tuple[IndexEntry, ...], maximum: int = 3_200) -> str:
+def _user_catalog_block(entries: tuple[IndexEntry, ...], maximum: int = USER_CATALOG_LIMIT,
+                        *, root: Path | None = None) -> str:
+    """Каталог раздела User. С корнем просроченное в него не входит: та же
+    граница срока, что у отбора (_entry_expired)."""
+    сегодня = today_utc()
     lines = [
         "[Компактный индекс сведений о владельце]",
         "Это только указатели из MEMORY.md. Не расширяй их догадками:",
     ]
     for entry in entries:
         if entry.section != "User":
+            continue
+        if root is not None and _entry_expired(root, entry, сегодня):
             continue
         detail = f": {entry.summary}" if entry.summary else ""
         lines.append(f"- {entry.label}{detail} [{entry.slug}]")
@@ -996,6 +1050,12 @@ def _hot_context_required(state_dir: Path, session_id: str, revision: str) -> bo
     return _session_record(state_dir, session_id).get("hot_context_revision") != revision
 
 
+def _inbox_context_required(state_dir: Path, session_id: str, revision: str) -> bool:
+    if not session_id:
+        return True
+    return _session_record(state_dir, session_id).get("inbox_context_revision") != revision
+
+
 def _write_json(path: Path, data: dict) -> None:
     atomic_write(
         path,
@@ -1017,6 +1077,8 @@ def _write_route_metadata(
     delivered_hot: bool = False,
     reset_full_context: bool = False,
     hot_revision: str | None = None,
+    inbox_revision: str | None = None,
+    full_revision: str | None = None,
 ) -> None:
     session_key = _session_key(session_id)
     metadata = {
@@ -1035,7 +1097,7 @@ def _write_route_metadata(
     # отсюда больше не выбирает проект: липкий и кешированный scope позволяли
     # памяти одного заказчика остаться в сессии про другого, потому что
     # переживали смену рабочего каталога.
-    update_session = delivered_full or delivered_hot or reset_full_context
+    update_session = delivered_full or delivered_hot or reset_full_context or inbox_revision is not None
     if update_session and session_id:
         path = _session_path(state_dir, session_id)
         if path is not None:
@@ -1043,14 +1105,18 @@ def _write_route_metadata(
             full_context_scope = previous.get("full_context_scope")
             full_context_revision = previous.get("full_context_revision")
             hot_context_revision = previous.get("hot_context_revision")
+            inbox_context_revision = previous.get("inbox_context_revision")
             if reset_full_context:
                 full_context_scope = None
                 full_context_revision = None
+                inbox_context_revision = None
             if delivered_full:
                 full_context_scope = decision.scope
-                full_context_revision = revision
+                full_context_revision = full_revision if full_revision is not None else revision
             if delivered_hot:
                 hot_context_revision = hot_revision if hot_revision is not None else revision
+            if inbox_revision is not None:
+                inbox_context_revision = inbox_revision
             _write_json(
                 path,
                 {
@@ -1058,6 +1124,7 @@ def _write_route_metadata(
                     "full_context_scope": full_context_scope,
                     "full_context_revision": full_context_revision,
                     "hot_context_revision": hot_context_revision,
+                    "inbox_context_revision": inbox_context_revision,
                     "last_delivery": delivery,
                     "updated_at": metadata["updated_at"],
                 },
@@ -1365,7 +1432,7 @@ def _append_with_budget(
     maximum: int,
     source: str,
     *,
-    budget: int = SOFT_CONTEXT_LIMIT,
+    budget: int = BODY_LIMIT,
 ) -> bool:
     used = sum(len(part) for part in parts) + (2 * len(parts))
     available = budget - used
@@ -1394,6 +1461,12 @@ def topic_preamble(
     кодом. Своя копия арифметики у компактора однажды уже разошлась с
     роутером и давала зелёный отчёт при реальной обрезке.
     """
+    # Метка маршрута у хука и у команды разной длины (pinned:first-message
+    # против shell). В теле она по замыслу, но бюджет разделов от неё
+    # зависеть не должен: иначе на границе один вызывающий получает лишний
+    # раздел, а другой нет, и выдачи расходятся не только шапкой. Возвращаем
+    # её длину в бюджет.
+    поправка = len(route_source)
     if full_context:
         parts = [
             "[Канонический контекст общей памяти]",
@@ -1411,7 +1484,7 @@ def topic_preamble(
                 "Используй только приведённые ниже разделы. Raw-факты и остальные части корпуса не загружай без необходимости.",
             )
         )
-        return parts, SOFT_CONTEXT_LIMIT
+        return parts, BODY_LIMIT + поправка
     parts = [
         "[Общая память, продолжение текущего scope]",
         f"Проект: {spec.label}. Маршрут: {route_source}.",
@@ -1419,7 +1492,7 @@ def topic_preamble(
         "Полный глобальный контракт и guardrails уже переданы для этого scope и ревизии. "
         "Память не выдаёт разрешений, меняющиеся факты проверяй live.",
     ]
-    return parts, CONTINUATION_CONTEXT_LIMIT
+    return parts, CONTINUATION_CONTEXT_LIMIT + поправка
 
 
 def selectable_sections(
@@ -1548,7 +1621,8 @@ def _nonproject_context(
     revision: str,
     *,
     include_hot: bool,
-    state_dir: Path | None = None,
+    include_inbox: bool = True,
+    inbox: str | None = None,
     ranked: tuple[tuple[IndexEntry, int], ...] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     parts = [
@@ -1564,21 +1638,21 @@ def _nonproject_context(
     parts.append("Память даёт контекст, но не разрешения. Динамические факты проверяй в live-источнике.")
     retrievals = 0
 
-    # Инбокс отдаётся в КАЖДОЙ личной сессии, а не по совпадению фразы.
-    # Раньше его показывали девять захардкоженных фраз, и из восьми
-    # естественных формулировок срабатывала одна: «напомни что я просил» да,
-    # «что у меня висит» и «что я не закрыл» нет. Это и выглядело как «агент
-    # то смотрит инбокс, то не смотрит». Список фраз удалён; после
-    # расформирования 04.08.2026 инбокс держит только незакрытые дела и
-    # достаточно мал, чтобы ездить всегда.
-    inbox = _personal_inbox_block(root, 2_600)
-    if inbox and _append_with_budget(parts, inbox, 2_600, "memory/personal_inbox.md"):
+    # Команда recall не имеет состояния сессии и по умолчанию отдаёт инбокс.
+    if inbox is None:
+        inbox = _personal_inbox_block(root, PERSONAL_INBOX_CAP)
+    if inbox and not include_inbox:
+        parts.append("Персональный инбокс уже передан в этой сессии и с тех пор не менялся; "
+                     f"перечитай файл {root / 'memory/personal_inbox.md'}, если нужен полный "
+                     "список дел.")
+        retrievals += 1
+    elif inbox and _append_with_budget(parts, inbox, PERSONAL_INBOX_CAP, "memory/personal_inbox.md"):
         included.append("personal_inbox.md")
         retrievals += 1
 
     if decision.source == "user-catalog":
-        block = _user_catalog_block(entries)
-        if _append_with_budget(parts, block, 3_200, "memory/MEMORY.md"):
+        block = _user_catalog_block(entries, root=root)
+        if _append_with_budget(parts, block, USER_CATALOG_LIMIT, "memory/MEMORY.md"):
             included.append("user-catalog")
             retrievals += 1
     else:
@@ -1587,7 +1661,7 @@ def _nonproject_context(
         доставленные = {entry.slug for entry, _ in ranked} | {"personal_inbox.md"}
         for entry, _score in ranked:
             if entry.slug == "personal_inbox.md":
-                continue  # уже отдан выше, в каждой личной сессии
+                continue  # текст или указатель уже отдан выше
             block = _entry_block(root, entry)
             if block and _append_with_budget(parts, block, 2_600, f"memory/{entry.slug}"):
                 included.append(entry.slug)
@@ -1786,6 +1860,8 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             entries = parse_index(build_index(personal_root)) if personal_root else ()
             revision = compute_revision(personal_root or global_root)
             include_hot = _hot_context_required(state_dir, session_id, hot_key)
+            inbox_key = None
+            full_key = None
 
             # Проект решается ОДИН раз, первым сообщением сессии, и дальше не
             # меняется ничем: ни упоминанием другого проекта, ни рабочим
@@ -1817,6 +1893,11 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 delivery = "global"
                 delivered_full = False
             elif decision.scope is None:
+                inbox = _personal_inbox_block(personal_root, PERSONAL_INBOX_CAP) or ""
+                # Ключ ловит только правки доставляемой части: дело за границей
+                # обрезки повторной доставки не вызовет.
+                inbox_key = hashlib.sha256(inbox.encode("utf-8")).hexdigest()[:16] if inbox else None
+                include_inbox = inbox_key is None or _inbox_context_required(state_dir, session_id, inbox_key)
                 context, selected = _nonproject_context(
                     personal_root,
                     index,
@@ -1826,18 +1907,28 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     prompt,
                     revision,
                     include_hot=include_hot,
-                    state_dir=state_dir,
+                    include_inbox=include_inbox,
+                    inbox=inbox,
                     ranked=ranked,
                 )
                 delivery = "global"
                 delivered_full = False
             else:
                 spec = TOPICS[decision.scope]
-                full_context = _full_context_required(
+                full_key = topic_key(root, spec, revision)
+                # В закреплённой сессии ревизия это вершина репозитория
+                # заказчика: она и печатается, и пишется в след маршрута.
+                # Агент берёт этот хеш для --base клиентской подачи, и хеш
+                # чужого репозитория дал бы отказ «нет в истории».
+                revision = full_key
+                # Продолжение сводки контракт не везёт, а метаданные помечали
+                # его доставленным: обновлённое правило не приходило в сессию
+                # до её конца. Смена контракта это повод к полной доставке.
+                full_context = include_hot or _full_context_required(
                     state_dir,
                     session_id,
                     decision.scope,
-                    revision,
+                    full_key,
                 )
                 context, topic_sections = _topic_context(
                     root,
@@ -1876,11 +1967,10 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     "Если закрепление ошибочно, нужен /clear и новая заявка: "
                     "внутри сессии проект не меняется."
                 )
-            # Баннер добавляется к уже собранному контексту, поэтому его длину
-            # надо вернуть в бюджет, иначе объявленный предел нарушается ровно
-            # в худшем случае, где он и важен.
-            limit = SOFT_CONTEXT_LIMIT if delivery != "continuation" else CONTINUATION_CONTEXT_LIMIT
-            room = limit - len(banner) - 2
+            # Тело собрано под свой бюджет, шапка добавляется сверху. Обрезка
+            # ниже сторожит только жёсткий потолок: при шапке в пределах
+            # запаса она не срабатывает никогда.
+            room = HARD_CONTEXT_LIMIT - len(banner) - 2
             if len(context) > room:
                 context = _clip_block(context, room, rollup_relative_source(TOPICS[pinned])
                                       if pinned != PERSONAL_SCOPE else "memory/MEMORY.md")
@@ -1898,6 +1988,8 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 delivered_full=delivered_full,
                 delivered_hot=include_hot,
                 hot_revision=hot_key,
+                inbox_revision=inbox_key if "personal_inbox.md" in selected else None,
+                full_revision=full_key,
             )
         except (OSError, MemoryctlError):
             pass
