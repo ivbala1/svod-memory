@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Доставка памяти любому агенту через оболочку, только чтение.
+"""Доставка памяти любому агенту через оболочку: чтение и подача записи.
+
+Читающая часть (recall, explain) не пишет ничего: это проверено тестом на
+корне без права записи. Подача (remember) пишет в память и публикует.
 
 Зачем. Доставка и защита записи живут в хуках ОДНОГО инструмента. Замер
 10.08.2026 показал, что вся разница между 1 и 10 верными ответами из 15 это
@@ -180,8 +183,14 @@ def resolve_scope(requested: str | None, потолок: str | None) -> str | No
     разрешено = allowed_scopes(потолок)
     if requested is None:
         return потолок
+    # Писатель называет область как `clients/<имя>`, и агент повторяет ту же
+    # запись у чтения. Принимаем обе формы, а отказ перечисляет допустимые.
+    if requested.startswith("clients/"):
+        requested = requested.split("/", 1)[1]
     if requested not in (set(mc.TOPICS) | {PERSONAL}):
-        raise RecallError(f"неизвестная область {requested!r}")
+        raise RecallError(f"неизвестная область {requested!r}; допустимы "
+                          + ", ".join(sorted({PERSONAL} | set(mc.TOPICS)))
+                          + " (клиентскую можно писать и как clients/<имя>)")
     if requested not in разрешено:
         где = "вне настроенных корней" if потолок is None else f"с потолком {потолок}"
         raise RecallError(
@@ -273,12 +282,14 @@ def build_body(root: Path, scope: str | None, prompt: str) -> tuple[str, tuple[s
     # Не `pinned:`, потому что ничего не закрепляется. Слово «pinned» в
     # стенограмме означало бы защёлку сессии, которой у команды нет.
     decision = mc.RouteDecision(scope, SHELL_SOURCE)
+    # Ревизия темы это вершина репозитория её владельца, ровно как у хука:
+    # иначе команда и хук печатали бы разные хеши одного материала.
     return mc._topic_context(
         root,
         spec,
         decision,
         prompt,
-        revision,
+        mc.topic_key(root, spec, revision),
         hot_contract,
         full_context=True,
         include_hot=True,
@@ -319,7 +330,9 @@ def recall(
     body, _ = _read_consistently(root, state_dir, lambda: build_body(root, итог, prompt))
 
     banner = banner_for(итог)
-    room = mc.SOFT_CONTEXT_LIMIT - len(banner) - 2
+    # Тело собрано под тот же бюджет, что у хука, а шапка живёт сверх него.
+    # Обрезка ниже сторожит только жёсткий потолок.
+    room = mc.HARD_CONTEXT_LIMIT - len(banner) - 2
     if len(body) > room:
         source = (
             mc.rollup_relative_source(mc.TOPICS[итог])
@@ -453,6 +466,9 @@ def explain(
         причина = f"просрочена: {просрочена}"
     elif not проиндексирована and свёрнута_в:
         причина = f"свёрнута в сводку {свёрнута_в}: канон формулировки в сводке темы"
+    elif (not проиндексирована and найденный_корень == personal_root
+          and поля.get("listed") == "false"):
+        причина = "свёрнута: вне индекса, находится поиском по корпусу"
     elif not проиндексирована:
         причина = "не проиндексирована (сирота)"
     else:
@@ -469,6 +485,27 @@ def explain(
     }
 
 
+def index_text(*, root: Path | None = None,
+               cwd: str | os.PathLike[str] | None = None) -> str:
+    """Индекс личной памяти целиком, той же сборкой, что у роутера.
+
+    Поверхность отбора курирует владелец, а посмотреть на неё было нечем:
+    `explain` отвечает про одну запись, реплика роутера показывает только
+    выбранные. Потолок тот же, что у `recall`: из каталога заказчика личный
+    индекс не отдаём, иначе команда стала бы обходом границы областей.
+    """
+    root = (root or mc.default_root()).expanduser().resolve()
+    потолок = ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots())
+    if потолок != "personal":
+        raise RecallError(
+            "личный индекс отдаётся только из личного каталога; у сводки "
+            "заказчика индекса нет, её разделы и запас показывает memory status")
+    _, personal = mc.index_roots(root)
+    if personal is None:
+        raise RecallError(f"{root}: нет личного репозитория personal/memory")
+    return mc.build_index(personal)
+
+
 def _read_prompt(значение: str | None) -> str:
     """Вопрос из аргумента или со стандартного ввода.
 
@@ -483,7 +520,8 @@ def _read_prompt(значение: str | None) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memory",
-        description="Память агента из оболочки. Пока только чтение.",
+        description="Память агента из оболочки: чтение, объяснение видимости, "
+                    "подача записи и состояние репозиториев.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     r = sub.add_parser("recall", help="напечатать блок памяти по вопросу")
@@ -493,24 +531,41 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("explain", help="объяснить видимость записи по slug")
     e.add_argument("slug", help="slug записи, с .md или без")
     e.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
-    # Срез 1 блока 3 (B11). Команда remember промежуточная: в штатные
-    # инструкции агентов не вносится до среза 3 (T5).
-    m = sub.add_parser("remember", help="принять предложение в журнал памяти")
-    m.add_argument("--scope", required=True, help="логическая область предложения")
+    i = sub.add_parser("index", help="напечатать индекс личной памяти целиком")
+    i.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
+    m = sub.add_parser("remember", help="подать запись в память и опубликовать")
+    m.add_argument("--scope", required=True,
+                   help="ровно один репозиторий: global (контракт сессии), "
+                        "personal (инбокс и личные записи) либо clients/<имя>")
     m.add_argument("--id", required=True, dest="proposal_id",
-                   help="идентификатор идемпотентности [a-z0-9][a-z0-9_-]{7,63}")
-    m.add_argument("--file", default=None, help="файл тела; без него читается stdin")
+                   help="идентификатор идемпотентности: буквы, цифры, точка, дефис, "
+                        "подчёркивание, до 80 символов; тот же id с тем же телом "
+                        "безвреден, с другим телом отказ")
+    m.add_argument("--file", default=None,
+                   help="файл тела; без него читается stdin. Временный файл не "
+                        "обязателен: подходит подстановка процесса, например "
+                        "--file <(cat <<'EOF' ... EOF)")
     m.add_argument("--content-type", default="markdown",
                    choices=["markdown", "manifest"])
     m.add_argument("--source", default="shell", help="агент-источник")
     m.add_argument("--session", default="shell", help="идентификатор сессии")
-    m.add_argument("--birth-pair", default=None,
-                   help="устарело (Свод-0, шаг 2): крючок поиска задаётся "
-                        "полем probe в шапке записи; приложенная пара не "
-                        "пишется и называется предупреждением")
-    m.add_argument("--projection", default=None,
-                   help="JSON-файл проекции кандидата (конверт v2, срез 2): "
-                        "record_slug [+ index_line + index_section]")
+    m.add_argument("--record", default=None,
+                   help="имя записи: файл memory/<имя>.md. Личной и глобальной "
+                        "записи этого достаточно")
+    m.add_argument("--section", default=None,
+                   help="раздел сводки темы, куда уезжает указатель клиентской записи")
+    m.add_argument("--line", default=None,
+                   help="строка-указатель со ссылкой на запись; клиентской записи "
+                        "нужна вместе с --section")
+    m.add_argument("--base", default=None,
+                   help="хеш версии корпуса, на которой читалась запись; короткий "
+                        "от семи знаков годится. Сверка не даст затереть более "
+                        "позднюю правку, а запись разрешено переписать под тем же именем")
+    m.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="только проверить и напечатать вердикт: без замка, без "
+                        "коммита и без следа в каталоге состояния. Вердикт о "
+                        "локальном снимке: занятость id, устаревание основы и "
+                        "состояние сервера видны только настоящей подаче")
     m.add_argument("--json", action="store_true", dest="as_json")
     st = sub.add_parser("status", help="состояние репозиториев памяти из git и каталога ожидания")
     st.add_argument("--fetch", action="store_true", help="сначала fetch с сервера")
@@ -521,12 +576,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _refused_early(args, reason: str) -> int:
-    """Отказ до подачи (проекция, тело): в failed/, как у проверок."""
+    """Отказ до подачи (проекция, тело): в failed/, как у проверок.
+    Сухой прогон следа не оставляет: он ничего не подавал."""
     import memoryremember
-    target = memoryremember.refuse_before_submit(
-        scope=args.scope, candidate_id=args.proposal_id, source=args.source,
-        session=args.session, content_type=args.content_type, reason=reason)
+    target = None
+    if not args.dry_run:
+        target = memoryremember.refuse_before_submit(
+            scope=args.scope, candidate_id=args.proposal_id, source=args.source,
+            session=args.session, content_type=args.content_type, reason=reason)
     result = {"state": "failed", "reason": reason}
+    if args.dry_run:
+        result["dry_run"] = True
     if target is not None:
         result["file"] = str(target)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -539,8 +599,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"memory {args.command}: {mc.TOPICS_ERROR}", file=sys.stderr)
         return 7 if args.command == "remember" else 4
     try:
-        if args.command in ("recall", "explain"):
-            if args.command == "recall":
+        if args.command in ("recall", "explain", "index"):
+            if args.command == "index":
+                text = index_text(root=args.root, cwd=os.getcwd())
+            elif args.command == "recall":
                 prompt = _read_prompt(args.question)
                 # Физический каталог процесса, а не логический $PWD: под
                 # символической ссылкой они расходятся, и потолок считался
@@ -551,27 +613,28 @@ def main(argv: list[str] | None = None) -> int:
                                   ensure_ascii=False, sort_keys=True)
         elif args.command == "remember":
             import memoryremember
+            # Указатель записи это три флага, а не файл JSON: у подачи
+            # остаётся одна команда и на одно понятие меньше.
+            беды: list[str] = []
             проекция = None
-            if args.projection:
-                try:
-                    raw = Path(args.projection).read_bytes()
-                    if len(raw) > 8 * 1024:
-                        raise ValueError("projection файл больше предела")
-                    проекция = json.loads(raw.decode("utf-8"))
-                except (OSError, ValueError) as exc:
-                    return _refused_early(args, f"projection: {exc}")
-            if args.birth_pair:
-                print("memory remember: --birth-pair больше не читается, крючок это поле "
-                      "probe в шапке записи", file=sys.stderr)
+            if args.record is not None or args.section is not None or args.line is not None:
+                проекция = {"record_slug": args.record}
+                if args.section is not None:
+                    проекция["index_section"] = args.section
+                if args.line is not None:
+                    проекция["index_line"] = args.line
+            тело = b""
             try:
                 тело = (Path(args.file).read_bytes() if args.file
                         else sys.stdin.buffer.read())
             except OSError as exc:
-                return _refused_early(args, f"тело: {exc}")
+                беды.append(f"тело: {exc}")
+            if беды:
+                return _refused_early(args, "; ".join(беды))
             код, результат = memoryremember.run_remember(
                 scope=args.scope, candidate_id=args.proposal_id, source=args.source,
                 session=args.session, content_type=args.content_type, body=тело,
-                projection=проекция)
+                projection=проекция, dry_run=args.dry_run, base=args.base)
             if args.as_json:
                 print(json.dumps(результат, ensure_ascii=False, sort_keys=True))
             else:

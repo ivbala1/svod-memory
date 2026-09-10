@@ -57,12 +57,10 @@ class LocalDrill(unittest.TestCase):
     def remember(self, machine, slug, hook, probe, body, *, code=0):
         candidate = self.fed.base / f"{slug}.md"
         candidate.write_bytes(fresh_record(slug, hook, probe, body))
-        projection = self.fed.base / "projection.json"
-        projection.write_text(json.dumps({"record_slug": slug}))
         result = self.cli(machine, "memory", "remember", "--scope", "personal",
                           "--id", f"{machine}-{slug}", "--source", "local-drill",
                           "--session", "step6", "--file", candidate,
-                          "--projection", projection, "--json", code=code)
+                          "--record", slug, "--json", code=code)
         parsed = json.loads(result.stdout)
         self.assertEqual(parsed["state"], "saved" if code == 0 else "pending", parsed)
         return candidate.read_bytes()

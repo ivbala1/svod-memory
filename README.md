@@ -155,19 +155,24 @@ using the router's own selection. Provenance must reflect the actual source
 and observation date.
 
 ```sh
-bin/memory remember --scope personal --id example-1 \
-  --source agent --session example --content-type markdown \
-  --file /absolute/path/to/record.md --projection /absolute/path/to/projection.json --json
+bin/memory remember --scope personal --id example-1 --record reference_example \
+  --source agent --session example \
+  --file /absolute/path/to/record.md --json
 ```
 
-The projection file can contain `{"record_slug":"reference_example"}`
-when the record has a complete header. A client projection also supplies
-`index_section` and `index_line`, with a link to the record in that line.
+`--record` names the record: it lands in `memory/<name>.md`. A client
+record also needs `--section` (an existing rollup section) and `--line`
+(the pointer line linking to the record). `--base` names the corpus
+revision the author actually read, full or abbreviated to seven or more
+characters; it prevents overwriting a later edit and allows rewriting the
+record under the same `--id`. `--dry-run` prints the same verdict without
+the lock, the commit, or any trace in the state directory.
 
 `--content-type manifest` accepts a JSON object with a nonempty `changes`
 list and optional `base_revision` from the actual read. Each change has
 `operation` (`put` or `remove`) and a unique `path` under `memory/`;
-`put` also requires string `content`. A call affects one repository.
+`put` carries either string `content` or `file`, a path to a local file
+holding that text. A call affects one repository.
 
 The writer checks the exact staged tree and outgoing commit range.
 `saved` (exit 0) means the server accepted the commit. `pending` (4)

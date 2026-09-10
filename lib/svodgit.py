@@ -191,7 +191,12 @@ def read_tree(root: Path, commit: str | None, prefix: str = "memory/") -> dict[s
         return {}
     listing = git(root, "ls-tree", "-r", "-z", commit, "--", prefix.rstrip("/"), check=False)
     if listing.returncode != 0:
-        return {}
+        # У живого коммита ls-tree всегда успешен, даже когда каталога памяти
+        # в нём нет: пустая выдача это пустое дерево. Ненулевой код значит
+        # «объект не прочитался», и молчаливый пустой словарь превратил бы
+        # поломку репозитория в зелёную проверку по пустому корпусу.
+        raise GitError(f"дерево {commit} не читается: "
+                       + listing.stderr.decode("utf-8", "replace").strip())
     entries: list[tuple[str, str]] = []
     for item in listing.stdout.split(b"\0"):
         if not item:

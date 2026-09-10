@@ -481,3 +481,54 @@ class GlobalContractTests(unittest.TestCase):
         errors, warnings = mv.link_errors(tree, None, "personal")
         self.assertEqual(errors, [])
         self.assertTrue(any("unresolved wiki link" in w for w in warnings))
+
+
+class FoldedReachTests(unittest.TestCase):
+    """Свёрнутая личная запись (`listed: false`) достижима: её находит поиск
+    по корпусу, поэтому свернуть её можно без сводки. Потерять строку
+    индекса без явной свёртки нельзя. У заказчика свёрнутую держит сводка."""
+
+    ЧАЙНИК = dict(type="reference", title="Чайник на даче",
+                  index="электрический чайник, накипь", probe="чем снять накипь в чайнике")
+    ТЕЛО = "Накипь снимается лимонной кислотой.\n"
+
+    def kettle_base(self):
+        tree = base_tree()
+        tree["memory/reference_kettle.md"] = record("reference_kettle", body=self.ТЕЛО, **self.ЧАЙНИК)
+        return tree
+
+    def test_folding_personal_record_with_search_line_is_accepted(self):
+        base = self.kettle_base()
+        cand = dict(base)
+        cand["memory/reference_kettle.md"] = record(
+            "reference_kettle", body=self.ТЕЛО, listed="false", **self.ЧАЙНИК)
+        report = check(cand, base)
+        self.assertFalse(any("недостижим" in e for e in report.errors), report.errors)
+        self.assertTrue(report.ok, report.errors)
+
+    def test_record_losing_index_line_without_folding_is_lost(self):
+        """Потеря строки индекса без явной свёртки это ошибка, а не свёртка."""
+        base = self.kettle_base()
+        cand = dict(base)
+        поля = {k: v for k, v in self.ЧАЙНИК.items() if k != "index"}
+        cand["memory/reference_kettle.md"] = record("reference_kettle", body=self.ТЕЛО, **поля)
+        report = check(cand, base)
+        self.assertTrue(any("reference_kettle.md" in e and "недостижим" in e
+                            for e in report.errors), report.errors)
+
+    def test_client_folded_record_still_needs_rollup(self):
+        base = {
+            "memory/MEMORY.md": PREAMBLE.encode("utf-8"),
+            "memory/topics/acme.md": "# Acme\n\n## Обзор\n\nУстройство.\n".encode("utf-8"),
+            "memory/reference_gate.md": record(
+                "reference_gate", type="reference", title="Шлагбаум у офиса",
+                index="пульт шлагбаума", probe="как открыть шлагбаум", body="Пульт у охраны.\n"),
+        }
+        cand = dict(base)
+        cand["memory/reference_gate.md"] = record(
+            "reference_gate", type="reference", title="Шлагбаум у офиса",
+            index="пульт шлагбаума", probe="как открыть шлагбаум", listed="false",
+            body="Пульт у охраны.\n")
+        report = check(cand, base, root="clients/acme")
+        self.assertTrue(any("reference_gate.md" in e and "недостижим" in e
+                            for e in report.errors), report.errors)

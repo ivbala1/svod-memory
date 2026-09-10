@@ -486,8 +486,8 @@ def probe_required_errors(candidate: dict[str, bytes], root: str) -> list[str]:
     Доставляемая: в индексном корне запись со строкой индекса, в
     клиентском любая запись (её отдаёт указатель сводки, listed ей не
     указ). Свёрнутая запись индексного корня и архив крючка не требуют:
-    свёрнутую держит проза сводки в другом репозитории, архив находят
-    только по имени."""
+    свёрнутую в личном корне находит поиск по корпусу, в глобальном свёртки
+    нет (контракт отказывает), архив находит тот же поиск по корпусу."""
     import memorycontext as mc
     client = client_name(root) is not None
     errors: list[str] = []
@@ -717,11 +717,32 @@ def router_index_slugs(index_text: str) -> set[str]:
     return {entry.slug for entry in mc.parse_index(index_text)}
 
 
+def folded_slugs(tree: dict[str, bytes]) -> set[str]:
+    """Свёрнутые записи дерева (`listed: false`): вне индекса, их находит
+    поиск по корпусу."""
+    out = set()
+    for path, data in tree.items():
+        if not _is_record_path(path):
+            continue
+        try:
+            fields, _ = parse_frontmatter(data.decode("utf-8"))
+        except UnicodeDecodeError:
+            continue
+        if fields.get("listed") == "false":
+            out.add(path[len(MEMORY_PREFIX):])
+    return out
+
+
 def unreachable_records(tree: dict[str, bytes], known_topics: set[str],
-                        extra_rollups: str = "") -> set[str]:
+                        extra_rollups: str = "", *,
+                        searchable_folded: bool = False) -> set[str]:
     """Записи, недостижимые ни из индекса, ни из сводки темы. known_topics
-    это пути сводок вида topics/<файл>."""
+    это пути сводок вида topics/<файл>. В личной области достижима и
+    свёрнутая запись (`listed: false`): её находит поиск по корпусу. У
+    заказчика свёрнутую держит сводка."""
     from_index = router_index_slugs(router_index_text(tree))
+    if searchable_folded:
+        from_index |= folded_slugs(tree)
     rollups = "\n".join(
         [text.decode("utf-8", "replace")
          for path, text in tree.items() if path[len(MEMORY_PREFIX):] in known_topics]
@@ -775,7 +796,9 @@ def reach_errors(base: dict[str, bytes], candidate: dict[str, bytes],
                  topics: Topics, root: str) -> list[str]:
     known = {f"topics/{name}" for name in topics.placement}
     errors: list[str] = []
-    for name in sorted(unreachable_records(candidate, known) - unreachable_records(base, known)):
+    folded = root == "personal"
+    for name in sorted(unreachable_records(candidate, known, searchable_folded=folded)
+                       - unreachable_records(base, known, searchable_folded=folded)):
         errors.append(
             f"memory/{name}: запись становится недостижимой (нет ни строки в индексе, "
             "ни упоминания в сводке темы); дай ей строку индекса в шапке (type, title, "
@@ -894,9 +917,10 @@ def probe_errors(base: dict[str, bytes], candidate: dict[str, bytes], *,
         if not probe:
             continue
         if client is None and fields.get("listed") == "false":
-            # Свёрнутую запись общего корня индекс не выдаёт по построению:
-            # её держит упоминание в сводке (проверка достижимости), крючок
-            # молчит. Клиентскую запись ищут через сводку, listed ей не указ.
+            # Свёрнутую запись общего корня автоматический отбор не выдаёт
+            # по построению: в личном корне её находит поиск по корпусу, в
+            # глобальном свёртки нет (контракт отказывает); крючок молчит.
+            # Клиентскую запись ищут через сводку, listed ей не указ.
             continue
         label = f"memory/{slug}.md"
         if is_tautology(probe, tautology_candidates(slug, text)):
