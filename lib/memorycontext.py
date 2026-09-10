@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
+import functools
 import hashlib
 import json
+import math
 import os
 import pathlib
 from pathlib import Path, PurePosixPath
@@ -133,6 +136,13 @@ CONTRACT_LIMIT = 2_600
 # памяти отводится записям индекса. Стенд читает эту константу и считает
 # выдачу шире потолка неисправностью отбора.
 DELIVERY_LIMIT = 2
+# Два места в выдаче разные: первое берёт совпадение по заголовку и строке
+# поиска, второе полнотекстовый BM25 по телам. Пороги подобраны 10.09.2026 на
+# наборе независимых вопросов (PRODUCTION_STATE.ru.md, раздел про поиск).
+SELECT_THRESHOLD = 5
+BM25_THRESHOLD = 10.0
+BM25_K1 = 1.2
+BM25_B = 0.75
 
 INDEX_SECTIONS = {
     "inbox": "Inbox",
@@ -820,6 +830,87 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
     parts.extend(блоки)
 
 
+def _match_key(token: str) -> str:
+    """Ключ совпадения, тот же, что у `_token_match`: слово целиком либо его
+    первые пять букв."""
+    return token[:5] if len(token) >= 5 else token
+
+
+@functools.lru_cache(maxsize=4)
+def _bm25_documents(root: Path, записи: tuple[tuple[str, str, str], ...]):
+    """Тела записей в ключах совпадения, один раз на процесс.
+
+    Писатель зовёт отбор на каждый крючок дерева (сейчас их больше сотни), и
+    пересборка на каждый вызов стоила бы секунд вместо миллисекунд."""
+    docs: dict[str, list[str]] = {}
+    df: Counter = Counter()
+    for slug, label, summary in записи:
+        target = _safe_memory_path(root, slug)
+        тело = ""
+        if target is not None and target.is_file():
+            try:
+                тело = body_without_frontmatter(_read_limited(target, HEADER_READ_LIMIT))
+            except OSError:
+                тело = ""
+        ключи = [_match_key(t) for t in _tokens(f"{label} {summary} {тело}")]
+        docs[slug] = ключи
+        df.update(set(ключи))
+    средняя = sum(len(d) for d in docs.values()) / (len(docs) or 1)
+    return docs, dict(df), len(docs) or 1, средняя
+
+
+def corpus_documents(root: Path) -> tuple[tuple[tuple[str, str, str], ...], dict[str, str]]:
+    """Все записи области для явного поиска: действующие, свёрнутые и архив.
+    Тройки (имя, заголовок, строка поиска) и состояние каждой записи. Шапка
+    прежнего формата (`name`, `description`) читается наравне с нынешней."""
+    memory_root = root / "memory"
+    индекс = {e.slug for e in parse_index(build_index(root))}
+    документы: list[tuple[str, str, str]] = []
+    состояние: dict[str, str] = {}
+    for файл in sorted(memory_root.glob("*.md")) + sorted((memory_root / "archive").glob("*.md")):
+        if файл.name == "MEMORY.md" or файл.is_symlink():
+            continue
+        try:
+            поля, _ = parse_frontmatter(_read_limited(файл, HEADER_READ_LIMIT))
+        except (OSError, UnicodeError):
+            continue
+        имя = файл.relative_to(memory_root).as_posix()
+        документы.append((имя, поля.get("title") or поля.get("name", ""),
+                          поля.get("index") or поля.get("description", "")))
+        состояние[имя] = ("архив" if имя.startswith("archive/")
+                          else "действующая" if имя in индекс else "свёрнутая")
+    return tuple(документы), состояние
+
+
+def bm25_over(root: Path, prompt: str,
+              документы: tuple[tuple[str, str, str], ...]) -> list[tuple[str, float]]:
+    """Полнотекстовый BM25 по данным записям: чем реже слово в корпусе, тем
+    больше его вес, а длинная запись не выигрывает у короткой просто длиной."""
+    docs, df, n, средняя = _bm25_documents(root, документы)
+    вопрос = {_match_key(t) for t in _tokens(prompt)}
+    итог: list[tuple[str, float]] = []
+    for slug, d in docs.items():
+        tf = Counter(d)
+        счёт = 0.0
+        for k in вопрос:
+            число = tf.get(k, 0)
+            if not число:
+                continue
+            idf = math.log(1 + (n - df[k] + 0.5) / (df[k] + 0.5))
+            счёт += idf * число * (BM25_K1 + 1) / (
+                число + BM25_K1 * (1 - BM25_B + BM25_B * len(d) / средняя))
+        if счёт > 0:
+            итог.append((slug, счёт))
+    итог.sort(key=lambda пара: (-пара[1], пара[0]))
+    return итог
+
+
+def bm25_ranking(root: Path, prompt: str,
+                 entries: tuple[IndexEntry, ...]) -> list[tuple[str, float]]:
+    """BM25 по записям индекса: второе место в выдаче."""
+    return bm25_over(root, prompt, tuple((e.slug, e.label, e.summary) for e in entries))
+
+
 def select_index_entries(
     root: Path,
     prompt: str,
@@ -827,38 +918,44 @@ def select_index_entries(
     *,
     today: dt.date | None = None,
 ) -> tuple[tuple[IndexEntry, int], ...]:
-    """Отбор записей для доставки: ранжирование плюс фильтр valid_until.
+    """Отбор записей для доставки: два места, и достаются они по-разному.
+
+    Первое место берёт совпадение по заголовку и строке поиска (порог
+    SELECT_THRESHOLD), второе полнотекстовый BM25 по телам. Прежнее правило
+    второго места (тот же счёт, не меньше 6 очков и половины первого) удалено:
+    на наборе независимых вопросов 10.09.2026 оно давало 13 попаданий из 33 при
+    8 ложных срабатываниях из 17, а два разных места дают 21 из 33 при 1 из 17,
+    и старый стенд остаётся полным (30 из 30).
 
     R7 замороженных критериев блока 2: просроченность применяется по времени
     запроса ДО ограничения числа записей, поэтому просроченная запись с
-    максимальным баллом не вытесняет действующую с меньшим. Реализация
-    эквивалентна ранжированию по корпусу без просроченных записей: кандидаты
-    обходятся в порядке рангов, просроченные выпадают, а правило второй записи
-    применяется к первым двум ЖИВЫМ. frontmatter читается только у верхних
-    кандидатов, не у всего корпуса. review_after здесь не участвует (R8): он
-    не скрывает запись и не меняет её балл.
+    максимальным счётом не вытесняет действующую. frontmatter читается только у
+    верхних кандидатов, не у всего корпуса. review_after здесь не участвует
+    (R8): он не скрывает запись и не меняет её счёт.
     """
     сегодня = today if today is not None else today_utc()
-    кандидаты = [
-        (entry, _entry_score(prompt, entry))
-        for entry in entries
-        if entry.section in INDEX_SECTIONS.values()
-    ]
-    кандидаты = [пара for пара in кандидаты if пара[1] >= 4]
-    кандидаты.sort(key=lambda пара: (-пара[1], пара[0].index))
-    живые: list[tuple[IndexEntry, int]] = []
-    for entry, score in кандидаты:
+    видимые = tuple(e for e in entries if e.section in INDEX_SECTIONS.values())
+    выбрано: list[tuple[IndexEntry, int]] = []
+    по_индексу = sorted(((e, _entry_score(prompt, e)) for e in видимые),
+                        key=lambda пара: (-пара[1], пара[0].index))
+    for entry, score in по_индексу:
+        if score < SELECT_THRESHOLD:
+            break
         if _entry_expired(root, entry, сегодня):
             continue
-        живые.append((entry, score))
-        if len(живые) == DELIVERY_LIMIT:
-            break
-    if not живые:
-        return ()
-    selected = [живые[0]]
-    if len(живые) > 1 and живые[1][1] >= 6 and (живые[1][1] * 2) >= живые[0][1]:
-        selected.append(живые[1])
-    return tuple(selected)
+        выбрано.append((entry, score))
+        break
+    занято = {entry.slug for entry, _ in выбрано}
+    по_слагу = {e.slug: e for e in видимые}
+    for slug, счёт in bm25_ranking(root, prompt, видимые):
+        if счёт < BM25_THRESHOLD or slug in занято:
+            continue
+        entry = по_слагу[slug]
+        if _entry_expired(root, entry, сегодня):
+            continue
+        выбрано.append((entry, int(счёт)))
+        break
+    return tuple(выбрано[:DELIVERY_LIMIT])
 
 
 def _has_trigger(prompt: str, triggers: Iterable[str]) -> bool:
