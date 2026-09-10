@@ -135,6 +135,39 @@ def compute_revision(root: Path) -> str:
 # ---------------------------------------------------------------------------
 # Ссылки для doctor
 
+WIKI_UNRESOLVED = ": unresolved wiki link: "
+# Общая часть, а не собственный источник: провенансом для клиентской сводки
+# служат личная и глобальная области, соседний заказчик им не служит.
+SHARED_AREAS = ("personal", "global")
+
+
+def _across_areas(root: Path, scope: str, warning: str) -> str:
+    """Указатель в другую область федерации это провенанс, а не обрыв.
+
+    Корпус разделён на области, и вики-ссылка разрешается только внутри
+    своей (Свод-0, шаг 4). Но клиентская сводка законно называет личную
+    запись-первоисточник, из которой её формулировка выросла: цель на месте,
+    доставке ссылка ничего не стоит, читателю она говорит, откуда факт. Такие
+    указатели надо называть, а не считать поломкой, иначе три десятка вечно
+    красных предупреждений приучают не смотреть на проверку вовсе.
+
+    ⚠️ Граница здесь настоящая: ссылка в область ДРУГОГО заказчика остаётся
+    предупреждением. Это межклиентская утечка, ради запрета которой области и
+    разделяли.
+    """
+    if WIKI_UNRESOLVED not in warning:
+        return warning
+    stem = warning.split(WIKI_UNRESOLVED, 1)[1].strip()
+    federation = root.parent.parent if scope.startswith("clients/") else root.parent
+    for area in SHARED_AREAS:
+        if area == scope:
+            continue
+        if (federation / area / "memory" / f"{stem}.md").is_file():
+            return warning.replace(WIKI_UNRESOLVED,
+                                   f": wiki link to the {area} area: ")
+    return warning
+
+
 def validate_links(root: Path, files: list[Path], scope: str = "personal",
                    topics_raw: bytes | None = None) -> tuple[list[str], list[str]]:
     """Ссылки файлов области memory по правилу memoryverify.link_errors плюс
@@ -148,6 +181,7 @@ def validate_links(root: Path, files: list[Path], scope: str = "personal",
             continue
     raw = topics_raw if topics_raw is not None else configpaths.config_path("topics.json").read_bytes()
     errors, warnings = memoryverify.link_errors(snapshot, memoryverify.load_topics(raw), scope)
+    warnings = [_across_areas(root, scope, w) for w in warnings]
     memory_root = (root / "memory").resolve()
     for path in files:
         relative = path.relative_to(root).as_posix()
@@ -170,8 +204,13 @@ def validate_links(root: Path, files: list[Path], scope: str = "personal",
 
 
 def countable_link_warnings(warnings: list[str]) -> set[str]:
+    """Что считается долгом. Архив, цель вне корпуса и указатель в общую
+    область федерации долгом не являются: первое история, второе про эту
+    машину, третье провенанс."""
     return {w for w in warnings
-            if not w.startswith("memory/archive/") and "external link target missing" not in w}
+            if not w.startswith("memory/archive/")
+            and "external link target missing" not in w
+            and "wiki link to the " not in w}
 
 
 def drifted_records(snapshot: dict, own_client: str | None = None,

@@ -10,6 +10,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from unittest import mock
 REPO_SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_SOURCE / "lib"))
 
+import memoryctl as mc  # noqa: E402
 import memoryverify as mv  # noqa: E402
 
 TODAY = dt.date(2026, 9, 4)
@@ -481,6 +483,54 @@ class GlobalContractTests(unittest.TestCase):
         errors, warnings = mv.link_errors(tree, None, "personal")
         self.assertEqual(errors, [])
         self.assertTrue(any("unresolved wiki link" in w for w in warnings))
+
+
+class CrossAreaLinkTests(unittest.TestCase):
+    """Указатель из области в область федерации.
+
+    Корпус разделён на области, и вики-ссылка разрешается только внутри своей
+    (Свод-0, шаг 4). Но сводка заказчика законно называет личную запись, из
+    которой её формулировка выросла: три десятка таких указателей висели
+    предупреждениями, и на их фоне настоящий обрыв стал бы невидим.
+    ⚠️ Ссылка в область ДРУГОГО заказчика предупреждением остаётся: ради
+    запрета этой утечки области и разделяли.
+    """
+
+    def федерация(self, где_цель: str | None):
+        корень = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, корень, True)
+        for область in ("personal", "clients/acme", "clients/other"):
+            (корень / область / "memory").mkdir(parents=True)
+        if где_цель is not None:
+            (корень / где_цель / "memory" / "reference_source.md").write_text(
+                "---\ntype: reference\n---\n\nПервоисточник.\n", encoding="utf-8")
+        сводка = корень / "clients/acme" / "memory" / "topics"
+        сводка.mkdir()
+        (сводка / "acme.md").write_text(
+            "# Acme\n\n## Обзор\n\nФакт, источник [[reference_source]].\n",
+            encoding="utf-8")
+        return корень
+
+    def проверить(self, корень):
+        область = корень / "clients/acme"
+        errors, warnings = mc.validate_links(
+            область, mc.collect_memory_files(область), "clients/acme",
+            topics_raw=TOPICS_RAW)
+        return errors, warnings, mc.countable_link_warnings(warnings)
+
+    def test_pointer_to_the_personal_area_is_provenance(self):
+        errors, warnings, долги = self.проверить(self.федерация("personal"))
+        self.assertEqual(errors, [])
+        self.assertEqual(долги, set(), "провенанс долгом не является")
+        self.assertTrue(any("wiki link to the personal area" in w for w in warnings), warnings)
+
+    def test_pointer_to_another_client_stays_a_warning(self):
+        _, _, долги = self.проверить(self.федерация("clients/other"))
+        self.assertTrue(any("unresolved wiki link" in w for w in долги), долги)
+
+    def test_pointer_to_nowhere_stays_a_warning(self):
+        _, _, долги = self.проверить(self.федерация(None))
+        self.assertTrue(any("unresolved wiki link" in w for w in долги), долги)
 
 
 class FoldedReachTests(unittest.TestCase):
