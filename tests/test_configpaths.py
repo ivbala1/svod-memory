@@ -60,16 +60,24 @@ class ПодменаКаталога:
 
 
 class РазрешениеПутей(unittest.TestCase):
-    def test_без_переменной_каталог_модуля(self):
-        прежний = os.environ.pop(configpaths.CONFIG_ENV, None)
-        try:
-            configpaths._reset_for_tests()
-            self.assertEqual(configpaths.config_dir(),
-                             Path(configpaths.__file__).resolve().parent)
-        finally:
-            if прежний is not None:
-                os.environ[configpaths.CONFIG_ENV] = прежний
-            configpaths._reset_for_tests()
+    def test_без_переменной_домашний_каталог_конфигурации(self):
+        """Незаданная и пустая переменная ведут в ~/.agent-memory-config.
+
+        Домашний каталог подменён: итог не должен зависеть от того, есть
+        ли конфигурация на машине, где идёт тест."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as дом:
+            ожидание = (Path(дом) / ".agent-memory-config").resolve()
+            try:
+                with mock.patch.dict(os.environ, {"HOME": дом}):
+                    os.environ.pop(configpaths.CONFIG_ENV, None)
+                    configpaths._reset_for_tests()
+                    self.assertEqual(configpaths.config_dir(), ожидание)
+                    os.environ[configpaths.CONFIG_ENV] = ""
+                    configpaths._reset_for_tests()
+                    self.assertEqual(configpaths.config_dir(), ожидание)
+            finally:
+                configpaths._reset_for_tests()
 
     def test_переменная_перекрывает(self):
         with ПодменаКаталога() as каталог:

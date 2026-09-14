@@ -1041,6 +1041,9 @@ class ReviewRegressionTests(Base):
     def test_missing_config_is_words_not_a_traceback(self):
         env = dict(os.environ)
         env.pop("MEMORY_CONFIG_DIR", None)
+        # Без переменной конфигурация ищется в ~/.agent-memory-config, а на
+        # машине автора она есть: домашний каталог пуст, чтобы её не найти.
+        env["HOME"] = str(self.fed.base / "emptyhome")
         env["MEMORY_REPO"] = str(self.fed.machines["a"])
         env["MEMORYCTL_STATE_DIR"] = str(self.fed.states["a"])
         hook = subprocess.run([sys.executable, str(REPO_SOURCE / "bin" / "memory-context"), "session-start"],
