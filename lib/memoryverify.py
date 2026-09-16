@@ -1069,10 +1069,29 @@ def section_errors(base: dict[str, bytes], candidate: dict[str, bytes],
 # ---------------------------------------------------------------------------
 # 9. Стенд: кандидат против основы (цели 4, 2)
 
+# Предупреждение стенда о принятом факте: писатель пропускает его к
+# автору, хотя оно называет не файл кандидата, а вопрос стенда.
+STAND_NOTICE = "стенд, факт принят:"
+
+
+def changed_records(base: dict[str, bytes], candidate: dict[str, bytes]) -> set[str]:
+    """Записи, которые подача меняет хоть в чём-то: тело, шапка, удаление."""
+    old, new = _records(base), _records(candidate)
+    return {slug for slug in old.keys() | new.keys() if old.get(slug) != new.get(slug)}
+
+
 def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
-                 today: dt.date, facts: dict, warnings: list[str]) -> list[str]:
+                 today: dt.date, facts: dict, warnings: list[str],
+                 changed: set[str] = frozenset()) -> list[str]:
+    """Отказ только за свою запись: подача тронула ожидаемую запись вопроса,
+    и та перестала находиться. Если новая запись перебила чужую или зацепила
+    отрицательный вопрос, факт принимается с предупреждением: перебитую
+    запись находит `memory search`, а вопрос разбирает полная проверка
+    доктора (решение владельца 17.09.2026: стенд не должен менять
+    формулировки фактов ради теста)."""
     import memoryeval
     data = json.loads(questions.decode("utf-8"))
+    ожидаемые = {q["id"]: q["expect"] for q in data["questions"]}
     after = memoryeval.stand(new_root, data, today=today)
     facts["stand"] = memoryeval.summarize(after)
     before = memoryeval.stand(old_root, data, today=today) if old_root else after
@@ -1083,11 +1102,18 @@ def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
         warnings.append(f"стенд: вопрос {item['id']} ранг ухудшился "
                         f"с {item['was']} до {item['now']}; запись всё ещё приходит")
     for item in verdict["regressions"]:
-        errors.append(f"стенд: вопрос {item['id']} {item['why']}; верни находимость "
-                      "записи или обнови вопросы стенда осознанным решением")
+        ожидаемая = ожидаемые.get(item["id"])
+        if ожидаемая is None or ожидаемая in changed:
+            errors.append(f"стенд: вопрос {item['id']} {item['why']}; верни находимость "
+                          "записи или обнови вопросы стенда осознанным решением")
+        else:
+            warnings.append(f"{STAND_NOTICE} вопрос {item['id']} больше не отдаёт "
+                            f"свою запись {ожидаемая}, её перебила эта подача; "
+                            f"{ожидаемая} находит memory search, вопрос разберёт "
+                            "полная проверка доктора")
     for nid in verdict["new_false_positives"]:
-        errors.append(f"стенд: отрицательный вопрос {nid} начал отдавать записи; "
-                      "перепиши крючок, который его цепляет")
+        warnings.append(f"{STAND_NOTICE} отрицательный вопрос {nid} начал отдавать "
+                        "записи; вопрос разберёт полная проверка доктора")
     return errors
 
 
@@ -1203,7 +1229,8 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
             # Стенд меряет отбор по индексу личного корня, в нём роутер и
             # ищет; глобальный отдаётся контрактом целиком, клиентский
             # доставляется сводкой, его проверяют крючки.
-            errors += stand_errors(old_root, new_root, config.questions, today, facts, warnings)
+            errors += stand_errors(old_root, new_root, config.questions, today, facts, warnings,
+                                   changed_records(base, candidate))
     if root == "global":
         errors += contract_errors(candidate)
         warnings += client_name_warnings(candidate, topics, svodgit.federation_members(config.topics))

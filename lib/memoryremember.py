@@ -681,8 +681,15 @@ def precheck(candidate: dict, *, root: Path, scope: str, config: memoryverify.Co
         report = memoryverify.check(tree, base_tree, root=scope, config=config,
                                     today=today, scanner=scanner)
         # Предупреждения только по файлам кандидата, как и под замком.
-        report.warnings = [w for w in report.warnings if w.split(":", 1)[0] in files]
+        report.warnings = candidate_warnings(report.warnings, files)
     return Checked(report=report, base=base_tree, tree=tree, notes=notes, revision=base)
+
+
+def candidate_warnings(warnings: list[str], files) -> list[str]:
+    """Предупреждения по файлам кандидата и о факте, принятом вопреки
+    стенду; сироты вики-ссылок в нетронутых записях не перечисляются."""
+    return [w for w in warnings
+            if w.startswith(memoryverify.STAND_NOTICE) or w.split(":", 1)[0] in files]
 
 
 def run_dry(*, scope: str, candidate_id: str, source: str, session: str,
@@ -886,7 +893,7 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
                 report = verify_trees(root, scope, tree, head, config, scanner, today)
             # Предупреждения только по файлам кандидата: сироты вики-ссылок в
             # нетронутых записях каждой подаче перечислять незачем.
-            report.warnings = [w for w in report.warnings if w.split(":", 1)[0] in files]
+            report.warnings = candidate_warnings(report.warnings, files)
             notes += report.warnings
             if not report.ok:
                 _restore(root, files, head_tree)

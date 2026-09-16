@@ -378,6 +378,39 @@ class StandTests(unittest.TestCase):
         report = check(cand, base)
         self.assertTrue(any("стенд" in e and "q1" in e for e in report.errors), report.errors)
 
+    def test_new_record_shadowing_other_question_is_a_warning(self):
+        """Новая запись перебила чужую по её вопросу: факт принимается, а
+        не переписывается ради теста."""
+        questions = {"questions": [{"id": "q2", "group": "tuned", "text": "принтер в офисе",
+                                    "expect": "reference_printer", "markers": ["принтер"]}],
+                     "negatives": []}
+        config = mv.Config(topics=TOPICS_RAW,
+                           questions=json.dumps(questions, ensure_ascii=False).encode("utf-8"))
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/reference_office.md"] = record(
+            "reference_office", type="reference", title="Принтер в офисе",
+            index="принтер в офисе сломан", source="разговор", observed_at="2026-09-04",
+            probe="сломался принтер в офисе", body="Офисный принтер сдан в ремонт.\n")
+        with Scanner(0) as scanner:
+            report = mv.check(cand, base, root="personal", config=config,
+                              today=TODAY, scanner=scanner)
+        self.assertTrue(report.ok, report.errors)
+        self.assertTrue(any("q2" in w and "reference_printer" in w for w in report.warnings),
+                        report.warnings)
+
+    def test_new_record_firing_negative_is_a_warning(self):
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/reference_mars.md"] = record(
+            "reference_mars", type="reference", title="Погода на Марсе",
+            index="погода марс прогноз", source="разговор", observed_at="2026-09-04",
+            probe="какая погода на марсе", body="На Марсе холодно.\n")
+        report = check(cand, base)
+        self.assertTrue(report.ok, report.errors)
+        self.assertTrue(any("отрицательный" in w and "n1" in w for w in report.warnings),
+                        report.warnings)
+
     def test_stand_skipped_without_index_or_questions(self):
         base = {"memory/topics/acme.md": b"# Acme\n", "memory/MEMORY.md": b"# I\n"}
         report = check(base, base, root="clients/acme")

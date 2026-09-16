@@ -254,6 +254,38 @@ class WriterTests(Base):
         self.assertEqual(sh(root, "log", "-1", "--format=%s"), "memory: kettle-1")
         self.assertEqual(svodgit.dirty_paths(root), set())
 
+    def test_fact_shadowing_other_record_is_saved_with_stand_warning(self):
+        """Новая запись перебила чужую по её вопросу стенда: факт принят, а
+        предупреждение с вопросом и перебитой записью доходит до автора."""
+        questions = {"questions": [{"id": "q2", "group": "tuned", "text": "принтер в офисе",
+                                    "expect": "reference_printer", "markers": ["принтер"]}],
+                     "negatives": []}
+        (self.fed.config / "eval_questions.json").write_text(
+            json.dumps(questions, ensure_ascii=False))
+        configpaths._reset_for_tests()
+        body = record("reference_office", type="reference", title="Принтер в офисе",
+                      index="принтер в офисе сломан", source="разговор",
+                      observed_at="2026-09-04", probe="сломался принтер в офисе",
+                      body="Офисный принтер сдан в ремонт.\n")
+        code, result = self.dry("a", "personal", "office-dry", body,
+                                {"record_slug": "reference_office"})
+        self.assertEqual((code, result["state"]), (mr.EXIT_SAVED, "checked"), result)
+        self.assertTrue(any("q2" in w and "reference_printer" in w
+                            for w in result["warnings"]), result)
+        code, result = self.fed.remember("a", "personal", "office-1", body,
+                                         {"record_slug": "reference_office"})
+        self.assertEqual((code, result["state"]), (mr.EXIT_SAVED, "saved"), result)
+        self.assertTrue(any("q2" in w and "reference_printer" in w
+                            for w in result["warnings"]), result)
+
+    def test_fact_firing_stand_negative_is_saved_with_warning(self):
+        body = fresh_record("reference_mars", "погода на марсе и прогноз",
+                            "какая погода на марсе", "На Марсе холодно.\n")
+        code, result = self.fed.remember("a", "personal", "mars-1", body,
+                                         {"record_slug": "reference_mars"})
+        self.assertEqual((code, result["state"]), (mr.EXIT_SAVED, "saved"), result)
+        self.assertTrue(any("n1" in w for w in result["warnings"]), result)
+
     def test_second_machine_writes_on_top_of_first(self):
         self.fed.remember("a", "personal", "kettle-1", NEW_BODY, {"record_slug": "reference_kettle"})
         body = fresh_record("reference_toaster", "как поджарить хлеб в тостере",
