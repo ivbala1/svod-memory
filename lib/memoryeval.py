@@ -150,6 +150,21 @@ def _evidence(path: Path, markers: list[str]) -> bool:
     return any(re.search(м, текст, re.IGNORECASE) for м in markers)
 
 
+def delivered_text(root: Path, prompt: str, записи, отобрано) -> str:
+    """Текст, который по этому вопросу получил бы агент: тот же сборщик
+    личного блока, что у хука и у `memory recall`, с теми же потолками
+    (запись 2 400 символов, инбокс, общий бюджет), без состояния сессии и
+    без контракта. Стенд ищет признак ответа в НЁМ, а не в исходном файле:
+    20.09.2026 четыре вопроса из тридцати выбирали верную запись, а ответ
+    оставался за обрезкой, и стенд этого не видел."""
+    источник = "user-catalog" if mc._has_trigger(prompt, mc.USER_CATALOG_TRIGGERS) else "personal"
+    решение = mc.RouteDecision(None, источник)
+    текст, _ = mc._nonproject_context(
+        root, root / "memory" / "MEMORY.md", записи, "", решение, prompt, "",
+        include_hot=False, ranked=tuple(отобрано))
+    return текст
+
+
 def stand(root: Path, questions: dict, *, today=None, ранжировать=None) -> dict:
     """Чистый прогон стенда по одному выложенному дереву: результат ПО
     КАЖДОМУ вопросу. Ничего живого не читает; проверки кандидата
@@ -169,19 +184,32 @@ def stand(root: Path, questions: dict, *, today=None, ранжировать=Non
         файл = root / "memory" / f"{ожидаемая}.md"
         нет = not файл.is_file()
         признак = False if нет else _evidence(файл, q["markers"])
-        выдано = [Path(e.slug).stem for e, _ in ранжировать(q["text"], записи)]
+        отобрано = tuple(ранжировать(q["text"], записи))
+        выдано = [Path(e.slug).stem for e, _ in отобрано]
         полный = sorted(((mc._entry_score(q["text"], e), e) for e in достижимые),
                         key=lambda p: (-p[0], p[1].index))
         ранг = next((i + 1 for i, (_, e) in enumerate(полный)
                      if Path(e.slug).stem == ожидаемая), None)
+        # Признак ответа ищется и в доставленном тексте: выбранная, но
+        # обрезанная запись это отдельный класс отказа, не «нашлось».
+        текст = delivered_text(root, q["text"], записи, отобрано)
+        доставлен = any(re.search(м, текст, re.IGNORECASE) for м in q["markers"])
+        # Запрет на запись, которой нет в индексе (свёрнута, удалена), не
+        # проверяем и не считаем: он ничего не ловит, и самопроверка не
+        # должна ждать от него срабатывания.
+        в_индексе = {Path(e.slug).stem for e in достижимые}
+        устаревшие_запреты = sorted(f for f in q.get("forbid", []) if f not in в_индексе)
         по_вопросам[q["id"]] = {
             "group": q["group"],
             "found": ожидаемая in выдано,
             "rank": ранг,
             "delivered": len(выдано),
+            "delivered_evidence": доставлен,
+            "delivered_chars": len(текст),
             "missing": нет,
             "evidence": признак,
             "forbidden": sorted(set(выдано) & set(q.get("forbid", []))),
+            "stale_forbid": устаревшие_запреты,
         }
 
     негативы = {}
@@ -226,9 +254,14 @@ def summarize(result: dict) -> dict:
     итог = {}
     for группа in ("tuned", "heldout"):
         свои = [r for r in result["questions"].values() if r["group"] == группа]
-        итог[группа] = {"found": sum(1 for r in свои if r["found"]), "of": len(свои)}
+        итог[группа] = {"found": sum(1 for r in свои if r["found"]),
+                        "delivered": sum(1 for r in свои if r.get("delivered_evidence")),
+                        "of": len(свои)}
     итог["negatives_fired"] = sum(1 for r in result["negatives"].values() if r["fired"])
     итог["absolute"] = [f"{item['id']}: {item['why']}" for item in absolute_failures(result)]
+    итог["stale_forbid"] = [f"{qid}: запрет {slug} вне индекса, не проверяется"
+                            for qid, r in result["questions"].items()
+                            for slug in r.get("stale_forbid", [])]
     return итог
 
 
@@ -291,6 +324,11 @@ def pairwise(baseline: dict, current: dict) -> dict:
             регрессии.append({"id": qid, "why": "перестал находиться"})
         elif not было["found"] and стало["found"]:
             улучшения.append(qid)
+        elif (было["found"] and стало["found"] and было.get("delivered_evidence")
+              and not стало.get("delivered_evidence")):
+            # Запись всё ещё выбирается, но ответ ушёл за обрезку: для агента
+            # это та же потеря, что и ненаходимость.
+            регрессии.append({"id": qid, "why": "признак ответа перестал доставляться"})
         if (было["found"] and стало["found"] and было.get("rank") and стало.get("rank")
                 and стало["rank"] > было["rank"]):
             ранг_хуже.append({"id": qid, "was": было["rank"], "now": стало["rank"]})
@@ -342,7 +380,10 @@ def selfcheck(root: Path) -> dict:
     сравнение_всё = compare(базис, всё)
     отрицательных = len(всё["negatives"])
     сработало = sum(1 for r in всё["negatives"].values() if r["fired"])
-    запретов = sum(1 for q in вопросы["questions"] if q.get("forbid"))
+    # Запрет на свёрнутую или удалённую запись сработать не может, и ждать
+    # его значит объявить стенд неисправным из-за устаревшего вопроса.
+    запретов = sum(1 for q in вопросы["questions"]
+                   if set(q.get("forbid", [])) - set(всё["questions"][q["id"]]["stale_forbid"]))
     попаданий = sum(1 for r in сравнение_всё.get("absolute", [])
                     if r["why"].startswith("выдана запрещённая запись"))
     записей = len([e for e in mc.parse_index(mc.build_index(personal_root(root)))

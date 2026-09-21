@@ -518,6 +518,91 @@ def search_text(prompt: str, *, root: Path | None = None, limit: int = 10,
     return "\n".join(части)
 
 
+def score_breakdown(prompt: str, entry, *, root: Path, today=None) -> dict:
+    """Разбивка счёта первого места по словам: та же арифметика, что у
+    `memorycontext._entry_score`, но с именами слов. Считается отдельно и
+    сверяется с настоящим счётом, чтобы объяснение не разошлось с отбором."""
+    prompt_tokens = mc._tokens(prompt, mc.SCORE_STOP_TOKENS)
+    label_tokens = mc._tokens(entry.label, mc.SCORE_STOP_TOKENS)
+    summary_tokens = mc._tokens(entry.summary, mc.SCORE_STOP_TOKENS)
+    def совпавшие(pool):
+        return [t for t in prompt_tokens
+                if any(mc._token_match(t, other) for other in pool)]
+    по_заголовку = совпавшие(label_tokens)
+    по_индексу = совпавшие(summary_tokens)
+    бонусы: list[str] = []
+    label_norm = mc._normalized_text(entry.label)
+    if prompt_tokens and len(label_norm) >= 5 and label_norm in mc._normalized_text(prompt):
+        бонусы.append("заголовок целиком в вопросе +6")
+    if len(по_заголовку) >= 2:
+        бонусы.append("два и более слова заголовка +2")
+    счёт = mc._entry_score(prompt, entry)
+    сегодня = today if today is not None else mc.today_utc()
+    return {
+        "slug": entry.slug,
+        "title": entry.label,
+        "score": счёт,
+        "threshold": mc.SELECT_THRESHOLD,
+        "title_hits": по_заголовку,
+        "index_hits": по_индексу,
+        "bonuses": бонусы,
+        "expired": mc._entry_expired(root, entry, сегодня),
+    }
+
+
+def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
+             cwd: str | os.PathLike[str] | None = None) -> str:
+    """Почему по вопросу выдано то, что выдано: слова вопроса после
+    стоп-списка, разбивка счёта верхних кандидатов первого места, счёт BM25
+    второго места и сама выдача. Ответ на самый частый отказ писателя
+    («крючок не находит запись»), которого раньше приходилось добиваться
+    перебором. Граница та же, что у `search`: только личная область и
+    только из личного каталога."""
+    root = (root or mc.default_root()).expanduser().resolve()
+    потолок = ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots())
+    if потолок != PERSONAL:
+        raise RecallError(
+            "разбор отбора отдаётся только из личного каталога; память заказчика "
+            "спрашивают командой memory recall --scope <имя>")
+    _, personal = mc.index_roots(root)
+    if personal is None:
+        raise RecallError(f"{root}: нет личного репозитория personal/memory")
+    записи = mc.parse_index(mc.build_index(personal))
+    видимые = tuple(e for e in записи if e.section in mc.INDEX_SECTIONS.values())
+    сегодня = mc.today_utc()
+    все_слова = [t for t in mc.TOKEN_RE.findall(prompt.casefold().replace("ё", "е"))]
+    слова = mc._tokens(prompt, mc.SCORE_STOP_TOKENS)
+    выброшены = [t for t in dict.fromkeys(все_слова) if t not in слова]
+    части = ["[Почему так выбрано]",
+             f"слова вопроса для первого места: {', '.join(слова) or 'нет'}"
+             + (f"; отброшены (стоп-слова и короткие): {', '.join(выброшены)}" if выброшены else ""),
+             f"порог первого места {mc.SELECT_THRESHOLD}: слово заголовка 4, слово index 1, "
+             "совпадение по первым пяти буквам"]
+    разбор = sorted((score_breakdown(prompt, e, root=personal, today=сегодня) for e in видимые),
+                    key=lambda d: (-d["score"], d["slug"]))
+    части.append("первое место, верхние кандидаты:")
+    for d in [d for d in разбор if d["score"] > 0][:max(1, limit)]:
+        куски = []
+        if d["title_hits"]:
+            куски.append("заголовок: " + ", ".join(d["title_hits"]) + f" (+{4 * len(d['title_hits'])})")
+        if d["index_hits"]:
+            куски.append("index: " + ", ".join(d["index_hits"]) + f" (+{len(d['index_hits'])})")
+        куски.extend(d["bonuses"])
+        метка = " просрочена" if d["expired"] else ""
+        части.append(f"- {d['score']:>3} memory/{d['slug']}{метка}: " + "; ".join(куски))
+    if not any(d["score"] > 0 for d in разбор):
+        части.append("- ни одна запись не набрала ни балла")
+    bm25 = mc.bm25_ranking(personal, prompt, видимые)[:3]
+    части.append(f"второе место, BM25 по телам (порог {mc.BM25_THRESHOLD:g}):")
+    for slug, счёт in bm25:
+        части.append(f"- {счёт:5.1f} memory/{slug}")
+    if not bm25:
+        части.append("- совпадений нет")
+    выдача = mc.select_index_entries(personal, prompt, записи, today=сегодня)
+    части.append("выдача: " + (", ".join(f"memory/{e.slug}" for e, _ in выдача) or "пусто"))
+    return "\n".join(части)
+
+
 def index_text(*, root: Path | None = None,
                cwd: str | os.PathLike[str] | None = None) -> str:
     """Индекс личной памяти целиком, той же сборкой, что у роутера.
@@ -568,6 +653,10 @@ def build_parser() -> argparse.ArgumentParser:
     s_.add_argument("question", nargs="?", help="вопрос; '-' или пропуск читает stdin")
     s_.add_argument("--limit", type=int, default=10, help="сколько записей показать")
     s_.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
+    w = sub.add_parser("why", help="почему по вопросу выбраны эти записи: разбивка счёта по словам")
+    w.add_argument("question", nargs="?", help="вопрос; '-' или пропуск читает stdin")
+    w.add_argument("--limit", type=int, default=5, help="сколько кандидатов первого места показать")
+    w.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
     i = sub.add_parser("index", help="напечатать индекс личной памяти целиком")
     i.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
     m = sub.add_parser("remember", help="подать запись в память и опубликовать")
@@ -636,9 +725,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"memory {args.command}: {mc.TOPICS_ERROR}", file=sys.stderr)
         return 7 if args.command == "remember" else 4
     try:
-        if args.command in ("recall", "explain", "index", "search"):
+        if args.command in ("recall", "explain", "index", "search", "why"):
             if args.command == "index":
                 text = index_text(root=args.root, cwd=os.getcwd())
+            elif args.command == "why":
+                text = why_text(_read_prompt(args.question), root=args.root,
+                                limit=args.limit, cwd=os.getcwd())
             elif args.command == "search":
                 text = search_text(_read_prompt(args.question), root=args.root,
                                    limit=args.limit, cwd=os.getcwd())

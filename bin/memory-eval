@@ -5,6 +5,7 @@
   memory-eval baseline   записать прогон исходной точкой и закоммитить её в конфигурации
   memory-eval compare    прогон и попарное сравнение с исходной точкой
   memory-eval selfcheck  заведомая поломка: стенд обязан её поймать
+  memory-eval probes     крючки всех записей как золотой набор: hit@1, hit@2, hit@5
 """
 import argparse
 import json
@@ -15,12 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import memoryeval as ev  # noqa: E402
 import memorycontext as mc  # noqa: E402
+import memoryprobes  # noqa: E402
 from memorycontext import default_root  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="memory-eval")
-    parser.add_argument("command", choices=("run", "baseline", "compare", "selfcheck"))
+    parser.add_argument("command", choices=("run", "baseline", "compare", "selfcheck", "probes"))
     parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument("--json", action="store_true", help="полный результат в JSON")
     args = parser.parse_args()
@@ -28,6 +30,11 @@ def main() -> int:
         print(f"memory-eval: {mc.TOPICS_ERROR}", file=sys.stderr)
         return 2
     root = args.root.expanduser().resolve()
+    if args.command == "probes":
+        итог = memoryprobes.report(root)
+        print(json.dumps(итог, ensure_ascii=False, indent=1) if args.json
+              else memoryprobes.format_report(итог))
+        return 0 if all(r["hit2"] == r["total"] for r in итог.values()) else 1
     if args.command == "selfcheck":
         итог = ev.selfcheck(root)
         print(json.dumps(итог, ensure_ascii=False, indent=1))

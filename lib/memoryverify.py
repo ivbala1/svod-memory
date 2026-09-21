@@ -901,14 +901,15 @@ def delivered_link_present(delivered_text: str, slug: str) -> bool:
 
 def probe_errors(base: dict[str, bytes], candidate: dict[str, bytes], *,
                  root: str, topics: Topics, laid_out: Path, today: dt.date,
-                 facts: dict) -> list[str]:
+                 facts: dict, entries: tuple | None = None) -> list[str]:
     errors: list[str] = []
     client = client_name(root)
     spec = None
     if client is not None:
         spec = next((s for s in topics.specs.values() if s.owner == root), None)
     results: dict[str, bool] = {}
-    entries = index_entries(laid_out) if client is None else ()
+    if entries is None:
+        entries = index_entries(laid_out) if client is None else ()
     for slug, text in sorted(_records(candidate).items()):
         fields, error = parse_frontmatter(text)
         if error:
@@ -1080,6 +1081,66 @@ def changed_records(base: dict[str, bytes], candidate: dict[str, bytes]) -> set[
     return {slug for slug in old.keys() | new.keys() if old.get(slug) != new.get(slug)}
 
 
+def delivery_warnings(base: dict[str, bytes], candidate: dict[str, bytes], *,
+                      root: str, laid_out: Path, entries: tuple | None = None) -> list[str]:
+    """Что из изменённого до агента доедет не целиком. Только предупреждение:
+    хвост записи законен, если это история для чтения по указателю, но автор
+    должен знать, что ниже потолка агент не увидит (опыт 21.09.2026: ответ
+    уезжал за обрезку, и стенд этого не видел). Меряется тем же сборщиком,
+    что у роутера. Личный корень: там запись приходит по индексу, а инбокс
+    блоком; глобальный доставляется контрактом, клиентский сводкой."""
+    if root != "personal":
+        return []
+    import memorycontext as mc
+    warnings: list[str] = []
+    записи = _records(candidate)
+    if entries is None:
+        entries = index_entries(laid_out)
+    по_имени = {Path(e.slug).stem: e for e in entries
+                if e.section in mc.INDEX_SECTIONS.values()}
+    for slug in sorted(changed_records(base, candidate)):
+        текст = записи.get(slug)
+        запись = по_имени.get(slug)
+        if текст is None or запись is None or slug == "personal_inbox":
+            continue
+        блок = mc._entry_block(laid_out, запись)
+        хвост = f"\n\n[Раздел сокращён. Полная версия: memory/{запись.slug}]"
+        if not блок or not блок.endswith(хвост):
+            continue
+        шапка = f"[Совпавшая запись индекса: {запись.label}]\nИсточник: memory/{запись.slug}"
+        if запись.summary:
+            шапка += f"\nРезюме индекса: {запись.summary}"
+        видно = max(0, len(блок) - len(хвост) - len(шапка) - 2)
+        тело = len(body_without_frontmatter(текст).strip())
+        warnings.append(
+            f"memory/{slug}.md: до агента доезжают первые {видно} символов тела из {тело}; "
+            "ответ на крючок и главное держать в начале, остальное вынести в отдельную "
+            "запись или оставить хвостом для чтения по указателю")
+    путь = "memory/personal_inbox.md"
+    if путь in candidate and candidate.get(путь) != base.get(путь):
+        текст = candidate[путь].decode("utf-8", "replace")
+        пункты: list[str] = []
+        for строка in текст.splitlines():
+            if re.match(r"^##\s+сделано", строка.strip(), re.IGNORECASE):
+                break
+            if строка.startswith("- "):
+                пункты.append(строка)
+        блок = mc._personal_inbox_block(laid_out, mc.PERSONAL_INBOX_CAP) or ""
+        длинные = sum(1 for п in пункты if len(mc._clean_inline(п, 10**6)) > 360)
+        доехало = sum(1 for п in пункты if mc._clean_inline(п, 360) in блок
+                      and len(mc._clean_inline(п, 10**6)) <= 360)
+        if длинные:
+            warnings.append(
+                f"{путь}: {длинные} из {len(пункты)} пунктов длиннее 360 символов, хвост "
+                "каждого до агента не доезжает; подробности держать в записи, в инбоксе "
+                "строка с действием, сроком и ссылкой")
+        if доехало < len(пункты):
+            warnings.append(
+                f"{путь}: целиком до агента доезжают {доехало} пунктов из {len(пункты)} "
+                f"(блок до {mc.PERSONAL_INBOX_CAP} символов, не больше 16 пунктов)")
+    return warnings
+
+
 def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
                  today: dt.date, facts: dict, warnings: list[str],
                  changed: set[str] = frozenset()) -> list[str]:
@@ -1222,8 +1283,13 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
     with tempfile.TemporaryDirectory(prefix="svod-check-") as tmp:
         new_root = lay_out(candidate, Path(tmp) / "new")
         old_root = lay_out(base, Path(tmp) / "old") if base else None
+        # Индекс кандидата строится один раз на подачу: его читают и
+        # крючки, и предупреждение о доставке.
+        entries = index_entries(new_root) if client_name(root) is None else ()
         errors += probe_errors(base, candidate, root=root, topics=topics,
-                               laid_out=new_root, today=today, facts=facts)
+                               laid_out=new_root, today=today, facts=facts, entries=entries)
+        warnings += delivery_warnings(base, candidate, root=root, laid_out=new_root,
+                                      entries=entries)
         if (config.questions is not None and root == "personal"
                 and "memory/MEMORY.md" in candidate):
             # Стенд меряет отбор по индексу личного корня, в нём роутер и

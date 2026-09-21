@@ -216,6 +216,35 @@ def _candidates(scope: str, base: Path | None, kind: str) -> list[dict]:
 SECTION_HEADROOM = 200
 
 
+def dated_records(tree: dict[str, bytes], today: dt.date) -> tuple[list[str], list[str]]:
+    """Записи с истёкшим сроком: слаги с просроченным valid_until и слаги, у
+    которых review_after уже прошёл, оба по дереву HEAD. Граница у обоих та
+    же, что у отбора (memorycontext._entry_expired): дата действует ПО
+    указанный день включительно, «после» начинается со следующего. Битая
+    дата не считается: её называет проверка формы писателя. Свёрнутые
+    записи (`listed: false`) не считаются: они и так вне выдачи."""
+    import memoryverify as mv
+    expired: list[str] = []
+    review: list[str] = []
+    for slug, text in sorted(mv._records(tree).items()):
+        fields, _ = mv.parse_frontmatter(text)
+        # Свёрнутая запись из выдачи уже убрана владельцем: срок у неё
+        # ничего не решает, а заметка напоминала бы о ней бесконечно.
+        if fields.get("listed") == "false":
+            continue
+        for key, bucket in (("valid_until", expired), ("review_after", review)):
+            value = fields.get(key)
+            if not value:
+                continue
+            try:
+                boundary = dt.date.fromisoformat(value)
+            except ValueError:
+                continue
+            if today > boundary:
+                bucket.append(slug)
+    return expired, review
+
+
 def repo_health(scope: str, root: Path, config) -> tuple[list[str], list[str]]:
     """Что разъедает доставку, словами и только при действии (цель 4:
     записанный факт находится). Измерение то же, что у проверок писателя,
@@ -238,6 +267,16 @@ def repo_health(scope: str, root: Path, config) -> tuple[list[str], list[str]]:
     topics = mv.load_topics(config.topics)
     findings: list[str] = []
     notes: list[str] = []
+    # Просроченная запись из выдачи уходит молча (valid_until), а review_after
+    # доставку не меняет вовсе: без этих строк оба срока узнавались бы только
+    # поимённо через explain. Это работа владельца, итог не красят.
+    # Дата та же, что у отбора (UTC), иначе около полуночи статус и доставка
+    # расходились бы. Список полный: усечённый скрывал бы хвост навсегда.
+    просрочено, обзор = dated_records(tree, mc.today_utc())
+    if просрочено:
+        notes.append(f"просрочено: valid_until истёк у {', '.join(просрочено)}")
+    if обзор:
+        notes.append(f"обзор: review_after прошёл у {', '.join(обзор)}")
     if mv.client_name(scope) is None:
         text = mv.router_index_text(tree)
         chars, lines = len(text), len(text.splitlines())
@@ -414,7 +453,8 @@ def format_nudge(result: dict) -> str:
             # разделов у потолка значит приучить её пролистывать.
             хвост = f" и ещё {len(измерение) - 1}" if len(измерение) > 1 else ""
             bits.append(f"{scope}: {измерение[0]}{хвост}")
-        подсказки.append(any(f.startswith(("индекс", "дрейф", "сводка", "запас"))
+        подсказки.append(any(f.startswith(("индекс", "дрейф", "сводка", "запас",
+                                           "просрочено", "обзор"))
                              for f in измерение))
         problems = (info.get("last_sync") or {}).get("problems")
         if problems:

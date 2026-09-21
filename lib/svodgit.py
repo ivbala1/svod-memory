@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -24,7 +25,10 @@ import configpaths
 
 
 GIT_TIMEOUT_SEC = 60.0
-NETWORK_TIMEOUT_SEC = 120.0
+# Обычный fetch занимает пару секунд. Сеть за полминуты не ответила,
+# значит ssh ждёт то, чего не будет (окно подтверждения ssh-агента); писатель
+# держит замок весь этот срок, а таймер ждёт чужой замок только 60 с.
+NETWORK_TIMEOUT_SEC = 30.0
 SCANNER_TIMEOUT_SEC = 180.0
 # Push запускает pre-push, а тот сканирует тот же диапазон ещё раз своим
 # бюджетом: предел push обязан вмещать и сеть, и сканер.
@@ -41,6 +45,10 @@ INDEX_SCOPES = ("global", "personal")
 
 class GitError(Exception):
     """Отказ git словами: что запускали и что он ответил."""
+
+
+class GitTimeout(GitError):
+    """git не уложился в срок; его группа процессов погашена."""
 
 
 class Busy(Exception):
@@ -63,14 +71,26 @@ def git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC,
     if env:
         окружение.update(env)
     try:
-        result = subprocess.run(
-            ["git", "-C", str(root), *args], input=data,
+        # Своя группа процессов: по сроку гасится вся группа, и вместе с git
+        # умирает его ssh, а не остаётся сиротой ждать ответа ssh-агента.
+        process = subprocess.Popen(
+            ["git", "-C", str(root), *args],
+            stdin=subprocess.PIPE if data is not None else None,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout, env=окружение)
+            env=окружение, start_new_session=True)
     except FileNotFoundError as exc:
         raise GitError("git не найден в PATH") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {' '.join(args[:2])}: не ответил за {timeout:.0f} с") from exc
+    with process:
+        try:
+            stdout, stderr = process.communicate(data, timeout=timeout)
+        except BaseException as exc:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            if isinstance(exc, subprocess.TimeoutExpired):
+                raise GitTimeout(f"git {' '.join(args[:2])}: не ответил за {timeout:.0f} с") from exc
+            raise
+    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     if check and result.returncode != 0:
         raise GitError(
             f"git {' '.join(args)}: код {result.returncode}: "
@@ -281,8 +301,11 @@ def fetch(root: Path) -> tuple[bool, str]:
     """(удалось, слова). Сети нет: (False, причина)."""
     if not has_remote(root):
         return False, "у репозитория нет origin"
-    result = git(root, "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main",
-                 timeout=NETWORK_TIMEOUT_SEC, check=False)
+    try:
+        result = git(root, "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main",
+                     timeout=NETWORK_TIMEOUT_SEC, check=False)
+    except GitTimeout as exc:
+        return False, str(exc)
     if result.returncode != 0:
         text = result.stderr.decode("utf-8", "replace").strip()
         if "couldn't find remote ref" in text:
@@ -301,8 +324,11 @@ def push(root: Path, commit: str, expect: str | None) -> tuple[bool, str]:
     """Push ровно этого коммита в main с условием, что вершина сервера всё
     ещё та, что принёс fetch (lease). (принят, слова)."""
     lease = f"--force-with-lease=refs/heads/main:{expect or ''}"
-    result = git(root, "push", "--quiet", lease, "origin", f"{commit}:refs/heads/main",
-                 timeout=PUSH_TIMEOUT_SEC, check=False)
+    try:
+        result = git(root, "push", "--quiet", lease, "origin", f"{commit}:refs/heads/main",
+                     timeout=PUSH_TIMEOUT_SEC, check=False)
+    except GitTimeout as exc:
+        return False, str(exc)
     if result.returncode == 0:
         return True, ""
     text = result.stderr.decode("utf-8", "replace").strip()

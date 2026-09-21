@@ -454,7 +454,7 @@ class CheckTests(unittest.TestCase):
         report = check(base, base)
         self.assertTrue(report.ok, report.errors)
         self.assertEqual(report.facts["touched"], {})
-        self.assertEqual(report.facts["stand"]["tuned"], {"found": 1, "of": 1})
+        self.assertEqual(report.facts["stand"]["tuned"], {"found": 1, "delivered": 1, "of": 1})
 
     def test_first_commit_has_no_base(self):
         cand = base_tree()
@@ -466,6 +466,51 @@ class CheckTests(unittest.TestCase):
         report = check(cand, None)
         self.assertTrue(report.ok, report.errors)
         self.assertEqual(report.facts["touched"], {"reference_printer": "new"})
+
+
+class DeliveryWarningTests(unittest.TestCase):
+    """Писатель предупреждает, когда изменённое до агента доедет не целиком."""
+
+    def test_long_record_warns_short_record_does_not(self):
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/reference_long.md"] = record(
+            "reference_long", type="reference", title="Длинная справка",
+            index="длинная справка про хвост", source="разговор", observed_at="2026-09-21",
+            probe="что в длинной справке про хвост", body="Начало.\n" + "вода " * 900 + "\n")
+        report = check(cand, base)
+        self.assertTrue(report.ok, report.errors)
+        предупреждения = [w for w in report.warnings if w.startswith("memory/reference_long.md:")]
+        self.assertEqual(len(предупреждения), 1, report.warnings)
+        self.assertIn("до агента доезжают первые", предупреждения[0])
+        self.assertFalse(any(w.startswith("memory/reference_printer.md:") for w in report.warnings))
+
+    def test_folded_and_other_roots_are_silent(self):
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/reference_long.md"] = record(
+            "reference_long", type="reference", title="Длинная справка",
+            index="длинная справка", source="разговор", observed_at="2026-09-21",
+            probe="что в длинной справке", listed="false", body="вода " * 900 + "\n")
+        self.assertFalse(any(w.startswith("memory/reference_long.md:")
+                             for w in check(cand, base).warnings))
+        with tempfile.TemporaryDirectory() as tmp:
+            корень = mv.lay_out(cand, Path(tmp) / "x")
+            self.assertEqual(mv.delivery_warnings(base, cand, root="global", laid_out=корень), [])
+
+    def test_inbox_long_items_and_overflow_warn(self):
+        base = base_tree()
+        cand = dict(base)
+        пункты = ["- [2026-09-21] Длинный пункт " + "подробность " * 60]
+        пункты += [f"- [2026-09-{n:02d}] Короткий пункт номер {n}" for n in range(1, 20)]
+        cand["memory/personal_inbox.md"] = (
+            "# Инбокс\n\n## Дела\n" + "\n".join(пункты) + "\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            корень = mv.lay_out(cand, Path(tmp) / "x")
+            слова = mv.delivery_warnings(base, cand, root="personal", laid_out=корень)
+        self.assertTrue(any("1 из 20 пунктов длиннее 360" in w for w in слова), слова)
+        self.assertTrue(any("целиком до агента доезжают" in w for w in слова), слова)
+        self.assertTrue(all(w.startswith("memory/personal_inbox.md:") for w in слова))
 
 
 if __name__ == "__main__":

@@ -716,6 +716,55 @@ class StatusTests(Base):
         self.assertEqual(health, [])
         self.assertTrue(any("каталог сведений о владельце" in n for n in notes), notes)
 
+    def test_expired_dates_are_notes(self):
+        """Просроченный valid_until молча уводит запись из выдачи, review_after
+        доставку не меняет: оба срока видны заметками статуса и подсказкой
+        старта, итог не красят."""
+        config = mv.Config(topics=json.dumps(TOPICS).encode())
+        root = self.fed.root("a")
+        tree = svodgit.read_tree(root, "HEAD")
+        tree["memory/reference_old.md"] = record(
+            "reference_old", type="reference", title="Старое", index="старое",
+            valid_until="2026-01-31", body="Старое.")
+        tree["memory/reference_review.md"] = record(
+            "reference_review", type="reference", title="Обзор", index="обзор",
+            review_after="2026-01-15", body="Пересмотреть.")
+        tree["memory/reference_fresh.md"] = record(
+            "reference_fresh", type="reference", title="Свежее", index="свежее",
+            valid_until="2999-12-31", review_after="2999-12-31", body="Свежее.")
+        tree["memory/reference_both.md"] = record(
+            "reference_both", type="reference", title="Оба", index="оба",
+            valid_until="2026-01-01", review_after="2026-01-02", body="Оба срока.")
+        tree["memory/reference_folded.md"] = record(
+            "reference_folded", type="reference", title="Свёрнутое", index="свёрнутое",
+            valid_until="2026-01-01", review_after="2026-01-01", listed="false",
+            body="Свёрнуто владельцем.")
+        tree["memory/reference_broken.md"] = record(
+            "reference_broken", type="reference", title="Битая", index="битая",
+            valid_until="вчера", review_after="2026-13-40", body="Битая дата.")
+        import memorycontext
+        with mock.patch.object(svodgit, "read_tree", return_value=tree), \
+                mock.patch.object(memorycontext, "today_utc",
+                                  return_value=dt.date(2026, 2, 1)):
+            health, notes = ms.repo_health("personal", root, config)
+        self.assertEqual(health, [])
+        self.assertIn("просрочено: valid_until истёк у reference_both, reference_old", notes)
+        self.assertIn("обзор: review_after прошёл у reference_both, reference_review", notes)
+        self.assertFalse(any("reference_fresh" in n or "reference_broken" in n
+                             or "reference_folded" in n for n in notes), notes)
+        # Граница включительная у обоих полей: в день valid_until запись ещё
+        # действует, в день review_after «после» ещё не наступило.
+        expired, review = ms.dated_records(tree, dt.date(2026, 1, 15))
+        self.assertEqual(expired, ["reference_both"])
+        self.assertEqual(review, ["reference_both"])
+        expired, review = ms.dated_records(tree, dt.date(2026, 1, 31))
+        self.assertEqual(expired, ["reference_both"])
+        self.assertEqual(review, ["reference_both", "reference_review"])
+        nudge = ms.format_nudge({"repos": [{"scope": "personal", "notes": notes}]})
+        self.assertIn("просрочено", nudge)
+        self.assertTrue(nudge.endswith("/memory-compact"), nudge)
+
+
 class HookTests(Base):
     def test_pre_commit_stops_secret_and_red_record(self):
         root = self.fed.root("a")
@@ -800,6 +849,58 @@ class GitToolsTests(Base):
             with svodgit.lock(root, exclusive=False) as taken:
                 self.assertFalse(taken)
         with svodgit.lock(root, exclusive=False) as taken:
+            self.assertTrue(taken)
+
+    def silent_ssh(self, root: Path) -> Path:
+        """origin по ssh, а ssh молчит, как при неподтверждённом окне
+        ssh-агента. Отдаёт файл, куда ssh запишет свой pid."""
+        pid_file = self.fed.base / "ssh.pid"
+        fake = self.fed.base / "silent-ssh"
+        fake.write_text(f"#!/bin/sh\necho $$ > '{pid_file}'\nexec sleep 600\n")
+        fake.chmod(0o755)
+        sh(root, "remote", "set-url", "origin", "ssh://git@example.invalid/personal.git")
+        patches = [mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": str(fake)}),
+                   mock.patch.object(svodgit, "NETWORK_TIMEOUT_SEC", 1.0)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        return pid_file
+
+    def assert_gone(self, pid_file: Path) -> None:
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (ProcessLookupError, FileNotFoundError):
+                return
+            if state == "Z":
+                return
+            time.sleep(0.1)
+        self.fail(f"ssh {pid} пережил git")
+
+    def test_silent_ssh_is_no_network_and_dies_with_git(self):
+        root = self.fed.root("a")
+        pid_file = self.silent_ssh(root)
+        started = time.monotonic()
+        fetched, why = svodgit.fetch(root)
+        self.assertFalse(fetched)
+        self.assertIn("не ответил", why)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assert_gone(pid_file)
+
+    def test_writer_behind_silent_ssh_commits_locally_and_frees_the_lock(self):
+        root = self.fed.root("a")
+        pid_file = self.silent_ssh(root)
+        head = svodgit.head(root)
+        code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        self.assertIn("сети нет", result["reason"])
+        self.assertNotEqual(svodgit.head(root), head)
+        self.assert_gone(pid_file)
+        with svodgit.lock(root, exclusive=True, wait=0.5) as taken:
             self.assertTrue(taken)
 
     def test_fast_forward_moves_only_without_divergence(self):
