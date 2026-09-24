@@ -266,6 +266,21 @@ class ProbeTests(unittest.TestCase):
         bad = check(self._tree("рецепт борща на зиму"), base)
         self.assertTrue(any("не находит запись" in e for e in bad.errors), bad.errors)
 
+    def test_expired_record_does_not_block_other_submissions(self):
+        """Истёкшую запись роутер не выдаёт, её крючок молчит: иначе первый
+        же прошедший valid_until отказывал бы любой подаче в личный корень."""
+        base = base_tree()
+        cand = self._tree("рецепт борща на зиму")
+        cand["memory/reference_printer.md"] = cand["memory/reference_printer.md"].replace(
+            b"---\n", b"---\nvalid_until: 2020-01-01\n", 1)
+        report = check(cand, base)
+        self.assertFalse(any("не находит запись" in e for e in report.errors), report.errors)
+        self.assertNotIn("reference_printer", report.facts["probes"])
+        cand["memory/reference_printer.md"] = cand["memory/reference_printer.md"].replace(
+            b"valid_until: 2020-01-01", b"valid_until: 2999-12-31", 1)
+        report = check(cand, base)
+        self.assertTrue(any("не находит запись" in e for e in report.errors), report.errors)
+
     def test_tautology_is_red(self):
         report = check(self._tree("как чинить зелёный принтер"), base_tree())
         self.assertTrue(any("повторяет" in e for e in report.errors), report.errors)
@@ -319,6 +334,50 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNot(first, other)
         self.assertEqual(other.budget["hardBytes"], 20)
         self.assertEqual(other.placement, first.placement)
+
+
+class ArchivedRollupTests(unittest.TestCase):
+    """Сводка ушедшего заказчика: тема снята с роутера, а свёрнутые записи
+    и архив ссылаются на неё. Ссылка законна, в темах её нет."""
+
+    RAW = json.dumps(dict(TOPICS, archivedRollups={"_comment": "пояснение",
+                                                    "gone.md": "clients/gone"}),
+                     ensure_ascii=False).encode("utf-8")
+
+    def test_links_and_archive_accept_archived_rollup(self):
+        topics = mv.load_topics(self.RAW)
+        self.assertNotIn("gone.md", topics.placement)
+        tree = base_tree()
+        tree["memory/reference_printer.md"] = record(
+            "reference_printer", type="reference", title="Зелёный принтер",
+            index="как чинить зелёный принтер", body="Свёрнуто в сводку [g](topics/gone.md)\n")
+        self.assertEqual(mv.link_errors(tree, topics, "personal")[0], [])
+        without = mv.load_topics(TOPICS_RAW)
+        self.assertTrue(any("gone.md" in e for e in mv.link_errors(tree, without, "personal")[0]))
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/archive/old.md"] = "# old\n\nСвёрнуто в сводку [topics/gone.md](../topics/gone.md)\n".encode("utf-8")
+        self.assertEqual(mv.reach_errors(base, cand, topics, "personal"), [])
+        self.assertTrue(mv.reach_errors(base, cand, without, "personal"))
+
+    def test_archived_rollup_copy_outside_owner_is_refused(self):
+        """Сводка ушедшего заказчика не становится вторым каноном в личном
+        корне и не попадает к другому заказчику."""
+        topics = mv.load_topics(self.RAW)
+        base = base_tree()
+        cand = dict(base, **{"memory/topics/gone.md": b"# Gone\n"})
+        for root in ("personal", "clients/acme"):
+            with self.subTest(root=root):
+                errors = mv.foreign_errors(base, cand, root, topics)
+                self.assertTrue(any("topics/gone.md" in e for e in errors), errors)
+
+    def test_bad_archived_section_is_refused(self):
+        for section in ({"acme.md": "clients/zzz"}, {"x.md": "clients/acme"},
+                        {"x.txt": "clients/x"}, {"x.md": "personal"}, ["x.md"]):
+            with self.subTest(section=section):
+                raw = json.dumps(dict(TOPICS, archivedRollups=section), ensure_ascii=False)
+                with self.assertRaises(ValueError):
+                    mv.load_topics(raw.encode("utf-8"))
 
 
 class ForeignTests(unittest.TestCase):

@@ -109,6 +109,10 @@ Each data repository has a `main` branch, an `origin` remote, a
 `{"scope":"global"}`, `{"scope":"personal"}`, or
 `{"scope":"clients/acme"}`. Global is required; other repositories are
 optional. Client repositories must be listed in `federationMembers`.
+When a client leaves, remove its topic, `federationMembers` and
+`scopeRoots` entries and list its rollup in `archivedRollups`
+(`{"file.md": "clients/<name>"}`): folded records and the archive may keep
+linking to it, and only the link and archive checks read that section.
 
 Copy `public/config` into a separate configuration repository and adapt it
 to the actual workspace and corpus. Its example question expects

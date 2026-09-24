@@ -6,7 +6,11 @@ ConditionPathIsDirectory=%h/.agent-memory/global/.git
 
 [Service]
 Type=oneshot
-TimeoutStartSec=180
+# Прогон может закончиться подачами автомата закрытого, и одна только
+# отправка с pre-push сканером занимает до 30 + 180 с (svodgit.py).
+# 300 с это запас над одним push, а не обещание: fetch, проверки,
+# ожидание замка и повторы публикации могут его съесть.
+TimeoutStartSec=300
 UMask=0077
 Environment=MEMORY_REPO=%h/.agent-memory
 Environment=MEMORY_CONFIG_DIR=%h/.agent-memory-config

@@ -52,6 +52,30 @@ def placement_from_config(raw, config_path: Path) -> dict[str, tuple[str, str | 
     return placement
 
 
+def archived_from_config(raw, config_path: Path,
+                         placement: dict[str, tuple[str, str | None]]) -> dict[str, tuple[str, str]]:
+    """Сводки ушедших заказчиков: `archivedRollups` {файл: "clients/<тема>"}.
+    Тема снята с роутера и федерации, а свёрнутые записи и архив по-прежнему
+    ссылаются на её сводку. Раздел читают только проверки ссылок и архива."""
+    section = raw.get("archivedRollups", {}) if isinstance(raw, dict) else {}
+    if not isinstance(section, dict):
+        raise _error(config_path, "<archivedRollups>", "раздел должен быть объектом")
+    archived: dict[str, tuple[str, str]] = {}
+    for filename, owner in section.items():
+        if filename == "_comment":
+            continue
+        if (not isinstance(filename, str) or filename.startswith(".")
+                or not filename.endswith(".md") or "/" in filename or "\\" in filename):
+            raise _error(config_path, "<archivedRollups>", f"недопустимое имя роллапа {filename!r}")
+        if not isinstance(owner, str) or OWNER_RE.fullmatch(owner) is None:
+            raise _error(config_path, filename, f"недопустимый owner {owner!r}")
+        topic = owner[len("clients/"):]
+        if filename in placement or any(t == topic for t, _ in placement.values()):
+            raise _error(config_path, topic, "тема одновременно действующая и архивная")
+        archived[filename] = (topic, owner)
+    return archived
+
+
 def rollup_relative_source(filename: str, owner: str | None) -> str:
     """Возвращает путь сводки от корня личной федерации."""
     if owner is not None:

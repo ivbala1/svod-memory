@@ -718,8 +718,8 @@ class StatusTests(Base):
 
     def test_expired_dates_are_notes(self):
         """Просроченный valid_until молча уводит запись из выдачи, review_after
-        доставку не меняет: оба срока видны заметками статуса и подсказкой
-        старта, итог не красят."""
+        доставку не меняет: оба срока видны заметками статуса и месячной
+        строкой подсказки старта, итог не красят."""
         config = mv.Config(topics=json.dumps(TOPICS).encode())
         root = self.fed.root("a")
         tree = svodgit.read_tree(root, "HEAD")
@@ -760,7 +760,8 @@ class StatusTests(Base):
         expired, review = ms.dated_records(tree, dt.date(2026, 1, 31))
         self.assertEqual(expired, ["reference_both"])
         self.assertEqual(review, ["reference_both", "reference_review"])
-        nudge = ms.format_nudge({"repos": [{"scope": "personal", "notes": notes}]})
+        self.assertEqual(ms.format_nudge({"repos": [{"scope": "personal", "notes": notes}]}), "")
+        nudge = ms.format_nudge({"repos": [{"scope": "personal", "notes": notes}]}, monthly=True)
         self.assertIn("просрочено", nudge)
         self.assertTrue(nudge.endswith("/memory-compact"), nudge)
 
@@ -1818,14 +1819,50 @@ class ReviewFixTests(Base):
         sh(пустой, "init", "--quiet", "-b", "main")
         self.assertEqual(ms.repo_health("personal", пустой, self.fed.verify_config), ([], []))
 
-    def test_nudge_stays_one_short_line_when_notes_are_many(self):
-        заметки = [f"запас: раздел «{n}» 5 симв до потолка 3400" for n in range(20)]
-        строка = ms.format_nudge({"repos": [{"scope": "clients/acme", "health": [],
-                                             "notes": заметки, "failed": [], "pending": []}]})
-        self.assertNotIn("\n", строка)
-        self.assertIn("и ещё 19", строка)
-        self.assertLess(len(строка), 200)
-        self.assertIn("/memory-compact", строка)
+    def test_daily_line_stays_short_and_monthly_line_shows_every_note(self):
+        находки = [f"сводка: раздел «Р{n}» 4000 симв при потолке 3400" for n in range(20)]
+        заметки = [f"обзор: review_after прошёл у reference_{n}" for n in range(20)]
+        итог = {"repos": [{"scope": "clients/acme", "health": находки, "notes": заметки,
+                           "failed": [], "pending": []}]}
+        ежедневная = ms.format_nudge(итог)
+        self.assertNotIn("\n", ежедневная)
+        self.assertIn("и ещё 19", ежедневная)
+        self.assertLess(len(ежедневная), 200)
+        self.assertTrue(ежедневная.endswith("/memory-compact"))
+        строки = ms.format_nudge(итог, monthly=True).split("\n")
+        self.assertEqual(строки[0], ежедневная)
+        self.assertTrue(all(z in строки[1] for z in заметки), строки[1])
+
+    def test_daily_nudge_names_only_breakage_and_monthly_skips_threshold_and_headroom(self):
+        """Ежедневная строка только о поломках, заметки обслуживания раз в
+        месяц; запас раздела и мягкий порог индекса не приходят и в месячной
+        (решение владельца 24.09.2026)."""
+        заметки = ["индекс 22000 симв / 160 строк выше порога 20000 / 150, потолок 28000 / 200",
+                   "запас: раздел «Обзор» 5 симв до потолка 3400"]
+        прочие = ["индекс 30000 симв / 160 строк выше потолка 28000 / 200",
+                  "каталог сведений о владельце 3300 симв выше потолка 3200",
+                  "дрейф: acme 1", "свернул бы (не выдавалась хуком 60 дней на машине x): y",
+                  "автомат закрытого отстал (исполнитель x, эта машина y): z"]
+        for набор in (заметки, заметки + прочие):
+            self.assertEqual(ms.format_nudge({"repos": [{"scope": "personal",
+                                                         "notes": набор}]}), "")
+        self.assertEqual(ms.format_nudge({"repos": [{"scope": "personal", "notes": заметки}]},
+                                         monthly=True), "")
+        for заметка in прочие:
+            строка = ms.format_nudge({"repos": [{"scope": "personal",
+                                                 "notes": заметки + [заметка]}]}, monthly=True)
+            self.assertEqual(строка, f"Память, раз в месяц: personal: {заметка} → /memory-compact")
+        # Один итог автомата разбирать нечего: хвост ведёт в статус.
+        итог = ms.AUTO_NOTE + "3"
+        self.assertEqual(ms.format_nudge({"repos": [{"scope": "personal", "notes": [итог]}]},
+                                         monthly=True),
+                         f"Память, раз в месяц: personal: {итог} → memory status")
+        # Поломка приходит каждый день; хвост ведёт в статус, если измерений нет.
+        поломка = {"scope": "personal", "failed": [{"id": "bad-1"}], "notes": прочие}
+        self.assertEqual(ms.format_nudge({"repos": [поломка]}),
+                         "Память: personal: отказ bad-1 → memory status")
+        сводка = {"scope": "clients/acme", "health": ["сводка: раздел «Обзор» 4000 симв"]}
+        self.assertTrue(ms.format_nudge({"repos": [сводка]}).endswith("/memory-compact"))
 
 
 class LateReviewFixTests(Base):
@@ -2105,3 +2142,524 @@ class PointerKeepsNeighboursTests(Base):
         два, слова = mr.insert_rollup_pointer(один, "Доступы", "- [[acme_dns]] доступ по ssh")
         self.assertEqual(один, два)
         self.assertFalse(any("заменена прежняя строка" in w for w in слова), слова)
+
+
+def expiring(slug: str, title: str, index: str, probe: str, until: str | None = "2026-09-10") -> bytes:
+    поля = {"type": "project", "title": title, "index": index, "source": "разговор",
+            "observed_at": "2026-09-04", "probe": probe}
+    if until:
+        поля["valid_until"] = until
+    return record(slug, **поля, body=f"{title}.\n")
+
+
+LATER = dt.date(2026, 9, 20)
+BOILER_WORDS = ("project_boiler", "Бойлер котельной", "бойлер котельная нагрев воды",
+                "когда менять бойлер в котельной")
+BOILER = expiring(*BOILER_WORDS)
+GARAGE = expiring("project_garage", "Ворота гаража", "гараж ворота привод",
+                  "что с воротами гаража")
+EXECUTOR = {"executor": "home-pc", "closed": "on"}
+
+
+class SelfMaintenanceTests(Base):
+    """Самообслуживание (решение владельца 24.09.2026): истёкшее сворачивает
+    автомат одной подачей писателя, только на машине-исполнителе."""
+
+    def configure(self, maintenance, **extra) -> mv.Config:
+        topics = json.loads(json.dumps(TOPICS))
+        if maintenance is not None:
+            topics["maintenance"] = maintenance
+        topics["topics"]["home"].update(extra)
+        (self.fed.config / "topics.json").write_text(json.dumps(topics, ensure_ascii=False))
+        return mv.Config(topics=json.dumps(topics).encode(),
+                         questions=(self.fed.config / "eval_questions.json").read_bytes())
+
+    def close(self, config: mv.Config, host: str = "home-pc", today=LATER, **kw) -> dict:
+        with mock.patch.object(ms.socket, "gethostname", return_value=host):
+            return ms.close_expired(self.fed.root("a"), config, data_root=self.fed.machines["a"],
+                                    today=today, state=self.fed.states["a"], **kw)
+
+    def sync_a(self) -> dict:
+        with mock.patch.object(ms.socket, "gethostname", return_value="home-pc"):
+            outcomes = ms.sync_all(data_root=self.fed.machines["a"], today=LATER,
+                                   state=self.fed.states["a"])
+        return next(o for o in outcomes if o["scope"] == "personal")
+
+    def expired_tree(self, *slugs: str) -> dict[str, bytes]:
+        tree = svodgit.read_tree(self.fed.root("a"), "HEAD")
+        for slug in slugs:
+            tree[f"memory/{slug}.md"] = expiring(slug, "Запись", "запись", "про запись")
+        return tree
+
+    def save(self, machine: str, cid: str, body: bytes, slug: str) -> None:
+        code, result = mr.run_remember(
+            scope="personal", candidate_id=cid, source="test", session="s",
+            content_type="markdown", body=body, projection={"record_slug": slug},
+            data_root=self.fed.machines[machine], state=self.fed.states[machine], today=LATER,
+            base=svodgit.head(self.fed.root(machine, "personal")))
+        self.assertEqual(result["state"], "saved", result)
+
+    def boiler_on_server(self) -> dict:
+        return mv.parse_frontmatter(self.fed.origin_tree()["memory/project_boiler.md"].decode())[0]
+
+    def test_maintenance_is_parsed_apart_from_topics_and_a_typo_stops_only_the_automaton(self):
+        self.assertEqual(ms.maintenance_from_config(json.dumps(TOPICS).encode()),
+                         {"executor": "", "closed": "off"})
+        self.assertEqual(ms.maintenance_from_config(json.dumps(
+            {**TOPICS, "maintenance": {"executor": "home-pc", "closed": "observe"}}).encode()),
+            {"executor": "home-pc", "closed": "observe"})
+        for плохое in ({"executor": "home-pc", "closed": "Off"}, {"executor": "home-pc", "closed": False},
+                       {"executor": 5, "closed": "on"}, "on"):
+            with self.subTest(плохое=плохое):
+                config = self.configure(плохое)
+                итог = self.close(config)
+                self.assertEqual(итог["done"], [])
+                self.assertEqual(len(итог["problems"]), 1)
+                self.assertIn("автомат закрытого выключен: topics.json: maintenance",
+                              итог["problems"][0])
+        # Писатели обеих областей работают при опечатке в разделе.
+        code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(result["state"], "saved", result)
+        body = record("acme_vpn", type="project", title="VPN Acme", index="vpn acme",
+                      source="разговор", observed_at="2026-09-04",
+                      probe="как попасть в сеть заказчика по ssh", listed="false",
+                      body="Доступ по ssh через бастион.\n")
+        code, result = self.fed.remember("a", "clients/acme", "acme-vpn-1", body,
+                                         {"record_slug": "acme_vpn", "index_section": "Доступы",
+                                          "index_line": "- [[acme_vpn]] ssh через бастион"})
+        self.assertEqual(result["state"], "saved", result)
+
+    def test_machine_name_ignores_case_and_local_suffix(self):
+        with mock.patch.object(ms.socket, "gethostname", return_value="Work-Laptop.local"):
+            self.assertTrue(ms.same_machine("work-laptop"))
+            self.assertFalse(ms.same_machine("home-pc"))
+            self.assertFalse(ms.same_machine(""))
+
+    def test_off_absent_foreign_machine_and_stale_head_do_nothing(self):
+        head = svodgit.head(self.fed.root("a"))
+        tree = self.expired_tree("project_old")
+        with mock.patch.object(svodgit, "read_tree", return_value=tree):
+            for config, host, current in (
+                    (self.configure(None), "home-pc", True),
+                    (self.configure({"executor": "home-pc", "closed": "off"}), "home-pc", True),
+                    (self.configure(EXECUTOR), "другая", True),
+                    (self.configure(EXECUTOR), "home-pc", False)):
+                self.assertEqual(self.close(config, host, current=current),
+                                 {"done": [], "problems": []})
+        self.assertEqual(svodgit.head(self.fed.root("a")), head)
+        self.assertEqual(self.pending("a") + self.failed("a"), [])
+
+    def test_observe_names_ten_without_stand_and_hotkeep(self):
+        config = self.configure({"executor": "HOME-PC.local", "closed": "observe"},
+                                hotKeep=["project_keep.md"])
+        slugs = [f"project_old_{n:02d}" for n in range(12)]
+        tree = self.expired_tree(*slugs, "project_keep")
+        # Ожидаемая запись стенда тоже истекла: её автомат не трогает.
+        tree["memory/reference_printer.md"] = expiring("reference_printer", "Зелёный принтер",
+                                                       "как чинить зелёный принтер", "чем чинить")
+        # Свои отказы автомат снимает только в режиме on.
+        прежний = svodgit.failed_dir("personal", self.fed.states["a"]) / "auto-close-x.json"
+        прежний.parent.mkdir(parents=True)
+        прежний.write_text("{}")
+        with mock.patch.object(svodgit, "read_tree", return_value=tree):
+            итог = self.close(config)
+        self.assertEqual(итог["problems"], [])
+        self.assertEqual(итог["done"], ["свернул бы по сроку: " + ", ".join(slugs[:10])])
+        self.assertEqual(self.pending("a") + self.failed("a"), [прежний])
+
+    def test_on_folds_expired_records_through_the_writer(self):
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        self.save("a", "garage-1", GARAGE, "project_garage")
+        self.configure(EXECUTOR)
+        личный = self.sync_a()
+        кэш = svodgit.read_json(svodgit.sync_cache_path("personal", self.fed.states["a"]))
+        self.assertEqual(кэш["done"], личный["done"])
+        self.assertEqual(личный["problems"], [])
+        self.assertIn("свёрнуто по сроку: project_boiler, project_garage", личный["done"])
+        tree = self.fed.origin_tree()
+        for slug in ("project_boiler", "project_garage"):
+            self.assertTrue(tree[f"memory/{slug}.md"].startswith(b"---\nlisted: false\ntype: project"))
+        self.assertEqual(ms.dated_records(tree, LATER)[0], [])
+        тема = sh(self.fed.origins / "personal.git", "log", "-1", "--format=%s", "main")
+        self.assertTrue(тема.startswith("memory: auto-close-20260920-"), тема)
+        self.assertEqual(self.pending("a") + self.failed("a"), [])
+        # Следующий прогон видит свёрнутое и молчит; истёкшее не возвращается.
+        личный = self.sync_a()
+        self.assertEqual(личный["problems"], [])
+        self.assertFalse(any("по сроку" in line for line in личный["done"]), личный)
+        # Счёт автомата виден заметкой статуса на любой машине.
+        _, notes = ms.repo_health("personal", self.fed.root("a"), self.fed.verify_config,
+                                  self.fed.states["a"])
+        self.assertIn("автомат за 30 дней свернул по сроку: 2", notes)
+
+    def test_extension_offline_race_heals_itself_without_a_stale_refusal(self):
+        """Исполнитель свернул без сети, другая машина продлила срок, rebase
+        слил listed: false с новым сроком без конфликта: следующий прогон
+        возвращает запись сам, ложного отказа не остаётся."""
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        self.fed.sync("b")
+        config = self.configure(EXECUTOR)
+        with mock.patch.object(svodgit, "fetch", return_value=(False, "нет сети")):
+            итог = self.close(config)
+        self.assertIn("свёрнуто по сроку локально, ждёт отправки: project_boiler", итог["done"][0])
+        self.save("b", "boiler-extend", expiring(*BOILER_WORDS, until="2026-12-31"), "project_boiler")
+        личный = self.sync_a()
+        self.assertEqual(личный["problems"], [])
+        self.assertIn("возвращено после продления срока: project_boiler", личный["done"])
+        поля = self.boiler_on_server()
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), (None, "2026-12-31"))
+        self.assertEqual(self.pending("a") + self.failed("a"), [])
+        self.assertEqual(ms.format_nudge(ms.status(data_root=self.fed.machines["a"],
+                                                   state=self.fed.states["a"])), "")
+
+    def race_in_push_window(self, edited: bytes) -> None:
+        """Другая машина правит срок, пока исполнитель отправляет свёртку."""
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        self.fed.sync("b")
+        config = self.configure(EXECUTOR)
+        настоящий = svodgit.push
+        сделано = []
+
+        def push(root, commit, remote):
+            if not сделано and Path(root).resolve() == self.fed.root("a").resolve():
+                сделано.append(1)
+                with mock.patch.object(svodgit, "push", настоящий):
+                    self.save("b", "boiler-edit", edited, "project_boiler")
+            return настоящий(root, commit, remote)
+
+        with mock.patch.object(svodgit, "push", push):
+            self.close(config)
+        self.assertEqual(self.boiler_on_server().get("listed"), "false")
+
+    def test_extension_in_the_push_window_is_reopened_next_run(self):
+        self.race_in_push_window(expiring(*BOILER_WORDS, until="2026-12-31"))
+        личный = self.sync_a()
+        self.assertIn("возвращено после продления срока: project_boiler", личный["done"])
+        поля = self.boiler_on_server()
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), (None, "2026-12-31"))
+        тема = sh(self.fed.origins / "personal.git", "log", "-1", "--format=%s", "main")
+        self.assertTrue(тема.startswith("memory: auto-reopen-20260920-"), тема)
+        # Возвращённое не сворачивается снова и не возвращается повторно.
+        личный = self.sync_a()
+        self.assertFalse(any("срока" in line for line in личный["done"]), личный)
+
+    def test_removed_expiry_in_the_push_window_is_reopened_next_run(self):
+        self.race_in_push_window(expiring(*BOILER_WORDS, until=None))
+        личный = self.sync_a()
+        self.assertIn("возвращено после продления срока: project_boiler", личный["done"])
+        поля = self.boiler_on_server()
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), (None, None))
+
+    def test_manual_fold_racing_the_automaton_is_not_undone(self):
+        """Человек на другой машине сам свернул запись (listed ниже в шапке)
+        и продлил срок, пока автомат сворачивал: две строки listed, возврата
+        нет, ручная свёртка остаётся."""
+        продлено = expiring(*BOILER_WORDS, until="2026-12-31").replace(
+            b"valid_until:", b"listed: false\nvalid_until:")
+        self.race_in_push_window(продлено)
+        self.assertEqual(self.fed.origin_tree()["memory/project_boiler.md"].count(b"listed: false"), 2)
+        личный = self.sync_a()
+        self.assertFalse(any("срока" in line for line in личный["done"]), личный)
+        self.assertEqual(self.fed.origin_tree()["memory/project_boiler.md"].count(b"listed: false"), 2)
+
+    def test_extension_rebased_over_the_fold_is_reopened(self):
+        """Обратный порядок: вторая машина продлила без сети, исполнитель
+        опубликовал свёртку, продление легло поверх неё. Последний коммит к
+        файлу человеческий, но строку listed менял только автомат."""
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        self.fed.sync("b")
+        self.configure(EXECUTOR)
+        with mock.patch.object(svodgit, "fetch", return_value=(False, "нет сети")):
+            code, result = mr.run_remember(
+                scope="personal", candidate_id="boiler-extend", source="test", session="s",
+                content_type="markdown", body=expiring(*BOILER_WORDS, until="2026-12-31"),
+                projection={"record_slug": "project_boiler"}, data_root=self.fed.machines["b"],
+                state=self.fed.states["b"], today=LATER, base=svodgit.head(self.fed.root("b")))
+        self.assertEqual(result["state"], "pending", result)
+        self.assertIn("свёрнуто по сроку: project_boiler", self.sync_a()["done"])
+        self.fed.sync("b")
+        поля = self.boiler_on_server()
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), ("false", "2026-12-31"))
+        тема = sh(self.fed.origins / "personal.git", "log", "-1", "--format=%s", "main")
+        self.assertFalse(тема.startswith("memory: auto-"), тема)
+        личный = self.sync_a()
+        self.assertIn("возвращено после продления срока: project_boiler", личный["done"])
+        поля = self.boiler_on_server()
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), (None, "2026-12-31"))
+        self.fed.sync("b")
+        self.assertEqual(self.failed("b") + self.failed("a"), [])
+
+    def test_body_line_starting_with_listed_does_not_hide_the_origin(self):
+        """После свёртки человек продлил срок и поправил в теле строку,
+        начинающуюся с listed: происхождение ищется по полю шапки, а не по
+        любой такой строке файла, и запись возвращается."""
+        исходная = BOILER.replace(b"\n\n# project_boiler",
+                                  "\n\n# project_boiler\n\nlisted: старый пример".encode())
+        self.save("a", "boiler-1", исходная, "project_boiler")
+        self.configure(EXECUTOR)
+        self.assertIn("свёрнуто по сроку: project_boiler", self.sync_a()["done"])
+        self.fed.sync("b")
+        правка = (self.fed.origin_tree()["memory/project_boiler.md"]
+                  .replace(b"valid_until: 2026-09-10", b"valid_until: 2026-12-31")
+                  .replace("listed: старый".encode(), "listed: новый".encode()))
+        self.save("b", "boiler-extend", правка, "project_boiler")
+        личный = self.sync_a()
+        self.assertIn("возвращено после продления срока: project_boiler", личный["done"])
+        текст = self.fed.origin_tree()["memory/project_boiler.md"]
+        поля = mv.parse_frontmatter(текст.decode())[0]
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), (None, "2026-12-31"))
+        self.assertIn("listed: новый пример".encode(), текст)
+
+    def folded_on_b(self) -> Path:
+        """Автомат свернул запись, вторая машина её подтянула."""
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        self.configure(EXECUTOR)
+        self.assertIn("свёрнуто по сроку: project_boiler", self.sync_a()["done"])
+        self.fed.sync("b")
+        return self.fed.root("b")
+
+    def test_human_merge_in_the_file_history_is_not_undone(self):
+        """Одна ветка сняла свёртку, другая продлила срок, человек слил их,
+        выбрав свёрнутое: решение человека важнее, возврата нет."""
+        root = self.folded_on_b()
+        путь = "memory/project_boiler.md"
+        текст = (root / путь).read_bytes()
+        sh(root, "checkout", "--quiet", "-b", "снять")
+        self.manual_commit(root, путь, текст.replace(b"listed: false\n", b""), "memory: x",
+                           no_verify=True)
+        sh(root, "checkout", "--quiet", "main")
+        self.manual_commit(root, путь, текст.replace(b"2026-09-10", b"2026-12-31"), "memory: y",
+                           no_verify=True)
+        sh(root, "merge", "--quiet", "--no-verify", "-s", "ours", "снять", "-m", "memory: слияние")
+        sh(root, "push", "--quiet", "--no-verify", "origin", "main")
+        личный = self.sync_a()
+        self.assertEqual(ms._fold_origin(self.fed.root("a"), путь), "")
+        self.assertFalse(any("срока" in line for line in личный["done"]), личный)
+        поля = self.boiler_on_server()
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), ("false", "2026-12-31"))
+
+    def test_renamed_record_is_followed_to_the_fold(self):
+        root = self.folded_on_b()
+        sh(root, "mv", "memory/project_boiler.md", "memory/project_heater.md")
+        sh(root, "commit", "--quiet", "--no-verify", "-m", "memory: rename")
+        sh(root, "push", "--quiet", "--no-verify", "origin", "main")
+        текст = (root / "memory/project_heater.md").read_bytes()
+        self.save("b", "heater-extend", текст.replace(b"2026-09-10", b"2026-12-31"),
+                  "project_heater")
+        личный = self.sync_a()
+        self.assertIn("возвращено после продления срока: project_heater", личный["done"])
+        поля = mv.parse_frontmatter(self.fed.origin_tree()["memory/project_heater.md"].decode())[0]
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), (None, "2026-12-31"))
+
+    def test_publication_conflict_keeps_the_automaton_away(self):
+        """fetch удался, но вершина сервера не легла в HEAD (конфликт
+        публикации): автомат не судит по старому."""
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        self.fed.sync("b")
+        self.configure(EXECUTOR)
+        путь = "memory/topics/home.md"
+        self.manual_commit(self.fed.root("a"), путь, "# Home\n\n## Обзор\n\nA.\n".encode(),
+                           "memory: a", no_verify=True)
+        self.manual_commit(self.fed.root("b"), путь, "# Home\n\n## Обзор\n\nB.\n".encode(),
+                           "memory: b", no_verify=True)
+        sh(self.fed.root("b"), "push", "--quiet", "--no-verify", "origin", "main")
+        личный = self.sync_a()
+        self.assertTrue(any("конфликт" in p for p in личный["problems"]), личный)
+        self.assertFalse(any("по сроку" in line for line in личный["done"]), личный)
+        self.assertIsNone(self.boiler_on_server().get("listed"))
+        self.assertEqual(self.pending("a") + self.failed("a"), [])
+
+    def test_stale_head_without_network_folds_nothing(self):
+        """Продление сделано заранее, исполнитель долго спал и первый прогон
+        без сети: со старой вершины автомат не сворачивает."""
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        self.fed.sync("b")
+        self.configure(EXECUTOR)
+        self.save("b", "boiler-extend", expiring(*BOILER_WORDS, until="2026-12-31"), "project_boiler")
+        with mock.patch.object(svodgit, "fetch", return_value=(False, "нет сети")):
+            личный = self.sync_a()
+        self.assertEqual(личный["done"], [])
+        self.assertEqual(личный["problems"], ["сети нет: нет сети"])
+        личный = self.sync_a()
+        self.assertFalse(any("срок" in line for line in личный["done"]), личный)
+        поля = self.boiler_on_server()
+        self.assertEqual((поля.get("listed"), поля.get("valid_until")), (None, "2026-12-31"))
+        self.assertEqual(self.pending("a") + self.failed("a"), [])
+
+    def test_own_refusal_is_replaced_each_run_and_cleared_after_the_fix(self):
+        self.save("a", "boiler-1", BOILER, "project_boiler")
+        config = self.configure(EXECUTOR)
+        self.fed.set_scanner(1)
+        for день in (LATER, LATER + dt.timedelta(days=1)):
+            итог = self.close(config, today=день)
+            self.assertEqual(len(итог["problems"]), 1, итог)
+            self.assertIn("свёртка по сроку auto-close-", итог["problems"][0])
+            отказы = self.failed("a")
+            self.assertEqual([f.name[:len("auto-close-20260920")] for f in отказы],
+                             [f"auto-close-{день:%Y%m%d}"])
+        self.fed.set_scanner(0)
+        итог = self.close(config, today=LATER + dt.timedelta(days=2))
+        self.assertEqual(итог, {"done": ["свёрнуто по сроку: project_boiler"], "problems": []})
+        self.assertEqual(self.failed("a"), [])
+
+    def test_crash_is_a_problem_not_a_fallen_timer(self):
+        self.configure(EXECUTOR)
+        with mock.patch.object(ms, "dated_records", side_effect=RuntimeError("сбой")):
+            личный = self.sync_a()
+        self.assertEqual(личный["problems"], ["автомат закрытого: RuntimeError: сбой"])
+        кэш = svodgit.read_json(svodgit.sync_cache_path("personal", self.fed.states["a"]))
+        self.assertEqual(кэш["problems"], личный["problems"])
+        self.assertIn("таймер: автомат закрытого",
+                      ms.format_nudge(ms.status(data_root=self.fed.machines["a"],
+                                                state=self.fed.states["a"])))
+
+    def test_usage_day_marks_older_than_120_days_are_swept(self):
+        """Каталога claude/sessions нет вовсе: уборка меток дней всё равно идёт."""
+        import memorycontext
+        метки = self.fed.states["a"] / "claude" / "usage"
+        (метки / "days").mkdir(parents=True)
+        (метки / "records").mkdir(parents=True)
+        self.assertFalse((self.fed.states["a"] / "claude" / "sessions").exists())
+        сегодня = dt.date(2026, 9, 24)
+        for смещение in (0, 100, 121, 400):
+            (метки / "days" / (сегодня - dt.timedelta(days=смещение)).isoformat()).touch()
+        (метки / "days" / "мусор").touch()
+        запись = метки / "records" / "project_old"
+        запись.touch()
+        древность = time.time() - 400 * 86400
+        os.utime(запись, (древность, древность))
+        with mock.patch.object(memorycontext, "today_utc", return_value=сегодня):
+            self.assertEqual(ms.prune_router_cache(self.fed.states["a"]), 2)
+        self.assertEqual(sorted(p.name for p in (метки / "days").iterdir()),
+                         ["2026-06-16", "2026-09-24", "мусор"])
+        self.assertTrue(запись.exists())
+
+
+class UsageObservationTests(Base):
+    """Неиспользуемое только наблюдается: заметка статуса при покрытии в
+    30 дней работы за 60 суток и учёте не короче 60 суток, никаких записей."""
+
+    NOTE = "свернул бы (не выдавалась хуком 60 дней на машине work-laptop): "
+
+    def commit(self, files: dict[str, bytes], message: str, days_ago: int) -> None:
+        root = self.fed.root("a")
+        for path, data in files.items():
+            (root / path).write_bytes(data)
+        когда = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days_ago)).isoformat()
+        env = {**os.environ, "GIT_COMMITTER_DATE": когда, "GIT_AUTHOR_DATE": когда}
+        sh(root, "add", "-A", env=env)
+        sh(root, "commit", "--quiet", "--no-verify", "-m", message, env=env)
+
+    def setUp(self):
+        super().setUp()
+        def project(slug: str, **fields) -> bytes:
+            return record(slug, **{"type": "project", "title": f"Проект {slug}",
+                                   "index": "проект", **fields})
+        names = ("project_idle", "project_used", "project_stale_mark", "project_edited",
+                 "project_keep", "project_stand", "project_closed", "project_reopened",
+                 "project_other_auto")
+        files = {f"memory/{n}.md": project(n) for n in names}
+        files["memory/project_dated.md"] = project("project_dated", valid_until="2999-01-01")
+        files["memory/project_folded.md"] = project("project_folded", listed="false")
+        files["memory/project_no_index.md"] = record("project_no_index", type="project")
+        files["memory/reference_idle.md"] = record("reference_idle", type="reference",
+                                                   title="Справка", index="справка")
+        self.commit(files, "memory: fixture", 90)
+        self.commit({"memory/project_edited.md": project("project_edited", body="Правка.\n")},
+                    "memory: edit-1", 5)
+        self.commit({"memory/project_closed.md": project("project_closed", listed="false")},
+                    "memory: auto-close-20260920-abcd1234", 3)
+        self.commit({"memory/project_reopened.md": project("project_reopened", body="Авто.\n")},
+                    "memory: auto-reopen-20260920-abcd1234", 3)
+        # Похожий префикс не делает правку автоматической.
+        self.commit({"memory/project_other_auto.md": project("project_other_auto", body="Ч.\n")},
+                    "memory: auto-other", 3)
+        topics = json.loads(json.dumps(TOPICS))
+        topics["topics"]["home"]["hotKeep"] = ["project_keep.md"]
+        questions = json.loads(json.dumps(QUESTIONS))
+        questions["questions"].append({"id": "q2", "group": "tuned", "text": "стенд",
+                                       "expect": "project_stand", "markers": ["стенд"]})
+        self.config = mv.Config(topics=json.dumps(topics).encode(),
+                                questions=json.dumps(questions).encode())
+        self.usage = self.fed.states["a"] / "claude" / "usage"
+        (self.usage / "records").mkdir(parents=True)
+        (self.usage / "days").mkdir(parents=True)
+        свежо = time.time() - 86400
+        давно = time.time() - 70 * 86400
+        for slug, когда in (("project_used", свежо), ("project_stale_mark", давно)):
+            (self.usage / "records" / slug).touch()
+            os.utime(self.usage / "records" / slug, (когда, когда))
+
+    def days(self, count: int, *, old: bool = True) -> None:
+        сегодня = dt.datetime.now(dt.timezone.utc).date()
+        for смещение in range(count):
+            (self.usage / "days" / (сегодня - dt.timedelta(days=смещение)).isoformat()).touch()
+        if old:
+            # Старая метка покрытия не даёт, но доказывает учёт в 60 суток.
+            (self.usage / "days" / (сегодня - dt.timedelta(days=70)).isoformat()).touch()
+
+    def notes(self, config=None) -> list[str]:
+        with mock.patch.object(ms.socket, "gethostname", return_value="work-laptop"):
+            health, notes = ms.repo_health("personal", self.fed.root("a"), config or self.config,
+                                           self.fed.states["a"])
+        self.assertEqual(health, [])
+        return notes
+
+    def test_covered_machine_names_idle_project_records(self):
+        self.days(30)
+        head = svodgit.head(self.fed.root("a"))
+        notes = self.notes()
+        self.assertIn(self.NOTE + "project_idle, project_reopened, project_stale_mark", notes)
+        self.assertIn("автомат за 30 дней свернул по сроку: 1", notes)
+        # Наблюдение ничего не пишет.
+        self.assertEqual(svodgit.head(self.fed.root("a")), head)
+        self.assertEqual(self.pending("a") + self.failed("a"), [])
+        строка = ms.format_nudge({"repos": [{"scope": "personal", "notes": notes}]}, monthly=True)
+        self.assertIn("свернул бы", строка)
+        self.assertIn("автомат за 30 дней", строка)
+        self.assertEqual(ms.format_nudge({"repos": [{"scope": "personal", "notes": notes}]}), "")
+
+    def test_without_coverage_there_is_no_idle_note_and_no_long_git_walk(self):
+        for count, old in ((29, True), (30, False)):
+            with self.subTest(count=count, old=old):
+                shutil.rmtree(self.usage / "days")
+                (self.usage / "days").mkdir()
+                self.days(count, old=old)
+                окна = []
+                настоящий = ms._commits
+
+                def считать(root, paths, *options):
+                    окна.append(options)
+                    return настоящий(root, paths, *options)
+
+                with mock.patch.object(ms, "_commits", считать):
+                    notes = self.notes()
+                self.assertFalse(any(n.startswith("свернул бы") for n in notes), notes)
+                self.assertIn("автомат за 30 дней свернул по сроку: 1", notes)
+                полночь = dt.datetime.combine(dt.datetime.now(dt.timezone.utc).date(), dt.time(),
+                                              dt.timezone.utc).timestamp()
+                self.assertEqual(окна, [(f"--since=@{int(полночь - 30 * 86400)}",)])
+
+    def test_lagging_automaton_is_a_note_and_protected_stay_expired(self):
+        """closed: on, а незащищённое истекло больше двух суток назад:
+        автомат отстал. Стенд и hotKeep остаются строкой «просрочено»."""
+        import memorycontext
+        сегодня = dt.date(2026, 9, 20)
+        tree = svodgit.read_tree(self.fed.root("a"), "HEAD")
+        for slug, срок in (("project_late", "2026-09-10"), ("project_recent", "2026-09-19"),
+                           ("project_stand", "2026-09-01"), ("project_keep", "2026-09-01")):
+            tree[f"memory/{slug}.md"] = expiring(slug, "Запись", "запись", "про запись", срок)
+        for режим, ожидание in (
+                ("on", ["автомат закрытого отстал (исполнитель home-pc, эта машина work-laptop): "
+                        "project_late", "просрочено: valid_until истёк у project_keep, project_stand"]),
+                ("observe", ["просрочено: valid_until истёк у project_keep, project_late, "
+                             "project_recent, project_stand"])):
+            topics = json.loads(self.config.topics)
+            topics["maintenance"] = {"executor": "home-pc", "closed": режим}
+            config = mv.Config(topics=json.dumps(topics).encode(), questions=self.config.questions)
+            with mock.patch.object(svodgit, "read_tree", return_value=tree), \
+                    mock.patch.object(memorycontext, "today_utc", return_value=сегодня):
+                notes = self.notes(config)
+            self.assertEqual([n for n in notes if n.startswith(("автомат закрытого", "просрочено"))],
+                             ожидание)

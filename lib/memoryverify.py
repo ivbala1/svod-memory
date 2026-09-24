@@ -261,6 +261,11 @@ class Topics:
     placement: dict[str, tuple[str, str | None]]  # файл сводки -> (тема, владелец)
     drift: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...]
     budget: dict                                  # пороги индекса из topics.json
+    archived: dict = field(default_factory=dict)  # сводки ушедших заказчиков
+
+    def link_placement(self) -> dict[str, tuple[str, str | None]]:
+        """Раскладка для ссылок и архива: действующие и архивные сводки."""
+        return {**self.archived, **self.placement}
 
 
 @functools.lru_cache(maxsize=8)
@@ -281,7 +286,8 @@ def load_topics(raw: bytes) -> Topics:
             raise ValueError(f"topics.json: у темы {name} нет tokens, дрейф не посчитать")
         drift.append((name, tuple(tokens), frozenset(entry.get("hotKeep") or ())))
     return Topics(specs=specs, placement=placement, drift=tuple(drift),
-                  budget=dict(parsed.get("budget") or {}))
+                  budget=dict(parsed.get("budget") or {}),
+                  archived=topiclayout.archived_from_config(parsed, label, placement))
 
 
 def client_name(root: str) -> str | None:
@@ -630,7 +636,7 @@ def link_errors(candidate: dict[str, bytes], topics: Topics | None = None,
     warnings: list[str] = []
     memory_root = Path("/memory")
     stems = {PurePosixPath(path).stem for path in candidate if path.endswith(".md")}
-    placement = topics.placement if topics is not None else {}
+    placement = topics.link_placement() if topics is not None else {}
     for path, data in sorted(candidate.items()):
         if not path.endswith(".md"):
             continue
@@ -803,8 +809,8 @@ def reach_errors(base: dict[str, bytes], candidate: dict[str, bytes],
             f"memory/{name}: запись становится недостижимой (нет ни строки в индексе, "
             "ни упоминания в сводке темы); дай ей строку индекса в шапке (type, title, "
             "index) или упомяни в сводке той же подачей")
-    before = invalid_archive(base, topics.placement, root)
-    after = invalid_archive(candidate, topics.placement, root)
+    before = invalid_archive(base, topics.link_placement(), root)
+    after = invalid_archive(candidate, topics.link_placement(), root)
     replaced = {name for name in before & after
                 if base.get(f"memory/{name}") != candidate.get(f"memory/{name}")}
     for name in sorted((after - before) | replaced):
@@ -899,6 +905,15 @@ def delivered_link_present(delivered_text: str, slug: str) -> bool:
     return False
 
 
+def _expired(fields: dict, today: dt.date) -> bool:
+    """valid_until прошёл: действует ПО указанный день включительно (UTC),
+    та же граница, что у отбора роутера. Битая дата не прячет запись."""
+    try:
+        return today > dt.date.fromisoformat(fields.get("valid_until") or "")
+    except ValueError:
+        return False
+
+
 def probe_errors(base: dict[str, bytes], candidate: dict[str, bytes], *,
                  root: str, topics: Topics, laid_out: Path, today: dt.date,
                  facts: dict, entries: tuple | None = None) -> list[str]:
@@ -922,6 +937,11 @@ def probe_errors(base: dict[str, bytes], candidate: dict[str, bytes], *,
             # по построению: в личном корне её находит поиск по корпусу, в
             # глобальном свёртки нет (контракт отказывает); крючок молчит.
             # Клиентскую запись ищут через сводку, listed ей не указ.
+            continue
+        if client is None and _expired(fields, today):
+            # Истёкшую запись отбор тоже не выдаёт (граница _entry_expired):
+            # её крючок не находит ничего, и без этого пропуска первый же
+            # истёкший valid_until отказывал бы каждой подаче в корень.
             continue
         label = f"memory/{slug}.md"
         if is_tautology(probe, tautology_candidates(slug, text)):
@@ -1014,7 +1034,7 @@ def drifted_slugs(tree: dict[str, bytes], drift, own_client: str | None = None) 
 
 def foreign_errors(base: dict[str, bytes], candidate: dict[str, bytes],
                    root: str, topics: Topics) -> list[str]:
-    errors = rollup_placement_errors(candidate, topics.placement, root)
+    errors = rollup_placement_errors(candidate, topics.link_placement(), root)
     client = client_name(root)
     fresh = drifted_slugs(candidate, topics.drift, client) - drifted_slugs(base, topics.drift, client)
     for slug in sorted(fresh):

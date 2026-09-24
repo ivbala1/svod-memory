@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import configpaths
 import memorycontext as mc
 import memoryctl
+import svodgit
 import topiclayout
 from memoryctl import MemoryctlError, compute_revision
 
@@ -696,7 +697,8 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="состояние репозиториев памяти из git и каталога ожидания")
     st.add_argument("--fetch", action="store_true", help="сначала fetch с сервера")
     st.add_argument("--nudge", action="store_true",
-                    help="одна строка только если есть что разобрать; для хука старта сессии")
+                    help="одна строка только если есть что разобрать; для хука старта "
+                         "сессии: ежедневно поломки, заметки обслуживания раз в месяц")
     st.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
@@ -775,12 +777,46 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             import memorysync
             if args.nudge:
-                # Подсказка не имеет права ломать старт сессии: любая ошибка
-                # это молчание, слова скажет полный статус.
+                # Хук старта зовёт подсказку до закрепления, поэтому она видит
+                # только области потолка каталога, как recall. Заметки месяца
+                # (UTC) только при личном потолке и человеку; месяц это
+                # локальный файл, удобство показа, а не состояние памяти.
+                метка = svodgit.state_dir() / "nudge-month"
+                месяц = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m")
+                безлюдный = (mc.scheduled_run() or os.environ.get(
+                    "CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"))
+                # Потолок не определён: только global, и строка об этом без
+                # имён областей, иначе молчали бы и отказы личной памяти.
+                беда = None
                 try:
-                    строка = memorysync.format_nudge(memorysync.status(fetch=False))
-                except Exception:  # noqa: BLE001
+                    потолок = ceiling_for(os.getcwd(), _load_scope_roots())
+                except Exception as exc:  # noqa: BLE001
+                    потолок, беда = None, type(exc).__name__
+                spec = mc.TOPICS.get(потолок or "")
+                видно = {"global"} | ({spec.owner} if spec and spec.owner else set())
+                try:
+                    месячная = (потолок == PERSONAL and not безлюдный
+                                and метка.read_text(encoding="utf-8").strip() != месяц)
+                except OSError:
+                    месячная = True
+                try:
+                    итог = memorysync.status(fetch=False)
+                    if потолок != PERSONAL:
+                        итог["repos"] = [r for r in итог["repos"] if r["scope"] in видно]
+                    строка = memorysync.format_nudge(итог, monthly=месячная)
+                except Exception:  # noqa: BLE001 - подсказка не ломает старт сессии
                     return 0
+                if беда:
+                    строка = "\n".join(filter(None, [
+                        f"Память: область каталога не определена ({беда}), подсказка "
+                        "ограничена global → memory status", строка]))
+                # Заметки личной области не посчитаны: месяц не расходуется.
+                if месячная and not any(r["scope"] == PERSONAL and r.get("problem")
+                                        for r in итог["repos"]):
+                    try:
+                        svodgit.replace_file(метка, месяц.encode("utf-8"))
+                    except OSError:
+                        pass
                 if строка:
                     print(строка)
                 return 0

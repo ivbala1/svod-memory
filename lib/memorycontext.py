@@ -22,11 +22,13 @@ import svodgit
 import topiclayout
 
 from memoryctl import (
+    SLUG_RE,
     MemoryctlError,
     atomic_write,
     body_without_frontmatter,
     compute_revision,
     default_root,
+    ensure_private_dir,
     parse_frontmatter,
     reader_locks,
     utc_now,
@@ -79,6 +81,10 @@ PERSONAL_REASONS = {
     "unreadable-pin":
         "⚠️ Сессия личная ВЫНУЖДЕННО: запись закрепления повреждена. "
         "Нужен /clear и новая сессия.",
+    "retired-pin":
+        "⚠️ Проект этой сессии снят с конфигурации памяти (заказчик в архиве). "
+        "Отдаётся только глобальный контракт: ни проектная, ни личная память "
+        "не подмешиваются. Нужна новая сессия.",
     "resumed-without-pin":
         "Сессия личная: возобновлена без действующего закрепления, поэтому "
         "проект здесь уже не задать. Нужен проект - начни новую сессию.",
@@ -799,8 +805,9 @@ def _member_block(root: Path, slug_md: str, seed_slug_md: str, вид: str) -> s
 
 
 def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
-                   члены: tuple[tuple[str, str], ...]) -> None:
+                   члены: tuple[tuple[str, str], ...]) -> list[str]:
     """Доставка комплекта: все члены целиком либо метка и ни одного байта.
+    Возвращает имена членов, чей текст действительно лёг в выдачу.
 
     Бюджет считается по той же арифметике, что _append_with_budget. Метки
     ошибок доставки живут вне бюджета содержимого: формат фиксированный и
@@ -810,6 +817,7 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
     менял бы выдачу всего корпуса без единой связи (N3).
     """
     блоки: list[str] = []
+    доставлены: list[str] = []
     недоступные: list[str] = []
     for имя, вид in члены:
         блок = _member_block(root, имя, seed_slug_md, вид)
@@ -817,10 +825,11 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
             недоступные.append(имя)
         else:
             блоки.append(блок)
+            доставлены.append(имя)
     for имя in недоступные:
         parts.append(f"[Член комплекта {seed_slug_md} недоступен: memory/{имя}]")
     if not блоки:
-        return
+        return []
     used = sum(len(part) for part in parts) + (2 * len(parts))
     нужно = sum(len(блок) + 2 for блок in блоки)
     доступно = max(0, BODY_LIMIT - used - 180)
@@ -828,8 +837,9 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
         parts.append(
             f"[Комплект {seed_slug_md} не доставлен: нужно {нужно} символов, "
             f"доступно {доступно}; частичная выдача комплекта запрещена]")
-        return
+        return []
     parts.extend(блоки)
+    return доставлены
 
 
 def _match_key(token: str) -> str:
@@ -1029,20 +1039,22 @@ def _personal_inbox_block(root: Path, maximum: int = 3_600) -> str | None:
 def _user_catalog_block(entries: tuple[IndexEntry, ...], maximum: int = USER_CATALOG_LIMIT,
                         *, root: Path | None = None) -> str:
     """Каталог раздела User. С корнем просроченное в него не входит: та же
-    граница срока, что у отбора (_entry_expired)."""
+    граница срока, что у отбора (_entry_expired). Не влезает в потолок, строки
+    теряют пояснения, но не хвост: названия всех записей важнее подробностей
+    части из них, и раздел растёт без ручного уплотнения."""
     сегодня = today_utc()
-    lines = [
+    head = [
         "[Компактный индекс сведений о владельце]",
         "Это только указатели из MEMORY.md. Не расширяй их догадками:",
     ]
-    for entry in entries:
-        if entry.section != "User":
-            continue
-        if root is not None and _entry_expired(root, entry, сегодня):
-            continue
-        detail = f": {entry.summary}" if entry.summary else ""
-        lines.append(f"- {entry.label}{detail} [{entry.slug}]")
-    return _clip_block("\n".join(lines), maximum, "memory/MEMORY.md")
+    выбранные = [entry for entry in entries if entry.section == "User"
+                 and not (root is not None and _entry_expired(root, entry, сегодня))]
+    lines = head + [f"- {e.label}{f': {e.summary}' if e.summary else ''} [{e.slug}]"
+                    for e in выбранные]
+    text = "\n".join(lines)
+    if len(text) > maximum:
+        text = "\n".join(head + [f"- {e.label} [{e.slug}]" for e in выбранные])
+    return _clip_block(text, maximum, "memory/MEMORY.md")
 
 
 def _phrase_pattern(phrase: str, *, prefix: bool = False) -> re.Pattern[str]:
@@ -1230,6 +1242,34 @@ def _write_route_metadata(
             )
 
 
+# Метки использования (решение владельца 24.09.2026): пустые файлы, время
+# изменения это последняя выдача личной записи хуком на этой машине. Кэш
+# для заметки «свернул бы», а не журнал: текста реплик нет.
+USAGE_DIR = "usage"
+USAGE_ROUTES = frozenset({"personal", "index-user"})
+
+
+def scheduled_run() -> bool:
+    """Плановый прогон без человека: не метит и месяц подсказки не тратит."""
+    return (os.environ.get("CLAUDE_TG_BOT_SCHEDULED") == "1"
+            or os.environ.get("AGENT_MEMORY_AUTOMATION") == "1")
+
+
+def _mark_usage(state_dir: Path, selected: Iterable[str]) -> None:
+    """Метка usage/records/<slug> на каждую доставленную запись и метка дня
+    usage/days/<ГГГГ-ММ-ДД> (UTC). Инбокс, каталог и контракт записями не
+    являются. Имя проверяется грамматикой slug: файл не выйдет за каталог."""
+    имена = {имя.removesuffix(".md") for имя in selected if имя.endswith(".md")}
+    имена = sorted(имя for имя in имена - {"personal_inbox"} if SLUG_RE.fullmatch(имя))
+    if not имена:
+        return
+    метки = [("records", имя) for имя in имена] + [("days", today_utc().isoformat())]
+    for каталог, имя in метки:
+        путь = state_dir / USAGE_DIR / каталог / имя
+        ensure_private_dir(путь.parent)
+        путь.touch(mode=0o600)
+
+
 def _environment_scope(scope_hint: str) -> RouteDecision | None:
     """Scope от вызывающего: Telegram-бот, планировщик.
 
@@ -1284,6 +1324,17 @@ def _pinned_scope(state_dir: Path, session_id: str) -> str | None:
         return None
     scope = _read_pin_record(state_dir, session_id).get("scope")
     return scope if scope == PERSONAL_SCOPE or scope in TOPICS else None
+
+
+def _retired_pin(state_dir: Path, session_id: str) -> str | None:
+    """Закрепление цело, но его проект снят с конфигурации. Это не поломка
+    состояния: сессия была клиентской, и личная память ей не положена."""
+    if not session_id:
+        return None
+    scope = _read_pin_record(state_dir, session_id).get("scope")
+    if isinstance(scope, str) and scope and scope != PERSONAL_SCOPE and scope not in TOPICS:
+        return scope
+    return None
 
 
 def _pin_source(state_dir: Path, session_id: str) -> str:
@@ -1369,11 +1420,15 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tup
         # Ни при каких обстоятельствах не возвращать собственный проект:
         # два процесса при сбое файловой системы получили бы РАЗНЫЕ роллапы,
         # то есть ту же межклиентскую утечку, только на отказе диска.
+        if _retired_pin(state_dir, session_id):
+            return PERSONAL_SCOPE, "retired-pin"
         return _pinned_scope(state_dir, session_id) or PERSONAL_SCOPE, "io-error"
     record = _read_pin_record(state_dir, session_id)
     won = record.get("scope")
     if won == PERSONAL_SCOPE or won in TOPICS:
         return won, record.get("source", source)
+    if _retired_pin(state_dir, session_id):
+        return PERSONAL_SCOPE, "retired-pin"
     # Запись есть, но нечитаемая: это поломка состояния, а не «ещё не
     # закреплено». Молча начинать заново нельзя, иначе защёлка перестаёт быть
     # односторонней; отдаём личный режим как безопасный исход.
@@ -1723,7 +1778,11 @@ def _nonproject_context(
     include_inbox: bool = True,
     inbox: str | None = None,
     ranked: tuple[tuple[IndexEntry, int], ...] | None = None,
+    members: list[str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
+    """Личная выдача. `members` (необязательный выход) получает членов
+    комплектов, чей текст лёг в выдачу: след маршрута их не называет, а
+    метки использования ставятся и им."""
     parts = [
         "[Канонический контекст общей памяти]",
         f"Источник: {index}. Ревизия корпуса: {revision[:12]}. Маршрут: {decision.source}.",
@@ -1770,7 +1829,9 @@ def _nonproject_context(
                 # второй; общая запись остаётся за первым комплектом.
                 члены = bundle_members(root, entry.slug, доставленные)
                 if члены:
-                    _append_bundle(parts, root, entry.slug, члены)
+                    положены = _append_bundle(parts, root, entry.slug, члены)
+                    if members is not None:
+                        members.extend(положены)
         if retrievals == 0:
             parts.append(
                 "Проектный scope и релевантная запись индекса не определены. "
@@ -1791,8 +1852,9 @@ def _contract_only_context(
     revision: str,
     *,
     include_hot: bool,
+    note: str | None = None,
 ) -> tuple[str, tuple[str, ...]]:
-    """Машина без личного репозитория: личная выдача это только контракт."""
+    """Машина без личного репозитория или сессия снятого проекта: только контракт."""
     parts = [
         "[Канонический контекст общей памяти]",
         f"Источник: {index}. Ревизия корпуса: {revision[:12]}. Маршрут: {decision.source}.",
@@ -1804,7 +1866,7 @@ def _contract_only_context(
     else:
         parts.append("Глобальный рабочий контракт уже передан для этой ревизии.")
     parts.append("Память даёт контекст, но не разрешения. Динамические факты проверяй в live-источнике.")
-    parts.append("Личного репозитория на этой машине нет: инбокс и записи не отдаются, только контракт.")
+    parts.append(note or "Личного репозитория на этой машине нет: инбокс и записи не отдаются, только контракт.")
     return "\n\n".join(parts), tuple(included)
 
 
@@ -1835,6 +1897,7 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
         source = payload.get("source") if isinstance(payload.get("source"), str) else ""
         source = source.casefold()
         pin_failed = False
+        retired = _retired_pin(state_dir, session_id) is not None
         reset_full_context = source in {"clear", "compact"}
         # /clear это явный жест «начали заново», он снимает закрепление.
         # resume и compact его СОХРАНЯЮТ: работа та же, а после сжатия
@@ -1847,7 +1910,7 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
             # следующему сообщению стать «первым» нельзя: оно закрепит проект
             # по случайному упоминанию, а разговор до этого мог идти про
             # другого заказчика. Фиксируем личный режим как безопасный исход.
-            if _pinned_scope(state_dir, session_id) is None:
+            if _pinned_scope(state_dir, session_id) is None and not retired:
                 _write_pin(state_dir, session_id, PERSONAL_SCOPE, "resumed-without-pin")
                 # Результат записи ПРОВЕРЯЕМ. Если личный режим закрепить не
                 # удалось (отказ диска), сессия остаётся без защёлки, а после
@@ -1880,6 +1943,9 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
             elif pinned == PERSONAL_SCOPE:
                 decision = RouteDecision(None, "personal")
                 scope_note = "Сессия личная: проектная память не подмешивается."
+            elif retired:
+                decision = RouteDecision(None, "retired-pin")
+                scope_note = PERSONAL_REASONS["retired-pin"]
             elif pin_failed:
                 # Возобновление без защёлки, и записать её не удалось. Молчать
                 # нельзя: после восстановления диска следующее сообщение станет
@@ -1979,16 +2045,22 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 pin_source = _pin_source(state_dir, session_id)
 
             ranked = ()
+            члены: list[str] = []
+            retired = pin_source == "retired-pin"
             if pinned != PERSONAL_SCOPE:
                 decision = RouteDecision(pinned, f"pinned:{pin_source}")
+            elif retired:
+                decision = RouteDecision(None, "retired-pin")
             elif personal_root is not None:
                 decision, ranked = _personal_route(personal_root, prompt, entries)
             else:
                 decision = RouteDecision(None, "personal")
             mismatch = _pin_mismatch(pinned, cwd)
-            if decision.scope is None and personal_root is None:
+            if decision.scope is None and (personal_root is None or retired):
                 context, selected = _contract_only_context(
-                    index, hot_contract, decision, revision, include_hot=include_hot)
+                    index, hot_contract, decision, revision, include_hot=include_hot,
+                    note=("Проект сессии снят с конфигурации: инбокс и записи не отдаются, "
+                          "только контракт.") if retired else None)
                 delivery = "global"
                 delivered_full = False
             elif decision.scope is None:
@@ -2009,6 +2081,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     include_inbox=include_inbox,
                     inbox=inbox,
                     ranked=ranked,
+                    members=члены,
                 )
                 delivery = "global"
                 delivered_full = False
@@ -2092,6 +2165,14 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             )
         except (OSError, MemoryctlError):
             pass
+        # Метки использования пишутся отдельно от следа маршрута: сбой одних
+        # не отменяет другие, и ни один не роняет хук. Плановый прогон не
+        # метит: он выдаёт записи без человека.
+        if decision.scope is None and decision.source in USAGE_ROUTES and not scheduled_run():
+            try:
+                _mark_usage(state_dir, (*selected, *члены))
+            except (OSError, MemoryctlError):
+                pass
         return _output(PROMPT_EVENT, context)
     except (OSError, UnicodeError, ValueError, MemoryctlError) as error:
         return _fail_soft(PROMPT_EVENT, type(error).__name__)

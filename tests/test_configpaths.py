@@ -47,7 +47,9 @@ class ПодменаКаталога:
         self.прежний = os.environ.get(configpaths.CONFIG_ENV)
         os.environ[configpaths.CONFIG_ENV] = str(каталог)
         configpaths._reset_for_tests()
-        return каталог
+        # Модуль разворачивает путь (realpath); на macOS временный каталог
+        # лежит под ссылкой /var -> /private/var.
+        return каталог.resolve()
 
     def __exit__(self, *_):
         if self.прежний is None:
