@@ -276,7 +276,7 @@ def build_body(root: Path, scope: str | None, prompt: str) -> tuple[str, tuple[s
                 index, hot_contract, decision, revision, include_hot=True)
         decision, ranked = mc._personal_route(personal_root, prompt, entries)
         return mc._nonproject_context(
-            personal_root, index, entries, hot_contract, decision, prompt, revision,
+            personal_root, entries, hot_contract, decision, prompt, revision,
             include_hot=True, ranked=ranked,
         )
     spec = mc.TOPICS[scope]
@@ -297,19 +297,25 @@ def build_body(root: Path, scope: str | None, prompt: str) -> tuple[str, tuple[s
     )
 
 
-def banner_for(scope: str | None) -> str:
+def banner_for(scope: str | None, index: Path | None = None) -> str:
     """Шапка обязана говорить правду про ЭТОТ вызов.
 
     Прежняя редакция писала «Сессия закреплена», хотя команда не создаёт
     никакой защёлки и следующий вызов волен выбрать другую область. Это была
     настоящая дивергенция с хуком, спрятанная за формулировкой.
+
+    Личная шапка называет индекс (`index`): путь к нему у хука даёт
+    SessionStart, а команду зовут как раз без хука (Codex без одобрения,
+    редактор), и пути memory/<имя> в теле иначе не от чего считать. В шапке,
+    а не в теле: тело побайтово равно хуку.
     """
     if scope is None:
         return ("Область этого вызова не определена: каталог вне настроенных корней, "
                 "отдан только глобальный контракт. Сессию не закрепляет.")
     if scope == PERSONAL:
         return ("Область этого вызова: личная, отдаются глобальные правила, инбокс "
-                "и подходящие записи. Сессию не закрепляет.")
+                "и подходящие записи. Сессию не закрепляет."
+                + (f" Источник: {index}." if index is not None else ""))
     return f"Область этого вызова: {mc.TOPICS[scope].label}. Сессию не закрепляет."
 
 
@@ -330,7 +336,8 @@ def recall(
     state_dir = state_dir or mc.default_state_dir()
     body, _ = _read_consistently(root, state_dir, lambda: build_body(root, итог, prompt))
 
-    banner = banner_for(итог)
+    _, personal_root = mc.index_roots(root)
+    banner = banner_for(итог, personal_root / "memory" / "MEMORY.md" if personal_root else None)
     # Тело собрано под тот же бюджет, что у хука, а шапка живёт сверх него.
     # Обрезка ниже сторожит только жёсткий потолок.
     room = mc.HARD_CONTEXT_LIMIT - len(banner) - 2
@@ -487,34 +494,37 @@ def explain(
 
 
 def search_text(prompt: str, *, root: Path | None = None, limit: int = 10,
-                cwd: str | os.PathLike[str] | None = None) -> str:
-    """Второй проход: полнотекстовый поиск по всей личной области, включая
+                cwd: str | os.PathLike[str] | None = None, scope: str | None = None) -> str:
+    """Второй проход: полнотекстовый поиск по всем записям области, включая
     свёрнутые записи и архив.
 
     Ранжирует тот же BM25, что даёт второе место в выдаче. Замер 10.09.2026 на
     независимых вопросах: нужный файл попадает в первую пятёрку в 65 случаях из
-    75, а греп по основам кладёт его туда в 38. Граница та же, что у `index`:
-    только личная область и только из личного каталога.
+    75, а греп по основам кладёт его туда в 38. Граница та же, что у `recall`:
+    область каталога или `--scope` не шире его потолка. У заказчика это
+    единственный путь к записям помимо сводки: её разделы выбираются по
+    терминам и режутся бюджетом (случай 24.09.2026).
     """
     root = (root or mc.default_root()).expanduser().resolve()
-    потолок = ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots())
-    if потолок != PERSONAL:
-        raise RecallError(
-            "поиск по корпусу отдаётся только из личного каталога; память заказчика "
-            "спрашивают командой memory recall --scope <имя>")
-    _, personal = mc.index_roots(root)
-    if personal is None:
-        raise RecallError(f"{root}: нет личного репозитория personal/memory")
-    документы, состояние = mc.corpus_documents(personal)
+    итог = resolve_scope(scope, ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots()))
+    if итог is None:
+        raise RecallError("поиск по корпусу отдаётся только из каталога личной или клиентской области")
+    владелец = "personal" if итог == PERSONAL else mc.TOPICS[итог].owner
+    федерация = mc.reader_federation(root)
+    корень = федерация.identities[владелец].worktree_root if владелец in федерация.available else None
+    if корень is None or not (корень / "memory" / "MEMORY.md").is_file():
+        raise RecallError(f"{root}: нет репозитория области {итог} с memory/MEMORY.md")
+    шапка = f"[Поиск по памяти: {итог}]"
+    документы, состояние = mc.corpus_documents(корень)
     заголовки = {имя: title for имя, title, _ in документы}
-    ranked = mc.bm25_over(personal, prompt, документы)[:max(1, limit)]
+    ranked = mc.bm25_over(корень, prompt, документы)[:max(1, limit)]
     if not ranked:
-        return "[Поиск по личной памяти]\nСовпадений нет: попробуй другие слова или формы."
-    части = ["[Поиск по личной памяти]",
+        return f"{шапка}\nСовпадений нет: попробуй другие слова или формы."
+    части = [шапка,
              "Это указатели, а не выдача: файл надо прочитать. Находка вне индекса "
              "бывает устаревшей, проверь дату и пометку о замещении."]
     for имя, счёт in ranked:
-        части.append(f"- {состояние.get(имя, 'запись')}: memory/{имя} — "
+        части.append(f"- {состояние.get(имя, 'запись')}: {корень / 'memory' / имя}: "
                      f"{заголовки.get(имя) or 'без заголовка'}")
     return "\n".join(части)
 
@@ -523,7 +533,7 @@ def score_breakdown(prompt: str, entry, *, root: Path, today=None) -> dict:
     """Разбивка счёта первого места по словам: та же арифметика, что у
     `memorycontext._entry_score`, но с именами слов. Считается отдельно и
     сверяется с настоящим счётом, чтобы объяснение не разошлось с отбором."""
-    prompt_tokens = mc._tokens(prompt, mc.SCORE_STOP_TOKENS)
+    prompt_tokens = mc.score_words(prompt)
     label_tokens = mc._tokens(entry.label, mc.SCORE_STOP_TOKENS)
     summary_tokens = mc._tokens(entry.summary, mc.SCORE_STOP_TOKENS)
     def совпавшие(pool):
@@ -574,11 +584,18 @@ def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
     все_слова = [t for t in mc.TOKEN_RE.findall(prompt.casefold().replace("ё", "е"))]
     слова = mc._tokens(prompt, mc.SCORE_STOP_TOKENS)
     выброшены = [t for t in dict.fromkeys(все_слова) if t not in слова]
+    # Формы с общим ключом совпадения считаются по первой; без этой строки
+    # они не попадали ни в слова вопроса, ни в отброшенные.
+    считаются = mc.score_words(prompt)
+    первая = {mc._match_key(t): t for t in считаются}
+    склеены = [f"{t} → {первая[mc._match_key(t)]}" for t in dict.fromkeys(слова)
+               if t not in считаются]
     части = ["[Почему так выбрано]",
-             f"слова вопроса для первого места: {', '.join(слова) or 'нет'}"
+             f"слова вопроса для первого места: {', '.join(считаются) or 'нет'}"
+             + (f"; склеены с первой формой: {', '.join(склеены)}" if склеены else "")
              + (f"; отброшены (стоп-слова и короткие): {', '.join(выброшены)}" if выброшены else ""),
              f"порог первого места {mc.SELECT_THRESHOLD}: слово заголовка 4, слово index 1, "
-             "совпадение по первым пяти буквам"]
+             "совпадение по первым пяти буквам, формы одного слова считаются раз"]
     разбор = sorted((score_breakdown(prompt, e, root=personal, today=сегодня) for e in видимые),
                     key=lambda d: (-d["score"], d["slug"]))
     части.append("первое место, верхние кандидаты:")
@@ -594,7 +611,9 @@ def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
     if not any(d["score"] > 0 for d in разбор):
         части.append("- ни одна запись не набрала ни балла")
     bm25 = mc.bm25_ranking(personal, prompt, видимые)[:3]
-    части.append(f"второе место, BM25 по телам (порог {mc.BM25_THRESHOLD:g}):")
+    части.append(f"второе место, BM25 по телам (порог {mc.bm25_threshold(prompt):g}, разных "
+                 f"ключей вопроса {mc.bm25_key_count(prompt)}: базовый {mc.BM25_THRESHOLD:g} "
+                 f"до {mc.BM25_LENGTH_NORM} ключей, дальше растёт пропорционально):")
     for slug, счёт in bm25:
         части.append(f"- {счёт:5.1f} memory/{slug}")
     if not bm25:
@@ -650,8 +669,9 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("explain", help="объяснить видимость записи по slug")
     e.add_argument("slug", help="slug записи, с .md или без")
     e.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
-    s_ = sub.add_parser("search", help="полнотекстовый поиск по личной памяти")
+    s_ = sub.add_parser("search", help="полнотекстовый поиск по записям области: личной или --scope <клиент>")
     s_.add_argument("question", nargs="?", help="вопрос; '-' или пропуск читает stdin")
+    s_.add_argument("--scope", default=None, help="область поиска, не шире потолка каталога")
     s_.add_argument("--limit", type=int, default=10, help="сколько записей показать")
     s_.add_argument("--root", type=Path, default=None, help="корень репозитория памяти")
     w = sub.add_parser("why", help="почему по вопросу выбраны эти записи: разбивка счёта по словам")
@@ -735,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
                                 limit=args.limit, cwd=os.getcwd())
             elif args.command == "search":
                 text = search_text(_read_prompt(args.question), root=args.root,
-                                   limit=args.limit, cwd=os.getcwd())
+                                   limit=args.limit, cwd=os.getcwd(), scope=args.scope)
             elif args.command == "recall":
                 prompt = _read_prompt(args.question)
                 # Физический каталог процесса, а не логический $PWD: под

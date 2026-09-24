@@ -160,7 +160,7 @@ def delivered_text(root: Path, prompt: str, записи, отобрано) -> s
     источник = "user-catalog" if mc._has_trigger(prompt, mc.USER_CATALOG_TRIGGERS) else "personal"
     решение = mc.RouteDecision(None, источник)
     текст, _ = mc._nonproject_context(
-        root, root / "memory" / "MEMORY.md", записи, "", решение, prompt, "",
+        root, записи, "", решение, prompt, "",
         include_hot=False, ranked=tuple(отобрано))
     return текст
 

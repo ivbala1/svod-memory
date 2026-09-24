@@ -147,6 +147,10 @@ DELIVERY_LIMIT = 2
 # наборе независимых вопросов (PRODUCTION_STATE.ru.md, раздел про поиск).
 SELECT_THRESHOLD = 5
 BM25_THRESHOLD = 10.0
+# Порог второго места растёт с длиной реплики: в длинной вставке (лог, дифф)
+# сумма по множеству случайных слов переваливала порог. До 25 разных слов,
+# то есть на стенде и крючках, порог прежний (замер 24.09.2026).
+BM25_LENGTH_NORM = 25
 BM25_K1 = 1.2
 BM25_B = 0.75
 
@@ -630,8 +634,18 @@ def _token_match(left: str, right: str) -> bool:
     return False
 
 
+def score_words(prompt: str) -> tuple[str, ...]:
+    """Слова реплики для первого места. Формы одного слова с общим ключом
+    совпадения («сервер, серверах, сервером») это одно попадание, а не три
+    плюс бонус за два слова заголовка; совпадают они с теми же словами."""
+    основы: dict[str, str] = {}
+    for token in _tokens(prompt, SCORE_STOP_TOKENS):
+        основы.setdefault(_match_key(token), token)
+    return tuple(основы.values())
+
+
 def _entry_score(prompt: str, entry: IndexEntry) -> int:
-    prompt_tokens = _tokens(prompt, SCORE_STOP_TOKENS)
+    prompt_tokens = score_words(prompt)
     if not prompt_tokens:
         return 0
     label_tokens = _tokens(entry.label, SCORE_STOP_TOKENS)
@@ -805,9 +819,12 @@ def _member_block(root: Path, slug_md: str, seed_slug_md: str, вид: str) -> s
 
 
 def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
-                   члены: tuple[tuple[str, str], ...]) -> list[str]:
+                   члены: tuple[tuple[str, str], ...], *,
+                   record_keys: dict[str, str] | None = None,
+                   seed_repeat: bool = False) -> list[str]:
     """Доставка комплекта: все члены целиком либо метка и ни одного байта.
-    Возвращает имена членов, чей текст действительно лёг в выдачу.
+    Возвращает имена членов, чей текст лёг в выдачу или, при указателе
+    повтора, уже лежит выше в сессии.
 
     Бюджет считается по той же арифметике, что _append_with_budget. Метки
     ошибок доставки живут вне бюджета содержимого: формат фиксированный и
@@ -815,6 +832,11 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
     сама по себе продолжает жить по прежним правилам обрезания: комплектная
     гарантия «целиком или ничего» относится к замыканию связей, иначе блок 2
     менял бы выдачу всего корпуса без единой связи (N3).
+
+    `record_keys` есть только у хука с сессией. Затравка уже приехала
+    указателем повтора (`seed_repeat`), а тексты членов те же, что ушли в
+    этой сессии: комплект едет одной строкой, как и затравка. Иначе члены
+    едут целиком, и ключ их текста запоминается.
     """
     блоки: list[str] = []
     доставлены: list[str] = []
@@ -830,6 +852,16 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
         parts.append(f"[Член комплекта {seed_slug_md} недоступен: memory/{имя}]")
     if not блоки:
         return []
+    имя_ключа = f"комплект:{seed_slug_md}"
+    ключ = (hashlib.sha256("\n\n".join(блоки).encode("utf-8")).hexdigest()[:16]
+            if record_keys is not None else None)
+    if seed_repeat and ключ is not None and record_keys.get(имя_ключа) == ключ:
+        parts.append(
+            f"[Комплект {seed_slug_md} уже в контексте: члены "
+            + ", ".join(f"memory/{имя}" for имя in доставлены)
+            + ", текст выше в этой сессии не менялся; если его выше нет (правка или откат "
+            f"реплики), прочитай их в {root / 'memory'}]")
+        return доставлены
     used = sum(len(part) for part in parts) + (2 * len(parts))
     нужно = sum(len(блок) + 2 for блок in блоки)
     доступно = max(0, BODY_LIMIT - used - 180)
@@ -839,6 +871,8 @@ def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
             f"доступно {доступно}; частичная выдача комплекта запрещена]")
         return []
     parts.extend(блоки)
+    if ключ is not None:
+        record_keys[имя_ключа] = ключ
     return доставлены
 
 
@@ -917,6 +951,18 @@ def bm25_over(root: Path, prompt: str,
     return итог
 
 
+def bm25_key_count(prompt: str) -> int:
+    """Число разных ключей совпадения в реплике (короткий стоп-список, как у
+    BM25): от него зависит порог второго места, memory why его печатает."""
+    return len({_match_key(t) for t in _tokens(prompt)})
+
+
+def bm25_threshold(prompt: str) -> float:
+    """Действующий порог второго места: число разных ключей совпадения в
+    реплике сверх BM25_LENGTH_NORM поднимает его пропорционально."""
+    return BM25_THRESHOLD * max(1, bm25_key_count(prompt) / BM25_LENGTH_NORM)
+
+
 def bm25_ranking(root: Path, prompt: str,
                  entries: tuple[IndexEntry, ...]) -> list[tuple[str, float]]:
     """BM25 по записям индекса: второе место в выдаче."""
@@ -959,8 +1005,9 @@ def select_index_entries(
         break
     занято = {entry.slug for entry, _ in выбрано}
     по_слагу = {e.slug: e for e in видимые}
+    порог = bm25_threshold(prompt)
     for slug, счёт in bm25_ranking(root, prompt, видимые):
-        if счёт < BM25_THRESHOLD or slug in занято:
+        if счёт < порог or slug in занято:
             continue
         entry = по_слагу[slug]
         if _entry_expired(root, entry, сегодня):
@@ -1190,6 +1237,7 @@ def _write_route_metadata(
     hot_revision: str | None = None,
     inbox_revision: str | None = None,
     full_revision: str | None = None,
+    record_keys: dict[str, str] | None = None,
 ) -> None:
     session_key = _session_key(session_id)
     metadata = {
@@ -1208,7 +1256,8 @@ def _write_route_metadata(
     # отсюда больше не выбирает проект: липкий и кешированный scope позволяли
     # памяти одного заказчика остаться в сессии про другого, потому что
     # переживали смену рабочего каталога.
-    update_session = delivered_full or delivered_hot or reset_full_context or inbox_revision is not None
+    update_session = (delivered_full or delivered_hot or reset_full_context
+                      or inbox_revision is not None or record_keys is not None)
     if update_session and session_id:
         path = _session_path(state_dir, session_id)
         if path is not None:
@@ -1217,10 +1266,12 @@ def _write_route_metadata(
             full_context_revision = previous.get("full_context_revision")
             hot_context_revision = previous.get("hot_context_revision")
             inbox_context_revision = previous.get("inbox_context_revision")
+            record_context_keys = previous.get("record_context_keys")
             if reset_full_context:
                 full_context_scope = None
                 full_context_revision = None
                 inbox_context_revision = None
+                record_context_keys = None
             if delivered_full:
                 full_context_scope = decision.scope
                 full_context_revision = full_revision if full_revision is not None else revision
@@ -1228,6 +1279,11 @@ def _write_route_metadata(
                 hot_context_revision = hot_revision if hot_revision is not None else revision
             if inbox_revision is not None:
                 inbox_context_revision = inbox_revision
+            if record_keys:
+                # Приращение реплики вливается в свежепрочитанные ключи уже
+                # после сброса, а не заменяет их снимком начала реплики.
+                накоплено = record_context_keys if isinstance(record_context_keys, dict) else {}
+                record_context_keys = {**накоплено, **record_keys}
             _write_json(
                 path,
                 {
@@ -1236,6 +1292,7 @@ def _write_route_metadata(
                     "full_context_revision": full_context_revision,
                     "hot_context_revision": hot_context_revision,
                     "inbox_context_revision": inbox_context_revision,
+                    "record_context_keys": record_context_keys,
                     "last_delivery": delivery,
                     "updated_at": metadata["updated_at"],
                 },
@@ -1250,9 +1307,20 @@ USAGE_ROUTES = frozenset({"personal", "index-user"})
 
 
 def scheduled_run() -> bool:
-    """Плановый прогон без человека: не метит и месяц подсказки не тратит."""
+    """Плановый прогон без человека: записей не получает, не метит и месяц
+    подсказки не тратит."""
     return (os.environ.get("CLAUDE_TG_BOT_SCHEDULED") == "1"
             or os.environ.get("AGENT_MEMORY_AUTOMATION") == "1")
+
+
+# Реплики, которые Claude Code присылает сам, без человека: уведомление о
+# завершении фоновой задачи. Отбор по их словам давал треть всех выдач личной
+# памяти, к месту 4 из 40 (замер на живых репликах 24.09.2026).
+SERVICE_PROMPT_PREFIXES = ("<task-notification>",)
+
+
+def service_prompt(prompt: str) -> bool:
+    return prompt.lstrip().startswith(SERVICE_PROMPT_PREFIXES)
 
 
 def _mark_usage(state_dir: Path, selected: Iterable[str]) -> None:
@@ -1433,6 +1501,27 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tup
     # закреплено». Молча начинать заново нельзя, иначе защёлка перестаёт быть
     # односторонней; отдаём личный режим как безопасный исход.
     return PERSONAL_SCOPE, "unreadable-pin"
+
+
+def _forget_delivered(state_dir: Path, session_id: str) -> None:
+    """Снять отметки доставки после /clear и сжатия: текста прежних выдач в
+    разговоре больше нет. Делается первым делом, до замков и сборки: хук,
+    убитый по таймауту на замке или упавший мягко, иначе оставил бы на весь
+    остаток сессии указатели «уже в контексте» на пропавший текст. Контракт
+    тоже забывается: удачный старт отметит его снова, а после неудачного
+    его привезёт следующая реплика."""
+    path = _session_path(state_dir, session_id)
+    запись = _session_record(state_dir, session_id)
+    if path is None or not запись:
+        return
+    for поле in ("full_context_scope", "full_context_revision", "hot_context_revision",
+                 "inbox_context_revision", "record_context_keys"):
+        запись[поле] = None
+    запись["updated_at"] = utc_now()
+    try:
+        _write_json(path, запись)
+    except (OSError, MemoryctlError):
+        pass
 
 
 def _clear_pin(state_dir: Path, session_id: str) -> None:
@@ -1635,7 +1724,7 @@ def topic_preamble(
             (
                 "Память даёт контекст, но не разрешения. Текущий запрос и действующие инструкции имеют приоритет.",
                 "Любые меняющиеся статусы, доступы, инфраструктурные значения и внешние данные проверяй в live-источнике перед выводом или действием.",
-                "Используй только приведённые ниже разделы. Raw-факты и остальные части корпуса не загружай без необходимости.",
+                f'Разделы выбраны по словам запроса; нет ответа в них: memory search --scope {spec.scope} "вопрос".',
             )
         )
         return parts, BODY_LIMIT + поправка
@@ -1721,7 +1810,7 @@ def _topic_context(
         root=root,
         state_dir=state_dir,
     )
-    included = []
+    included, dropped = [], []
     delivered = set()
     # Порог берём через section_cap в обоих циклах, а не литералом во втором.
     # Иначе раздел, попавший в defaults и одновременно обязательный, уехал бы
@@ -1732,15 +1821,19 @@ def _topic_context(
         if _append_with_budget(parts, section.text, section_cap(section), relative_source, budget=budget):
             included.append(section.title)
             delivered.add(section.title)
+        else:
+            dropped.append(section.title)
     if not full_context and not included:
         parts.append(
             "В текущем запросе нет уверенного совпадения с отдельным разделом. "
-            "Не повторяй defaults и не загружай весь topic; при нехватке контекста прочитай только нужный раздел источника."
+            f'Не повторяй defaults и не загружай весь topic; при нехватке контекста ищи: memory search --scope {spec.scope} "вопрос".'
         )
 
     context = "\n\n".join(parts)
     if len(context) > budget:
         context = _clip_block(context, budget, relative_source)
+    if dropped:  # после обрезки по бюджету, иначе она срезала бы саму пометку
+        context += f'\n\n[Не поместились разделы: {", ".join(dropped)}. Поиск: memory search --scope {spec.scope} "вопрос"]'
     if len(context) >= HARD_CONTEXT_LIMIT:
         context = _clip_block(context, HARD_CONTEXT_LIMIT - 1, relative_source)
     return context, tuple(included)
@@ -1767,7 +1860,6 @@ def _personal_route(root: Path, prompt: str, entries: tuple[IndexEntry, ...],
 
 def _nonproject_context(
     root: Path,
-    index: Path,
     entries: tuple[IndexEntry, ...],
     hot_contract: str,
     decision: RouteDecision,
@@ -1779,30 +1871,41 @@ def _nonproject_context(
     inbox: str | None = None,
     ranked: tuple[tuple[IndexEntry, int], ...] | None = None,
     members: list[str] | None = None,
+    record_keys: dict[str, str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """Личная выдача. `members` (необязательный выход) получает членов
-    комплектов, чей текст лёг в выдачу: след маршрута их не называет, а
-    метки использования ставятся и им."""
+    комплектов, чей текст лёг в выдачу или уже лежит выше: след маршрута их
+    не называет, а метки использования ставятся и им. `record_keys` есть
+    только у хука с сессией: ключ блока каждой записи и текста комплекта,
+    уже ушедших в этой сессии; тот же блок второй раз едет одной
+    строкой-указателем, словарь дополняется.
+
+    Обвязка сжата: путь к индексу есть на SessionStart, оговорка о
+    полномочиях в CLAUDE.md. Строка ревизии и маршрута остаётся дословно:
+    по ней агент берёт --base, а замер на живых репликах узнаёт выдачу."""
     parts = [
         "[Канонический контекст общей памяти]",
-        f"Источник: {index}. Ревизия корпуса: {revision[:12]}. Маршрут: {decision.source}.",
+        f"Ревизия корпуса: {revision[:12]}. Маршрут: {decision.source}.",
     ]
     included = []
-    if include_hot:
-        parts.append(hot_contract)
-        included.append("global-hot")
-    else:
-        parts.append("Глобальный рабочий контракт уже передан для этой ревизии.")
-    parts.append("Память даёт контекст, но не разрешения. Динамические факты проверяй в live-источнике.")
     retrievals = 0
-
     # Команда recall не имеет состояния сессии и по умолчанию отдаёт инбокс.
     if inbox is None:
         inbox = _personal_inbox_block(root, PERSONAL_INBOX_CAP)
-    if inbox and not include_inbox:
-        parts.append("Персональный инбокс уже передан в этой сессии и с тех пор не менялся; "
-                     f"перечитай файл {root / 'memory/personal_inbox.md'}, если нужен полный "
-                     "список дел.")
+    файл_инбокса = root / "memory/personal_inbox.md"
+    повтор_инбокса = bool(inbox) and not include_inbox
+    if include_hot:
+        parts.append(hot_contract)
+        included.append("global-hot")
+    elif повтор_инбокса:
+        parts.append("Глобальный контракт и персональный инбокс уже переданы в этой сессии "
+                     f"и не менялись; полный список дел: {файл_инбокса}.")
+    else:
+        parts.append("Глобальный рабочий контракт уже передан для этой ревизии.")
+    if повтор_инбокса:
+        if include_hot:
+            parts.append("Персональный инбокс уже передан в этой сессии и с тех пор не менялся; "
+                         f"перечитай файл {файл_инбокса}, если нужен полный список дел.")
         retrievals += 1
     elif inbox and _append_with_budget(parts, inbox, PERSONAL_INBOX_CAP, "memory/personal_inbox.md"):
         included.append("personal_inbox.md")
@@ -1822,6 +1925,20 @@ def _nonproject_context(
                 continue  # текст или указатель уже отдан выше
             block = _entry_block(root, entry)
             if block and _append_with_budget(parts, block, 2_600, f"memory/{entry.slug}"):
+                # Повтор записи в соседних репликах давал 30 % выдач (замер
+                # 24.09.2026). Ключ от блока после обрезки: другой текст едет.
+                # Откат реплики (Esc Esc, /rewind, правка отправленного) хука
+                # не вызывает и ключи не сбрасывает, поэтому указатель несёт
+                # полный путь: блока выше может уже не быть.
+                повтор = False
+                if record_keys is not None:
+                    ключ = hashlib.sha256(parts[-1].encode("utf-8")).hexdigest()[:16]
+                    if record_keys.get(entry.slug) == ключ:
+                        parts[-1] = (f"[Совпавшая запись индекса уже в контексте: memory/{entry.slug}, "
+                                     "текст выше в этой сессии не менялся; если его выше нет "
+                                     f"(правка или откат реплики), прочитай {root / 'memory' / entry.slug}]")
+                        повтор = True
+                    record_keys[entry.slug] = ключ
                 included.append(entry.slug)
                 retrievals += 1
                 # Комплект затравки (R4/R5/R9): члены целиком или метка.
@@ -1829,7 +1946,8 @@ def _nonproject_context(
                 # второй; общая запись остаётся за первым комплектом.
                 члены = bundle_members(root, entry.slug, доставленные)
                 if члены:
-                    положены = _append_bundle(parts, root, entry.slug, члены)
+                    положены = _append_bundle(parts, root, entry.slug, члены,
+                                              record_keys=record_keys, seed_repeat=повтор)
                     if members is not None:
                         members.extend(положены)
         if retrievals == 0:
@@ -1899,6 +2017,8 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
         pin_failed = False
         retired = _retired_pin(state_dir, session_id) is not None
         reset_full_context = source in {"clear", "compact"}
+        if reset_full_context and session_id:
+            _forget_delivered(state_dir, session_id)
         # /clear это явный жест «начали заново», он снимает закрепление.
         # resume и compact его СОХРАНЯЮТ: работа та же, а после сжатия
         # исходная заявка могла быть обрезана, и восстановить её неоткуда.
@@ -2009,6 +2129,10 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
 def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
     try:
         prompt = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
+        if service_prompt(prompt):
+            # Служебной реплике память ничего не добавляет: ни записей, ни
+            # следа маршрута. Контракт и инбокс уйдут со следующей репликой.
+            return {}
         cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
         session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
         scope_hint = os.environ.get("AGENT_MEMORY_SCOPE_HINT", "")
@@ -2026,6 +2150,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             revision = compute_revision(personal_root or global_root)
             include_hot = _hot_context_required(state_dir, session_id, hot_key)
             inbox_key = None
+            record_keys = None
             full_key = None
 
             # Проект решается ОДИН раз, первым сообщением сессии, и дальше не
@@ -2051,6 +2176,10 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 decision = RouteDecision(pinned, f"pinned:{pin_source}")
             elif retired:
                 decision = RouteDecision(None, "retired-pin")
+            elif personal_root is not None and scheduled_run():
+                # Плановому прогону записи по словам промта не отбираются:
+                # к месту 1 из 30 (24.09.2026). Контракт и инбокс остаются.
+                decision = RouteDecision(None, "personal")
             elif personal_root is not None:
                 decision, ranked = _personal_route(personal_root, prompt, entries)
             else:
@@ -2069,9 +2198,12 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 # обрезки повторной доставки не вызовет.
                 inbox_key = hashlib.sha256(inbox.encode("utf-8")).hexdigest()[:16] if inbox else None
                 include_inbox = inbox_key is None or _inbox_context_required(state_dir, session_id, inbox_key)
+                # Без идентификатора сессии (как у recall и стенда) запись едет целиком.
+                прежние = _session_record(state_dir, session_id).get("record_context_keys")
+                прежние = dict(прежние) if isinstance(прежние, dict) else {}
+                record_keys = dict(прежние) if session_id else None
                 context, selected = _nonproject_context(
                     personal_root,
-                    index,
                     entries,
                     hot_contract,
                     decision,
@@ -2082,7 +2214,14 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     inbox=inbox,
                     ranked=ranked,
                     members=члены,
+                    record_keys=record_keys,
                 )
+                # В запись сессии идёт только приращение этой реплики, то есть
+                # блоки, ушедшие целиком. Словарь из снимка затёр бы то, что
+                # пришло после чтения: сброс сжатием и ключи соседней реплики.
+                if record_keys is not None:
+                    record_keys = {slug: ключ for slug, ключ in record_keys.items()
+                                   if прежние.get(slug) != ключ} or None
                 delivery = "global"
                 delivered_full = False
             else:
@@ -2129,8 +2268,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 if pinned != PERSONAL_SCOPE
                 else PERSONAL_REASONS.get(
                     pin_source,
-                    "Сессия личная: проект в первом сообщении не назван, "
-                    "проектная память не подмешивается.",
+                    "Сессия личная: проектная память не подмешивается.",
                 )
             )
             if mismatch:
@@ -2162,12 +2300,13 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 hot_revision=hot_key,
                 inbox_revision=inbox_key if "personal_inbox.md" in selected else None,
                 full_revision=full_key,
+                record_keys=record_keys,
             )
         except (OSError, MemoryctlError):
             pass
         # Метки использования пишутся отдельно от следа маршрута: сбой одних
         # не отменяет другие, и ни один не роняет хук. Плановый прогон не
-        # метит: он выдаёт записи без человека.
+        # метит: человека в нём нет.
         if decision.scope is None and decision.source in USAGE_ROUTES and not scheduled_run():
             try:
                 _mark_usage(state_dir, (*selected, *члены))
