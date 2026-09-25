@@ -85,11 +85,19 @@ PERSONAL_REASONS = {
         "⚠️ Проект этой сессии снят с конфигурации памяти (заказчик в архиве). "
         "Отдаётся только глобальный контракт: ни проектная, ни личная память "
         "не подмешиваются. Нужна новая сессия.",
+    "forked":
+        "Ответвление разговора: отдаётся только глобальный контракт, ни личная, "
+        "ни проектная память не подмешиваются. Для памяти нужна новая сессия.",
     "resumed-without-pin":
         "Сессия личная: возобновлена без действующего закрепления, поэтому "
         "проект здесь уже не задать. Нужен проект - начни новую сессию.",
     "no-session-id":
         "Сессия личная: нет идентификатора сессии, закреплять негде.",
+}
+# Закрепления, которым положен только контракт, и пометка в выдаче.
+CONTRACT_ONLY_NOTES = {
+    "retired-pin": "Проект сессии снят с конфигурации: инбокс и записи не отдаются, только контракт.",
+    "forked": "Ответвление разговора: инбокс и записи не отдаются, только контракт.",
 }
 SESSION_EVENT = "SessionStart"
 PROMPT_EVENT = "UserPromptSubmit"
@@ -1187,33 +1195,6 @@ def _session_record(state_dir: Path, session_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _full_context_required(
-    state_dir: Path,
-    session_id: str,
-    scope: str,
-    revision: str,
-) -> bool:
-    if not session_id:
-        return True
-    record = _session_record(state_dir, session_id)
-    return not (
-        record.get("full_context_scope") == scope
-        and record.get("full_context_revision") == revision
-    )
-
-
-def _hot_context_required(state_dir: Path, session_id: str, revision: str) -> bool:
-    if not session_id:
-        return True
-    return _session_record(state_dir, session_id).get("hot_context_revision") != revision
-
-
-def _inbox_context_required(state_dir: Path, session_id: str, revision: str) -> bool:
-    if not session_id:
-        return True
-    return _session_record(state_dir, session_id).get("inbox_context_revision") != revision
-
-
 def _write_json(path: Path, data: dict) -> None:
     atomic_write(
         path,
@@ -1388,8 +1369,6 @@ def _read_pin_record(state_dir: Path, session_id: str) -> dict:
 
 def _pinned_scope(state_dir: Path, session_id: str) -> str | None:
     """Проект, закреплённый за сессией. None значит ещё не закреплён."""
-    if not session_id:
-        return None
     scope = _read_pin_record(state_dir, session_id).get("scope")
     return scope if scope == PERSONAL_SCOPE or scope in TOPICS else None
 
@@ -1397,8 +1376,6 @@ def _pinned_scope(state_dir: Path, session_id: str) -> str | None:
 def _retired_pin(state_dir: Path, session_id: str) -> str | None:
     """Закрепление цело, но его проект снят с конфигурации. Это не поломка
     состояния: сессия была клиентской, и личная память ей не положена."""
-    if not session_id:
-        return None
     scope = _read_pin_record(state_dir, session_id).get("scope")
     if isinstance(scope, str) and scope and scope != PERSONAL_SCOPE and scope not in TOPICS:
         return scope
@@ -1407,6 +1384,12 @@ def _retired_pin(state_dir: Path, session_id: str) -> str | None:
 
 def _pin_source(state_dir: Path, session_id: str) -> str:
     return _read_pin_record(state_dir, session_id).get("source", "pinned")
+
+
+def _forked_pin(state_dir: Path, session_id: str) -> bool:
+    """Сессия ответвлена от другого разговора: до конца только контракт."""
+    record = _read_pin_record(state_dir, session_id)
+    return record.get("scope") == PERSONAL_SCOPE and record.get("source") == "forked"
 
 
 def resolve_pin(prompt: str, scope_hint: str = "") -> tuple[str, str]:
@@ -1458,7 +1441,8 @@ def _sweep_pin_temps(directory: Path, max_age_sec: float = 3600.0) -> None:
             continue
 
 
-def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tuple[str, str]:
+def _write_pin(state_dir: Path, session_id: str, scope: str, source: str,
+               *, replace: bool = False) -> tuple[str, str]:
     """Односторонняя защёлка: публикуется целое значение, а не пустое имя.
 
     Первая версия брала O_EXCL прямо на итоговом файле и писала JSON уже
@@ -1473,6 +1457,9 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tup
     (svodgit.create_file): связывание либо происходит с уже готовым
     содержимым, либо не происходит вовсе. Проигравший читает заведомо
     полную запись.
+
+    replace заменяет прежнюю запись атомарно: так ответвление разговора
+    сужает любое закрепление до контракта.
     """
     path = _pin_path(state_dir, session_id)
     if path is None:
@@ -1483,7 +1470,10 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tup
     ).encode("utf-8")
     _sweep_pin_temps(path.parent)
     try:
-        svodgit.create_file(path, payload)
+        if replace:
+            svodgit.replace_file(path, payload)
+        else:
+            svodgit.create_file(path, payload)
     except OSError:
         # Ни при каких обстоятельствах не возвращать собственный проект:
         # два процесса при сбое файловой системы получили бы РАЗНЫЕ роллапы,
@@ -1504,12 +1494,12 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str) -> tup
 
 
 def _forget_delivered(state_dir: Path, session_id: str) -> None:
-    """Снять отметки доставки после /clear и сжатия: текста прежних выдач в
-    разговоре больше нет. Делается первым делом, до замков и сборки: хук,
-    убитый по таймауту на замке или упавший мягко, иначе оставил бы на весь
-    остаток сессии указатели «уже в контексте» на пропавший текст. Контракт
-    тоже забывается: удачный старт отметит его снова, а после неудачного
-    его привезёт следующая реплика."""
+    """Снять отметки доставки после /clear, сжатия и отката в Codex: текста
+    прежних выдач в разговоре может не быть. Делается первым делом, до
+    замков и сборки: хук, убитый по таймауту на замке или упавший мягко,
+    иначе оставил бы указатели «уже в контексте» на пропавший текст.
+    Контракт тоже забывается: удачный старт отметит его снова, а после
+    неудачного его привезёт следующая реплика."""
     path = _session_path(state_dir, session_id)
     запись = _session_record(state_dir, session_id)
     if path is None or not запись:
@@ -1927,7 +1917,7 @@ def _nonproject_context(
             if block and _append_with_budget(parts, block, 2_600, f"memory/{entry.slug}"):
                 # Повтор записи в соседних репликах давал 30 % выдач (замер
                 # 24.09.2026). Ключ от блока после обрезки: другой текст едет.
-                # Откат реплики (Esc Esc, /rewind, правка отправленного) хука
+                # Откат реплики у Claude Code (Esc Esc, /rewind, правка) хука
                 # не вызывает и ключи не сбрасывает, поэтому указатель несёт
                 # полный путь: блока выше может уже не быть.
                 повтор = False
@@ -1972,7 +1962,8 @@ def _contract_only_context(
     include_hot: bool,
     note: str | None = None,
 ) -> tuple[str, tuple[str, ...]]:
-    """Машина без личного репозитория или сессия снятого проекта: только контракт."""
+    """Машина без личного репозитория, сессия снятого проекта или
+    ответвление разговора: только контракт."""
     parts = [
         "[Канонический контекст общей памяти]",
         f"Источник: {index}. Ревизия корпуса: {revision[:12]}. Маршрут: {decision.source}.",
@@ -2016,7 +2007,13 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
         source = source.casefold()
         pin_failed = False
         retired = _retired_pin(state_dir, session_id) is not None
-        reset_full_context = source in {"clear", "compact"}
+        # Любой resume в Codex сбрасывает отметки: откат (Esc Esc,
+        # thread/revert) приходит как resume с тем же session_id, и выданного
+        # текста в истории может уже не быть. Повторное открытие треда просто
+        # везёт выдачу ещё раз. Resume у Claude Code продолжает разговор
+        # целиком, отметки живут.
+        codex_resume = source == "resume" and os.environ.get("MEMORY_AGENT") == "codex"
+        reset_full_context = source in {"clear", "compact"} or codex_resume
         if reset_full_context and session_id:
             _forget_delivered(state_dir, session_id)
         # /clear это явный жест «начали заново», он снимает закрепление.
@@ -2024,6 +2021,16 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
         # исходная заявка могла быть обрезана, и восстановить её неоткуда.
         if source == "clear":
             _clear_pin(state_dir, session_id)
+        elif source == "fork" and session_id:
+            # Ответвление разговора (решение владельца 25.09.2026): новый
+            # session_id и копия истории родителя. Проект родителя хук не
+            # знает, а в истории может лежать память заказчика, поэтому до
+            # конца сессии только контракт. Прежнюю запись заменяем: у fork её
+            # оставляет лишь первая реплика Codex, пришедшая на пути ошибки
+            # раньше отложенного SessionStart. Сорвалась запись: pin-write-failed.
+            if not _forked_pin(state_dir, session_id):
+                _write_pin(state_dir, session_id, PERSONAL_SCOPE, "forked", replace=True)
+                pin_failed = not _forked_pin(state_dir, session_id)
         elif source in {"resume", "compact"} and session_id:
             # Сессия продолжается, а закрепления нет: значит либо она началась
             # до внедрения защёлки, либо каталог состояния потерян. Позволить
@@ -2057,7 +2064,23 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
             # закрепление сохраняется, и его надо показать заново, потому что
             # исходная заявка могла быть обрезана сжатием.
             pinned = _pinned_scope(state_dir, session_id)
-            if pinned and pinned != PERSONAL_SCOPE:
+            if pin_failed:
+                # Возобновление без защёлки или ответвление, и записать её не
+                # удалось. Молчать нельзя: после восстановления диска следующее
+                # сообщение станет для этой сессии «первым» и закрепит проект
+                # по случайному упоминанию, хотя разговор до этого мог идти про
+                # другого заказчика. Один идентификатор сессии получил бы два
+                # разных клиентских роллапа.
+                decision = RouteDecision(None, "pin-write-failed")
+                scope_note = (
+                    "⚠️ Сессию продолжать НЕЛЬЗЯ: закрепление отсутствует и не "
+                    "записывается (ошибка файловой системы). Начни новую сессию "
+                    "и проверь ~/.local/state/agent-memory."
+                )
+            elif _forked_pin(state_dir, session_id):
+                decision = RouteDecision(None, "forked")
+                scope_note = PERSONAL_REASONS["forked"]
+            elif pinned and pinned != PERSONAL_SCOPE:
                 decision = RouteDecision(pinned, "pinned")
                 scope_note = f"Сессия закреплена: {TOPICS[pinned].label}."
             elif pinned == PERSONAL_SCOPE:
@@ -2066,19 +2089,6 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
             elif retired:
                 decision = RouteDecision(None, "retired-pin")
                 scope_note = PERSONAL_REASONS["retired-pin"]
-            elif pin_failed:
-                # Возобновление без защёлки, и записать её не удалось. Молчать
-                # нельзя: после восстановления диска следующее сообщение станет
-                # для этой сессии «первым» и закрепит проект по случайному
-                # упоминанию, хотя разговор до этого мог идти про другого
-                # заказчика. Один идентификатор сессии получил бы два разных
-                # клиентских роллапа.
-                decision = RouteDecision(None, "pin-write-failed")
-                scope_note = (
-                    "⚠️ Сессию продолжать НЕЛЬЗЯ: закрепление отсутствует и не "
-                    "записывается (ошибка файловой системы). Начни новую сессию "
-                    "и проверь ~/.local/state/agent-memory."
-                )
             else:
                 decision = RouteDecision(None, "session-start")
                 scope_note = (
@@ -2086,8 +2096,8 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
                     "станет проектной, не назовёшь - останется личной."
                 )
             include_hot = (
-                source in {"startup", "clear", "compact"}
-                or _hot_context_required(state_dir, session_id, hot_key)
+                source == "startup" or reset_full_context
+                or _session_record(state_dir, session_id).get("hot_context_revision") != hot_key
             )
             header = (
                 "[Общая память агента] "
@@ -2135,6 +2145,13 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             return {}
         cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
         session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
+        # Субагент spawn_agent в Codex делит session_id с корнем, его реплика
+        # несёт agent_id. Отметки доставки описывают разговор корня: субагенту
+        # всё едет целиком, и его выдача в них не пишется, иначе корень
+        # получил бы указатель на текст, которого у него нет. Делегат /review
+        # agent_id не несёт и считается корнем.
+        agent_id = payload.get("agent_id")
+        marks_id = "" if isinstance(agent_id, str) and agent_id else session_id
         scope_hint = os.environ.get("AGENT_MEMORY_SCOPE_HINT", "")
         global_root, personal_root = index_roots(root)
         with reader_locks(reader_federation(root).available_roots):
@@ -2148,7 +2165,9 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             hot_key = contract_key(hot_contract)
             entries = parse_index(build_index(personal_root)) if personal_root else ()
             revision = compute_revision(personal_root or global_root)
-            include_hot = _hot_context_required(state_dir, session_id, hot_key)
+            # Без сессии (как у recall и стенда) отметок нет, всё едет целиком.
+            отметки = _session_record(state_dir, marks_id)
+            include_hot = отметки.get("hot_context_revision") != hot_key
             inbox_key = None
             record_keys = None
             full_key = None
@@ -2163,6 +2182,11 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 # первым. Отдаём личный режим: без опоры выбирать проект
                 # опаснее, чем не выбрать.
                 pinned, pin_source = PERSONAL_SCOPE, "no-session-id"
+            elif pinned is None and marks_id != session_id:
+                # Субагент в сессии, которую корень не закрепил (его хук упал
+                # до записи). Текст субагента пишет модель, проект он не
+                # выбирает: личный режим без записи, закрепит реплика корня.
+                pinned, pin_source = PERSONAL_SCOPE, "subagent-without-pin"
             elif pinned is None:
                 pinned, pin_source = resolve_pin(prompt, scope_hint)
                 pinned, pin_source = _write_pin(state_dir, session_id, pinned, pin_source)
@@ -2171,11 +2195,11 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
 
             ranked = ()
             члены: list[str] = []
-            retired = pin_source == "retired-pin"
+            contract_only = CONTRACT_ONLY_NOTES.get(pin_source)
             if pinned != PERSONAL_SCOPE:
                 decision = RouteDecision(pinned, f"pinned:{pin_source}")
-            elif retired:
-                decision = RouteDecision(None, "retired-pin")
+            elif contract_only:
+                decision = RouteDecision(None, pin_source)
             elif personal_root is not None and scheduled_run():
                 # Плановому прогону записи по словам промта не отбираются:
                 # к месту 1 из 30 (24.09.2026). Контракт и инбокс остаются.
@@ -2185,11 +2209,10 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             else:
                 decision = RouteDecision(None, "personal")
             mismatch = _pin_mismatch(pinned, cwd)
-            if decision.scope is None and (personal_root is None or retired):
+            if decision.scope is None and (personal_root is None or contract_only):
                 context, selected = _contract_only_context(
                     index, hot_contract, decision, revision, include_hot=include_hot,
-                    note=("Проект сессии снят с конфигурации: инбокс и записи не отдаются, "
-                          "только контракт.") if retired else None)
+                    note=contract_only)
                 delivery = "global"
                 delivered_full = False
             elif decision.scope is None:
@@ -2197,11 +2220,10 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 # Ключ ловит только правки доставляемой части: дело за границей
                 # обрезки повторной доставки не вызовет.
                 inbox_key = hashlib.sha256(inbox.encode("utf-8")).hexdigest()[:16] if inbox else None
-                include_inbox = inbox_key is None or _inbox_context_required(state_dir, session_id, inbox_key)
-                # Без идентификатора сессии (как у recall и стенда) запись едет целиком.
-                прежние = _session_record(state_dir, session_id).get("record_context_keys")
+                include_inbox = inbox_key is None or отметки.get("inbox_context_revision") != inbox_key
+                прежние = отметки.get("record_context_keys")
                 прежние = dict(прежние) if isinstance(прежние, dict) else {}
-                record_keys = dict(прежние) if session_id else None
+                record_keys = dict(прежние) if marks_id else None
                 context, selected = _nonproject_context(
                     personal_root,
                     entries,
@@ -2235,12 +2257,9 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 # Продолжение сводки контракт не везёт, а метаданные помечали
                 # его доставленным: обновлённое правило не приходило в сессию
                 # до её конца. Смена контракта это повод к полной доставке.
-                full_context = include_hot or _full_context_required(
-                    state_dir,
-                    session_id,
-                    decision.scope,
-                    full_key,
-                )
+                full_context = include_hot or (
+                    отметки.get("full_context_scope"), отметки.get("full_context_revision")
+                ) != (decision.scope, full_key)
                 context, topic_sections = _topic_context(
                     root,
                     spec,
@@ -2290,7 +2309,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             _write_route_metadata(
                 state_dir,
                 event=PROMPT_EVENT,
-                session_id=session_id,
+                session_id=marks_id,
                 decision=decision,
                 revision=revision,
                 sections=selected,
