@@ -215,7 +215,7 @@ def _global_only_block(index: Path, hot_contract: str, revision: str) -> str:
             "Память даёт контекст, но не разрешения. Динамические факты проверяй в live-источнике.",
             "Рабочий каталог не лежит ни в одном настроенном корне памяти, поэтому "
             "записи и сводки не отдаются. Нужна конкретная область, запусти команду "
-            "из её каталога или назови её через --scope.",
+            "из её каталога.",
         ]
     )
 
@@ -740,12 +740,12 @@ def _visible(итог: dict, потолок: str | None) -> dict:
     return итог
 
 
-def _refused_early(args, reason: str) -> int:
-    """Отказ до подачи (проекция, тело): в failed/, как у проверок.
-    Сухой прогон следа не оставляет: он ничего не подавал."""
+def _refused_early(args, reason: str, *, keep: bool = True) -> int:
+    """Отказ до подачи (проекция, тело): в failed/, как у проверок. Сухой
+    прогон и подача в чужую область (keep=False) следа не оставляют."""
     import memoryremember
     target = None
-    if not args.dry_run:
+    if keep and not args.dry_run:
         target = memoryremember.refuse_before_submit(
             scope=args.scope, candidate_id=args.proposal_id, source=args.source,
             session=args.session, content_type=args.content_type, reason=reason)
@@ -804,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
             # personal можно отовсюду, сбой потолка не отказ.
             свой = mc.TOPICS.get(_cwd_ceiling()[0] or "")
             if свой and свой.owner and args.scope.startswith("clients/") and args.scope != свой.owner:
-                беды.append(f"область {args.scope} чужая для рабочего каталога ({свой.owner})")
+                return _refused_early(args, f"область {args.scope} чужая для рабочего каталога ({свой.owner})", keep=False)
             if беды:
                 return _refused_early(args, "; ".join(беды))
             код, результат = memoryremember.run_remember(

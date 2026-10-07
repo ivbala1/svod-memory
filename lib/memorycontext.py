@@ -1328,10 +1328,10 @@ def _mark_usage(state_dir: Path, selected: Iterable[str]) -> None:
 def _environment_scope(scope_hint: str) -> RouteDecision | None:
     """Scope от вызывающего: Telegram-бот, планировщик.
 
-    Только точный алиас. Разбор подсказки по маркерам убран: маркеры это
-    рукописный список слов, который молча протухает, а закрепление сессии
-    слишком дорого ошибается, чтобы опираться на догадку. Не распознали
-    подсказку - сессия станет личной, это безопасный исход.
+    Алиасы ищутся во всей подсказке, как в первом сообщении; закрепляет ровно
+    один названный проект. Маркеров нет: рукописный список слов молча протухает,
+    а закрепление сессии слишком дорого ошибается, чтобы опираться на догадку.
+    Не распознали подсказку - сессия станет личной, это безопасный исход.
     """
     if not scope_hint:
         return None
@@ -1783,8 +1783,8 @@ def _topic_context(
                       / "memory" / "topics" / spec.filename)
     else:
         # Сводка без владельца читается от переданного корня: так проверка
-        # крючка выкладывает клиентское дерево; в живой карте у каждой темы
-        # есть владелец.
+        # крючка выкладывает дерево. Хук и recall передают каталог данных, где
+        # её нет: тема без owner в конфигурации не работает, код это не запрещает.
         relative_source = rollup_relative_source(spec)
         topic_path = root / relative_source
     text = topic_path.read_text(encoding="utf-8")
@@ -2154,6 +2154,27 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
         agent_id = payload.get("agent_id")
         marks_id = "" if isinstance(agent_id, str) and agent_id else session_id
         scope_hint = os.environ.get("AGENT_MEMORY_SCOPE_HINT", "")
+        # Проект решается ОДИН раз, первым сообщением сессии, и дальше не
+        # меняется ничем: ни упоминанием другого проекта, ни рабочим
+        # каталогом, ни маркерами. Здесь только чтение защёлки или её единственная
+        # установка, до чтения корпуса: его сбой не отдаст выбор второй реплике.
+        pinned = _pinned_scope(state_dir, session_id)
+        if not session_id:
+            # Закрепить негде, значит каждое сообщение стало бы новым
+            # первым. Отдаём личный режим: без опоры выбирать проект
+            # опаснее, чем не выбрать.
+            pinned, pin_source = PERSONAL_SCOPE, "no-session-id"
+        elif pinned is None and marks_id != session_id:
+            # Субагент в сессии, которую корень не закрепил (его хук упал
+            # до записи). Текст субагента пишет модель, проект он не
+            # выбирает: личный режим без записи, закрепит реплика корня.
+            pinned, pin_source = PERSONAL_SCOPE, "subagent-without-pin"
+        elif pinned is None:
+            pinned, pin_source = resolve_pin(prompt, scope_hint)
+            pinned, pin_source = _write_pin(state_dir, session_id, pinned, pin_source)
+        else:
+            pin_source = _pin_source(state_dir, session_id)
+
         global_root, personal_root = index_roots(root)
         with reader_locks(reader_federation(root).available_roots):
             index = (personal_root or global_root) / "memory" / "MEMORY.md"
@@ -2172,27 +2193,6 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             inbox_key = None
             record_keys = None
             full_key = None
-
-            # Проект решается ОДИН раз, первым сообщением сессии, и дальше не
-            # меняется ничем: ни упоминанием другого проекта, ни рабочим
-            # каталогом, ни маркерами. Поэтому здесь нет маршрутизации, есть
-            # только чтение защёлки и, если её ещё нет, единственная установка.
-            pinned = _pinned_scope(state_dir, session_id)
-            if not session_id:
-                # Закрепить негде, значит каждое сообщение стало бы новым
-                # первым. Отдаём личный режим: без опоры выбирать проект
-                # опаснее, чем не выбрать.
-                pinned, pin_source = PERSONAL_SCOPE, "no-session-id"
-            elif pinned is None and marks_id != session_id:
-                # Субагент в сессии, которую корень не закрепил (его хук упал
-                # до записи). Текст субагента пишет модель, проект он не
-                # выбирает: личный режим без записи, закрепит реплика корня.
-                pinned, pin_source = PERSONAL_SCOPE, "subagent-without-pin"
-            elif pinned is None:
-                pinned, pin_source = resolve_pin(prompt, scope_hint)
-                pinned, pin_source = _write_pin(state_dir, session_id, pinned, pin_source)
-            else:
-                pin_source = _pin_source(state_dir, session_id)
 
             ranked = ()
             члены: list[str] = []

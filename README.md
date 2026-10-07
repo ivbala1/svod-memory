@@ -82,11 +82,14 @@ python3 -u -m unittest discover -s tests
 Unit tests use neutral fixtures and a simulated scanner. The separate
 drill exercises the actual scanner and CLI. These tests do not establish
 that a scheduler or credentials work on another physical machine. The
-public suite covers the writer, verifier, sync and config paths; the
-router (`memorycontext`), `memoryrecall` and `memoryeval` are covered only
-by the author's private suite, which reads a private corpus. A hygiene test
-(`tests/test_hygiene.py`) keeps `lib/` free of functions without callers,
-unused imports and helpers defined twice.
+public suite covers the writer, verifier, sync and config paths, and of
+`memoryeval` only the baseline commit (`tests/test_configpaths.py`); the
+router (`memorycontext`), `memoryrecall`, `memoryprobes` and the rest of
+`memoryeval` are covered only by the author's private suite, which reads a
+private corpus. The export script runs every `bin/*` with `--help`
+against `public/config`, so a module missing from the package fails the
+export. A hygiene test (`tests/test_hygiene.py`) keeps `lib/` free of
+functions without callers, unused imports and helpers defined twice.
 
 CLI output, refusal reasons and hook messages are in Russian; the code
 identifiers and this README are English.
@@ -109,6 +112,9 @@ Each data repository has a `main` branch, an `origin` remote, a
 `{"scope":"global"}`, `{"scope":"personal"}`, or
 `{"scope":"clients/acme"}`. Global is required; other repositories are
 optional. Client repositories must be listed in `federationMembers`.
+Every topic should name its `owner` (`clients/<name>`): the hook and
+`recall` read the rollup from that clone. A topic without an owner passes
+the configuration check, but the hook and `recall` cannot deliver it.
 When a client leaves, remove its topic, `federationMembers` and
 `scopeRoots` entries and list its rollup in `archivedRollups`
 (`{"file.md": "clients/<name>"}`): folded records and the archive may keep
@@ -204,10 +210,12 @@ Git preserves accepted facts. Losing a disk also loses unpushed commits
 and local pending candidates unless they have a separate backup.
 
 `memory-eval compare` checks regression against the configured baseline;
-`selfcheck` exercises a deliberately empty and excessive result set.
+`selfcheck` exercises a deliberately empty and excessive result set;
+`probes` reports hit@1, hit@2 and hit@5 of every record's probe.
 `baseline` commits only the baseline file in the configuration repository
-and reports whether its push succeeded. A green comparison is not proof
-that every possible question can be answered.
+and reports whether its push succeeded. The example configuration ships no
+baseline: run `baseline` on your own corpus first. A green comparison is
+not proof that every possible question can be answered.
 
 ## License
 

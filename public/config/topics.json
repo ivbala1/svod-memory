@@ -31,34 +31,10 @@
           "ssh"
         ]
       }
-    },
-    "home": {
-      "rollup": "home.md",
-      "label": "Home",
-      "tokens": [
-        "home"
-      ],
-      "hotKeep": [],
-      "aliases": [
-        "home"
-      ],
-      "cwdNames": [
-        "home"
-      ],
-      "cwdPrefixes": [],
-      "defaultSections": [
-        "обзор"
-      ],
-      "sectionTerms": {
-        "обзор": [
-          "обзор"
-        ]
-      }
     }
   },
   "topicOrder": [
-    "acme",
-    "home"
+    "acme"
   ],
   "scopeRoots": {
     "personal": [
@@ -66,9 +42,6 @@
     ],
     "acme": [
       "~/src-work/acme"
-    ],
-    "home": [
-      "~/notes"
     ]
   }
 }

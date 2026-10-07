@@ -935,6 +935,59 @@ class GitToolsTests(Base):
         self.assertTrue(svodgit.fast_forward(empty, None, remote))
         self.assertEqual(svodgit.head(empty), remote)
 
+    def refuse_on_server(self, *lines: str) -> None:
+        """Сервер отвергает любой push своим хуком и пишет строки в stderr."""
+        hook = self.fed.origins / "personal.git" / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\n" + "".join(f"echo '{line}' >&2\n" for line in lines)
+                        + "exit 1\n")
+        hook.chmod(0o755)
+
+    def test_push_refusal_names_the_cause_not_the_last_line(self):
+        """Последняя строка отказа push всегда «failed to push some refs»,
+        причина выше неё: строка ссылки и ответ сервера (случай 07.10.2026)."""
+        root = self.fed.root("a")
+        remote = svodgit.remote_head(root)
+        commit = self.manual_commit(root, "memory/reference_iron.md", fresh_record(
+            "reference_iron", "как гладить утюгом", "гладить утюг"), "memory: iron")
+        accepted, words = svodgit.push(root, commit, commit)  # lease не на вершину сервера
+        self.assertFalse(accepted)
+        self.assertTrue(words.startswith("сервер не принял push: ! [rejected] "), words)
+        self.assertIn("(stale info)", words)
+        self.assertNotIn("failed to push", words)
+        self.refuse_on_server("отказ сервера: ветка защищена", "", "  ----------",
+                              *(f"подробность {n}: " + "слово " * 20 for n in range(30)))
+        accepted, words = svodgit.push(root, commit, remote)
+        self.assertFalse(accepted)
+        self.assertTrue(words.startswith("сервер не принял push: ! [remote rejected] "), words)
+        self.assertIn("(pre-receive hook declined); remote: отказ сервера: ветка защищена;", words)
+        self.assertNotIn("----", words)
+        self.assertNotIn("failed to push", words)
+        self.assertLessEqual(len(words), len("сервер не принял push: ") + svodgit.REASON_LIMIT)
+        self.assertTrue(words.endswith("…"), words)
+
+    def test_writer_keeps_the_server_refusal_in_pending(self):
+        self.refuse_on_server("отказ сервера: ветка защищена")
+        code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        self.assertIn("! [remote rejected]", result["reason"])
+        self.assertIn("remote: отказ сервера: ветка защищена", result["reason"])
+        saved = json.loads(self.pending("a")[0].read_text())
+        self.assertEqual(saved["reason"], result["reason"])
+
+    def test_fetch_failure_names_the_cause(self):
+        root = self.fed.root("a")
+        sh(root, "remote", "set-url", "origin", str(self.fed.base / "missing.git"))
+        fetched, why = svodgit.fetch(root)
+        self.assertFalse(fetched)
+        self.assertIn("does not appear to be a git repository", why)
+        self.assertNotIn("repository exists", why)
+
+    def test_stderr_without_meaningful_lines_keeps_the_last(self):
+        self.assertEqual(svodgit.stderr_reason(b""), "без текста")
+        self.assertEqual(svodgit.stderr_reason(b"To srv\nerror: failed to push some refs to 'srv'\n"),
+                         "error: failed to push some refs to 'srv'")
+
 
 if __name__ == "__main__":
     unittest.main()

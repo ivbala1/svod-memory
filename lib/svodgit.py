@@ -297,6 +297,30 @@ def has_remote(root: Path) -> bool:
     return git(root, "remote", "get-url", "origin", check=False).returncode == 0
 
 
+# Строки отказа, которые ничего не объясняют: адрес сервера, общий итог
+# «failed to push some refs», подсказки git и приписка о правах доступа.
+# Последней строкой стоит как раз такая, а причина выше (случай 07.10.2026).
+STDERR_NOISE = ("To ", "hint:", "error: failed to push some refs",
+                "Please make sure you have the correct access rights",
+                "and the repository exists.")
+# Причина ложится в pending, кэш таймера, статус и журнал: одна строка.
+REASON_LIMIT = 400
+
+
+def stderr_reason(stderr: bytes) -> str:
+    """Причина отказа git одной строкой: значимые строки stderr без шума,
+    строки состояния ссылки (`! [rejected] ... (stale info)`) первыми."""
+    lines = [" ".join(raw.split()) for raw in stderr.decode("utf-8", "replace").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return "без текста"
+    meaningful = [line for line in lines if not line.startswith(STDERR_NOISE)
+                  and any(ch.isalnum() for ch in line.removeprefix("remote:"))]
+    meaningful.sort(key=lambda line: not line.startswith("! ["))
+    text = "; ".join(dict.fromkeys(meaningful)) or lines[-1]
+    return text if len(text) <= REASON_LIMIT else text[:REASON_LIMIT - 1] + "…"
+
+
 def fetch(root: Path) -> tuple[bool, str]:
     """(удалось, слова). Сети нет: (False, причина)."""
     if not has_remote(root):
@@ -312,7 +336,7 @@ def fetch(root: Path) -> tuple[bool, str]:
             # Сервер есть, ветки на нём ещё нет: репозиторий новый.
             git(root, "update-ref", "-d", "refs/remotes/origin/main", check=False)
             return True, ""
-        return False, f"fetch не удался: {text.splitlines()[-1] if text else 'без текста'}"
+        return False, f"fetch не удался: {stderr_reason(result.stderr)}"
     return True, ""
 
 
@@ -331,9 +355,7 @@ def push(root: Path, commit: str, expect: str | None) -> tuple[bool, str]:
         return False, str(exc)
     if result.returncode == 0:
         return True, ""
-    text = result.stderr.decode("utf-8", "replace").strip()
-    last = text.splitlines()[-1] if text else "без текста"
-    return False, f"сервер не принял push: {last}"
+    return False, f"сервер не принял push: {stderr_reason(result.stderr)}"
 
 
 # ---------------------------------------------------------------------------
