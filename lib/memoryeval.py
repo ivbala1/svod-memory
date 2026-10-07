@@ -291,8 +291,10 @@ def replace_baseline(result: dict, path: Path | None = None) -> list[str]:
     if отправка.returncode == 0:
         заметки.append("опубликовано")
     else:
-        слова = отправка.stderr.decode("utf-8", "replace").strip().splitlines()
-        заметки.append("не отправлено: " + (слова[-1] if слова else f"код {отправка.returncode}"))
+        # Последней строкой отказа идёт hint: или общий итог, причина выше.
+        слова = (svodgit.stderr_reason(отправка.stderr) if отправка.stderr.strip()
+                 else f"код {отправка.returncode}")
+        заметки.append("не отправлено: " + слова)
     return заметки
 
 

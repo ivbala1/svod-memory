@@ -171,6 +171,32 @@ class ПересдачаТочки(unittest.TestCase):
             self.assertNotIn("опубликовано", notes)
             self.assertEqual(json.loads(git("show", "HEAD:eval_baseline.json")), {"new": 2})
 
+    def test_push_refusal_names_the_cause_not_the_hint(self):
+        """Сервер ушёл вперёд: последней строкой отказа идёт hint:, а причина
+        это строка ссылки выше неё."""
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            def git(cwd, *args):
+                return subprocess.check_output(["git", "-C", str(cwd), *args], text=True,
+                                               stderr=subprocess.DEVNULL).strip()
+            subprocess.check_call(["git", "init", "--quiet", "--bare", "-b", "main",
+                                   str(base / "srv.git")])
+            for name in ("a", "b"):
+                if name == "b":
+                    git(base / "a", "push", "--quiet", "-u", "origin", "main")
+                subprocess.check_call(["git", "clone", "--quiet", str(base / "srv.git"),
+                                       str(base / name)], stderr=subprocess.DEVNULL)
+                git(base / name, "symbolic-ref", "HEAD", "refs/heads/main")
+                git(base / name, "config", "user.name", "Test")
+                git(base / name, "config", "user.email", "test@example.invalid")
+                git(base / name, "config", "commit.gpgsign", "false")
+                (base / name / f"{name}.txt").write_text(name)
+                git(base / name, "add", ".")
+                git(base / name, "commit", "--quiet", "-m", name)
+            git(base / "b", "push", "--quiet")
+            notes = memoryeval.replace_baseline({"new": 2}, base / "a" / "eval_baseline.json")
+            self.assertIn("не отправлено: ! [rejected] main -> main (fetch first)", notes)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -988,6 +988,12 @@ class GitToolsTests(Base):
         self.assertEqual(svodgit.stderr_reason(b"To srv\nerror: failed to push some refs to 'srv'\n"),
                          "error: failed to push some refs to 'srv'")
 
+    def test_stderr_noise_duplicates_and_spaces_are_dropped(self):
+        stderr = (b"warning: same\nwarning: same\nfatal:   too   many   spaces\n\n"
+                  b"Please make sure you have the correct access rights\n"
+                  b"and the repository exists.\nhint: try again\n")
+        self.assertEqual(svodgit.stderr_reason(stderr), "warning: same; fatal: too many spaces")
+
 
 if __name__ == "__main__":
     unittest.main()
