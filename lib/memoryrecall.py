@@ -220,7 +220,7 @@ def _global_only_block(index: Path, hot_contract: str, revision: str) -> str:
     )
 
 
-def _read_consistently(root: Path, state_dir: Path, построить):
+def _read_consistently(root: Path, построить):
     """Прочитать дерево так, чтобы не поймать его в середине транзакции.
 
     Под замком одного чтения достаточно. Без замка сверяем ревизии до и после:
@@ -325,7 +325,6 @@ def recall(
     scope: str | None,
     cwd: str,
     root: Path | None = None,
-    state_dir: Path | None = None,
 ) -> str:
     """Блок, который отдал бы маршрутизатор. Ничего не пишет."""
     root = (root or mc.default_root()).expanduser()
@@ -333,8 +332,7 @@ def recall(
     потолок = ceiling_for(cwd, roots)
     итог = resolve_scope(scope, потолок)
 
-    state_dir = state_dir or mc.default_state_dir()
-    body, _ = _read_consistently(root, state_dir, lambda: build_body(root, итог, prompt))
+    body, _ = _read_consistently(root, lambda: build_body(root, итог, prompt))
 
     _, personal_root = mc.index_roots(root)
     banner = banner_for(итог, personal_root / "memory" / "MEMORY.md" if personal_root else None)
@@ -372,7 +370,7 @@ def explain(
     найденный_корень: Path | None = None
     найденный_файл: Path | None = None
     в_архиве = False
-    for корень in memoryctl.federation_roots(mc.reader_federation(root)):
+    for корень in mc.reader_federation(root).available_roots:
         действующая = корень / "memory" / файл_имя
         архивная = корень / "memory" / "archive" / файл_имя
         if действующая.is_file():
@@ -542,8 +540,7 @@ def score_breakdown(prompt: str, entry, *, root: Path, today=None) -> dict:
     по_заголовку = совпавшие(label_tokens)
     по_индексу = совпавшие(summary_tokens)
     бонусы: list[str] = []
-    label_norm = mc._normalized_text(entry.label)
-    if prompt_tokens and len(label_norm) >= 5 and label_norm in mc._normalized_text(prompt):
+    if prompt_tokens and mc.title_in_prompt(entry.label, prompt):
         бонусы.append("заголовок целиком в вопросе +6")
     if len(по_заголовку) >= 2:
         бонусы.append("два и более слова заголовка +2")
@@ -723,6 +720,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cwd_ceiling() -> tuple[str | None, str | None]:
+    """Потолок каталога; при сбое None и имя ошибки, без имён областей."""
+    try:
+        return ceiling_for(os.getcwd(), _load_scope_roots()), None
+    except Exception as exc:  # noqa: BLE001
+        return None, type(exc).__name__
+
+
+def _visible(итог: dict, потолок: str | None) -> dict:
+    """Статус в пределах потолка, как у recall: личный каталог видит все
+    области, клиентский свою и global, прочие только global; итог по видимым."""
+    import memorysync
+    if потолок != PERSONAL:
+        spec = mc.TOPICS.get(потолок or "")
+        видно = {"global"} | ({spec.owner} if spec and spec.owner else set())
+        итог["repos"] = [r for r in итог["repos"] if r["scope"] in видно]
+        итог["ok"] = all(memorysync._repo_ok(r) for r in итог["repos"])
+    return итог
+
+
 def _refused_early(args, reason: str) -> int:
     """Отказ до подачи (проекция, тело): в failed/, как у проверок.
     Сухой прогон следа не оставляет: он ничего не подавал."""
@@ -783,6 +800,11 @@ def main(argv: list[str] | None = None) -> int:
                         else sys.stdin.buffer.read())
             except OSError as exc:
                 беды.append(f"тело: {exc}")
+            # Из каталога заказчика нельзя в чужую клиентскую область; global и
+            # personal можно отовсюду, сбой потолка не отказ.
+            свой = mc.TOPICS.get(_cwd_ceiling()[0] or "")
+            if свой and свой.owner and args.scope.startswith("clients/") and args.scope != свой.owner:
+                беды.append(f"область {args.scope} чужая для рабочего каталога ({свой.owner})")
             if беды:
                 return _refused_early(args, "; ".join(беды))
             код, результат = memoryremember.run_remember(
@@ -805,24 +827,14 @@ def main(argv: list[str] | None = None) -> int:
                 месяц = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m")
                 безлюдный = (mc.scheduled_run() or os.environ.get(
                     "CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"))
-                # Потолок не определён: только global, и строка об этом без
-                # имён областей, иначе молчали бы и отказы личной памяти.
-                беда = None
-                try:
-                    потолок = ceiling_for(os.getcwd(), _load_scope_roots())
-                except Exception as exc:  # noqa: BLE001
-                    потолок, беда = None, type(exc).__name__
-                spec = mc.TOPICS.get(потолок or "")
-                видно = {"global"} | ({spec.owner} if spec and spec.owner else set())
+                потолок, беда = _cwd_ceiling()
                 try:
                     месячная = (потолок == PERSONAL and not безлюдный
                                 and метка.read_text(encoding="utf-8").strip() != месяц)
                 except OSError:
                     месячная = True
                 try:
-                    итог = memorysync.status(fetch=False)
-                    if потолок != PERSONAL:
-                        итог["repos"] = [r for r in итог["repos"] if r["scope"] in видно]
+                    итог = _visible(memorysync.status(fetch=False), потолок)
                     строка = memorysync.format_nudge(итог, monthly=месячная)
                 except Exception:  # noqa: BLE001 - подсказка не ломает старт сессии
                     return 0
@@ -840,10 +852,13 @@ def main(argv: list[str] | None = None) -> int:
                 if строка:
                     print(строка)
                 return 0
-            итог = memorysync.status(fetch=args.fetch)
+            потолок, беда = _cwd_ceiling()
+            итог = _visible(memorysync.status(fetch=args.fetch), потолок)
             if args.as_json:
                 print(json.dumps(итог, ensure_ascii=False, sort_keys=True))
             else:
+                if потолок != PERSONAL:
+                    print(f"Только области каталога ({беда or потолок or 'вне корней'}).")
                 print(memorysync.format_human(итог))
             return 0 if итог["ok"] else 1
         else:

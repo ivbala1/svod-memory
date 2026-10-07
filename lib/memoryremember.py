@@ -637,6 +637,8 @@ def save_candidate(path: Path, candidate: dict) -> None:
 
 def fail_candidate(path: Path, candidate: dict, reason: str, state: Path | None = None) -> Path:
     candidate = dict(candidate, reason=reason)
+    if "на секрет" in reason or "possible secret" in reason:
+        candidate["body"] = None  # отказ лежит до удаления, секрет в нём не хранить
     target = failed_path(candidate["scope"], candidate["id"], state)
     svodgit.replace_file(target, json.dumps(candidate, ensure_ascii=False, indent=1,
                                             sort_keys=True).encode("utf-8"))

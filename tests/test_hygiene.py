@@ -58,7 +58,9 @@ class LibHygieneTests(unittest.TestCase):
     def _referenced_elsewhere(self, module: str, name: str) -> bool:
         own = self.sources[f"lib/{module}.py"]
         own_defs = len(re.findall(r"\bdef\s+" + re.escape(name) + r"\b", own))
-        if _mentions(name, own) > own_defs:
+        # В своём модуле считается только голое имя: `memoryverify.имя` в
+        # теле обёртки это вызов чужой функции, а не своей.
+        if len(re.findall(r"(?<![\w.])" + re.escape(name) + r"\b", own)) > own_defs:
             return True
         for path, text in self.sources.items():
             if path == f"lib/{module}.py":

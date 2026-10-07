@@ -529,7 +529,7 @@ def build_index(root: Path) -> str:
     преамбула = (memory_root / "MEMORY.md").read_text(encoding="utf-8")
     тексты = []
     for файл in memory_root.glob("*.md"):
-        if файл.name == "MEMORY.md":
+        if файл.name == "MEMORY.md" or файл.is_symlink():
             continue
         try:
             тексты.append((файл.name, файл.read_text(encoding="utf-8")))
@@ -652,6 +652,12 @@ def score_words(prompt: str) -> tuple[str, ...]:
     return tuple(основы.values())
 
 
+def title_in_prompt(label: str, prompt: str) -> bool:
+    """Заголовок целиком в вопросе отдельными словами, не внутри длинного."""
+    заголовок = _normalized_text(label)
+    return len(заголовок) >= 5 and f" {заголовок} " in f" {_normalized_text(prompt)} "
+
+
 def _entry_score(prompt: str, entry: IndexEntry) -> int:
     prompt_tokens = score_words(prompt)
     if not prompt_tokens:
@@ -669,9 +675,7 @@ def _entry_score(prompt: str, entry: IndexEntry) -> int:
         if any(_token_match(prompt_token, entry_token) for entry_token in summary_tokens)
     )
     score = (label_hits * 4) + summary_hits
-    normalized_label = _normalized_text(entry.label)
-    normalized_prompt = _normalized_text(prompt)
-    if len(normalized_label) >= 5 and normalized_label in normalized_prompt:
+    if title_in_prompt(entry.label, prompt):
         score += 6
     if label_hits >= 2:
         score += 2
@@ -1143,7 +1147,9 @@ def _strip_shell_prompts(text: str) -> str:
 
 
 def _explicit_scopes(prompt: str) -> tuple[str, ...]:
-    text = _strip_shell_prompts(prompt)
+    # Ограждённый код (лог, путь, цитата) намерением не считается, как приглашение.
+    lines = _strip_shell_prompts(prompt).splitlines()
+    text = "\n".join(s for s, код in zip(lines, code_fence_mask(lines)) if not код)
     matches = []
     for scope in TOPIC_ORDER:
         if _matching_terms(text, TOPICS[scope].aliases):
@@ -1684,8 +1690,6 @@ def topic_preamble(
     *,
     full_context: bool,
     include_hot: bool,
-    root: Path | None = None,
-    state_dir: Path | None = None,
 ) -> tuple[list[str], int]:
     """Шапка выдачи и бюджет под неё.
 
@@ -1764,13 +1768,12 @@ def _topic_context(
     *,
     full_context: bool,
     include_hot: bool,
-    state_dir: Path | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     if spec.owner:
         # Сводка владельца читается из ВЫБРАННОГО контекстом дерева (F8), а
         # не по стандартному пути: зарегистрированное рабочее дерево клиента
-        # обслуживает и чтение. Фабрика контекста проверяет физические
-        # границы (симлинки clients/, корней и областей memory).
+        # обслуживает и чтение. Фабрика контекста отбрасывает область, чей
+        # каталог или memory это ссылка; метку .svod.json читатель не сверяет.
         контекст = reader_federation(root)
         if spec.owner not in контекст.available:
             raise MemoryctlError(
@@ -1797,8 +1800,6 @@ def _topic_context(
         hot_contract,
         full_context=full_context,
         include_hot=include_hot,
-        root=root,
-        state_dir=state_dir,
     )
     included, dropped = [], []
     delivered = set()
@@ -2269,7 +2270,6 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     hot_contract,
                     full_context=full_context,
                     include_hot=include_hot,
-                    state_dir=state_dir,
                 )
                 if full_context:
                     selected = (("global-hot",) if include_hot else ()) + topic_sections

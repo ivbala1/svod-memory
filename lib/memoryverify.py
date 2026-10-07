@@ -739,8 +739,7 @@ def folded_slugs(tree: dict[str, bytes]) -> set[str]:
     return out
 
 
-def unreachable_records(tree: dict[str, bytes], known_topics: set[str],
-                        extra_rollups: str = "", *,
+def unreachable_records(tree: dict[str, bytes], known_topics: set[str], *,
                         searchable_folded: bool = False) -> set[str]:
     """Записи, недостижимые ни из индекса, ни из сводки темы. known_topics
     это пути сводок вида topics/<файл>. В личной области достижима и
@@ -749,10 +748,8 @@ def unreachable_records(tree: dict[str, bytes], known_topics: set[str],
     from_index = router_index_slugs(router_index_text(tree))
     if searchable_folded:
         from_index |= folded_slugs(tree)
-    rollups = "\n".join(
-        [text.decode("utf-8", "replace")
-         for path, text in tree.items() if path[len(MEMORY_PREFIX):] in known_topics]
-        + ([extra_rollups] if extra_rollups else []))
+    rollups = "\n".join(text.decode("utf-8", "replace") for path, text in tree.items()
+                        if path[len(MEMORY_PREFIX):] in known_topics)
     orphans = set()
     for path in tree:
         if not path.startswith(MEMORY_PREFIX):
@@ -914,7 +911,7 @@ def _expired(fields: dict, today: dt.date) -> bool:
         return False
 
 
-def probe_errors(base: dict[str, bytes], candidate: dict[str, bytes], *,
+def probe_errors(candidate: dict[str, bytes], *,
                  root: str, topics: Topics, laid_out: Path, today: dt.date,
                  facts: dict, entries: tuple | None = None) -> list[str]:
     errors: list[str] = []
@@ -1306,7 +1303,7 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
         # Индекс кандидата строится один раз на подачу: его читают и
         # крючки, и предупреждение о доставке.
         entries = index_entries(new_root) if client_name(root) is None else ()
-        errors += probe_errors(base, candidate, root=root, topics=topics,
+        errors += probe_errors(candidate, root=root, topics=topics,
                                laid_out=new_root, today=today, facts=facts, entries=entries)
         warnings += delivery_warnings(base, candidate, root=root, laid_out=new_root,
                                       entries=entries)

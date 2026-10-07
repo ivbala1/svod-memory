@@ -64,18 +64,15 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
 # ---------------------------------------------------------------------------
 # Файлы области памяти
 
-def require_real_directory(path: Path, label: str, *, required: bool = True) -> bool:
+def require_real_directory(path: Path, label: str) -> None:
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
-        if required:
-            raise ValidationError([f"{label} is missing: {path}"])
-        return False
+        raise ValidationError([f"{label} is missing: {path}"]) from None
     if stat.S_ISLNK(mode):
         raise ValidationError([f"{label} is a symlink: {path}"])
     if not stat.S_ISDIR(mode):
         raise ValidationError([f"{label} is not a directory: {path}"])
-    return True
 
 
 def iter_data_files(root: Path):
@@ -213,13 +210,6 @@ def countable_link_warnings(warnings: list[str]) -> set[str]:
             and "wiki link to the " not in w}
 
 
-def drifted_records(snapshot: dict, own_client: str | None = None,
-                    topics_raw: bytes | None = None) -> dict[str, list[str]]:
-    import memoryverify
-    raw = topics_raw if topics_raw is not None else configpaths.config_path("topics.json").read_bytes()
-    return memoryverify.drifted_records(snapshot, memoryverify.load_topics(raw).drift, own_client)
-
-
 # ---------------------------------------------------------------------------
 # Карта репозиториев для читателей
 
@@ -245,19 +235,15 @@ class RepoMap:
                      if lid in self.available)
 
 
-def federation_context(data_root: Path, state_dir: Path | None = None, *,
-                       topics_raw: bytes | None = None, **_ignored) -> RepoMap:
+def federation_context(data_root: Path, *, topics_raw: bytes | None = None) -> RepoMap:
     mapping = svodgit.repo_map(data_root, topics_raw, on_disk_only=False)
     identities = {lid: RootInfo(lid, path) for lid, path in mapping.items()}
     # Читателю хватает области memory на диске: git нужен писателю и таймеру,
-    # а выложенное дерево или фикстура репозиторием не являются.
-    available = frozenset(lid for lid, path in mapping.items() if (path / "memory").is_dir())
+    # а выложенное дерево или фикстура репозиторием не являются. Каталог
+    # области или memory ссылкой не отдаётся: так чужой клон выглядел бы своим.
+    available = frozenset(lid for lid, path in mapping.items() if (path / "memory").is_dir()
+                          and not path.is_symlink() and not (path / "memory").is_symlink())
     return RepoMap(identities=identities, available=available)
-
-
-def federation_roots(source, *, state_dir: Path | None = None) -> list[Path]:
-    context = source if isinstance(source, RepoMap) else federation_context(source, state_dir)
-    return list(context.available_roots)
 
 
 def revision_vector(root: Path, *, federation: RepoMap | None = None) -> dict[str, str]:

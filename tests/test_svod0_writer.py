@@ -2059,6 +2059,25 @@ class FourthRoundFixTests(Base):
         self.assertNotIn("«Доступы»", " ".join(слова))
 
 
+class OctoberReviewTests(Base):
+    """Ревью 06.10.2026: отказ «похоже на секрет» не хранит тело в failed/."""
+
+    def test_secret_refusal_keeps_no_body_other_refusal_keeps_it(self):
+        self.fed.set_scanner(9)
+        code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertIn("на секрет", result["reason"])
+        self.assertIsNone(json.loads(Path(result["file"]).read_text())["body"])
+        self.fed.set_scanner(0)
+        body = fresh_record("feedback_link", "правило со ссылкой наружу",
+                            "как правило со ссылкой наружу", "См. [[nowhere]].\n")
+        code, result = self.fed.remember("a", "global", "link-1", body,
+                                         {"record_slug": "feedback_link"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertIsNotNone(json.loads(Path(result["file"]).read_text())["body"])
+
+
 class ManifestFileTests(Base):
     """file это источник текста, значит он бывает только у put."""
 

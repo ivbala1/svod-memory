@@ -146,7 +146,11 @@ bin/memory-sync
 ```
 
 CLI scope is constrained by the calling directory and the configured
-`scopeRoots`. Session hooks pin a project from the first message. Actual
+`scopeRoots`: `recall`, `search` and `status` see only the areas it allows,
+and `remember` from one client's directory refuses another client's
+repository (`global` and `personal` are accepted anywhere). Session hooks
+pin a project from the first message; a name inside a shell prompt or a
+fenced code block does not. Actual
 access boundaries require separate repositories and credentials; a prompt
 or scope marker is not access control.
 
@@ -181,7 +185,8 @@ holding that text. A call affects one repository.
 The writer checks the exact staged tree and outgoing commit range.
 `saved` (exit 0) means the server accepted the commit. `pending` (4)
 preserves a local candidate for retry, `failed` (2) preserves the refusal
-with its reason, and `busy` (3) means the lock remained occupied.
+with its reason (without the body when it looks like a secret), and
+`busy` (3) means the lock remained occupied.
 Other startup errors are reported separately.
 
 ## Synchronization and recovery
