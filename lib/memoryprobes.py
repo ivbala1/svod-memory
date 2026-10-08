@@ -61,7 +61,11 @@ def поля_probe(поля: dict) -> str | None:
 
 def report(root: Path, *, today=None) -> dict:
     """По обоим корням общего индекса этой машины."""
-    global_root, personal = mc.index_roots(root)
+    try:
+        global_root, personal = mc.index_roots(root)
+    except ValueError as exc:
+        # Битый federationMembers: отказ словами, как у стенда.
+        raise mc.MemoryctlError(str(exc)) from exc
     out = {"global": probes_for_root(global_root, today=today)}
     if personal is not None:
         out["personal"] = probes_for_root(personal, today=today)

@@ -30,6 +30,16 @@ def main() -> int:
         print(f"memory-eval: {mc.TOPICS_ERROR}", file=sys.stderr)
         return 2
     root = args.root.expanduser().resolve()
+    try:
+        return command(args, root)
+    except (ev.EvalError, mc.MemoryctlError) as exc:
+        # Отказ стенда словами и кодом 2, как битая конфигурация: код 1 у
+        # compare значит регрессию.
+        print(f"memory-eval: {exc}", file=sys.stderr)
+        return 2
+
+
+def command(args, root: Path) -> int:
     if args.command == "probes":
         итог = memoryprobes.report(root)
         print(json.dumps(итог, ensure_ascii=False, indent=1) if args.json

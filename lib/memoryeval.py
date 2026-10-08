@@ -61,10 +61,20 @@ QUESTIONS_PATH = configpaths.config_path("eval_questions.json")
 # это git того же репозитория: команда baseline коммитит её сама.
 BASELINE_PATH = configpaths.baseline_path()
 
+# Конфигурация тем входит в отпечаток разобранной и без полей сводок
+# заказчиков, которые правят клиентские сессии: терминов и разделов по
+# умолчанию. Личный стенд сводок не читает (замер 08.10.2026: ни одно
+# допустимое значение ни одного ключа topics.json чисел стенда не меняет), а
+# каждая такая правка пересдавала точку, десять раз за месяц. Список
+# исключённого, а не учтённого: новые ключи входят в отпечаток сами. Разбор
+# как у читателя, ключи по порядку: перестановка и пробелы тоже не в счёт.
+# Сторож: тест гоняет стенд на двух конфигурациях, различающихся только
+# этими полями, и требует того же результата и того же отпечатка.
+TOPICS_PATH = configpaths.config_path("topics.json")
+NOT_MEASURED_TOPIC_FIELDS = ("sectionTerms", "defaultSections")
+
 # Файлы, определяющие измерение целиком: маршрутизатор, сам стенд, модуль
-# раскладки и конфигурация тем. Конфигурация входит наравне с кодом: поле
-# owner переключает физический источник сводки, и без него в отпечатке смена
-# раскладки не делала сравнение недействительным, хотя меняла доставку.
+# раскладки и конфигурация тем.
 MEASUREMENT_FILES = (
     Path(mc.__file__),
     Path(__file__),
@@ -74,7 +84,7 @@ MEASUREMENT_FILES = (
     # memoryctl его реэкспортирует: правка разбора меняет ранги.
     HERE / "memoryverify.py",
     HERE / "memoryctl.py",
-    configpaths.config_path("topics.json"),
+    TOPICS_PATH,
 )
 
 
@@ -108,7 +118,8 @@ def load_questions(path: Path = QUESTIONS_PATH) -> dict:
 
 def measurement_fingerprint(files: tuple[Path, ...] | None = None,
                             substitute: dict | None = None) -> str:
-    """Отпечаток измерителя: байты обоих модулей ЦЕЛИКОМ.
+    """Отпечаток измерителя: байты модулей ЦЕЛИКОМ, конфигурация тем без
+    полей сводок заказчиков (`measured_topics`).
 
     Ручной список зависимостей дважды оказался неполным, и оба раза это нашло
     ревью, а не тесты: сперва STOP_TOKENS (слово в стоп-списке меняло результат
@@ -126,10 +137,28 @@ def measurement_fingerprint(files: tuple[Path, ...] | None = None,
     куски = []
     for путь in (files or MEASUREMENT_FILES):
         if substitute is not None and путь in substitute:
-            куски.append(substitute[путь])
+            байты = substitute[путь]
         else:
-            куски.append(путь.read_bytes())
+            байты = путь.read_bytes()
+        куски.append(measured_topics(байты) if путь == TOPICS_PATH else байты)
     return hashlib.sha256(b"".join(куски)).hexdigest()
+
+
+def measured_topics(raw: bytes) -> bytes:
+    """Конфигурация тем без NOT_MEASURED_TOPIC_FIELDS, ключи по порядку.
+    Неразборчивый файл идёт байтами целиком: безопасная сторона."""
+    try:
+        разбор = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return raw
+    темы = разбор.get("topics") if isinstance(разбор, dict) else None
+    if not isinstance(темы, dict):
+        return raw
+    разбор["topics"] = {
+        имя: ({k: v for k, v in тема.items() if k not in NOT_MEASURED_TOPIC_FIELDS}
+              if isinstance(тема, dict) else тема)
+        for имя, тема in темы.items()}
+    return json.dumps(разбор, sort_keys=True).encode("ascii")
 
 
 def versions(root: Path) -> dict:
@@ -236,7 +265,12 @@ def absolute_failures(result: dict) -> list[dict]:
 
 
 def personal_root(root: Path) -> Path:
-    контекст = federation_context(root)
+    try:
+        контекст = federation_context(root)
+    except ValueError as exc:
+        # Битый federationMembers: отказ словами, а не трассировка с кодом 1,
+        # который у compare значит регрессию.
+        raise EvalError(str(exc)) from exc
     if "personal" not in контекст.available:
         raise EvalError(f"{root}: нет личного репозитория personal/memory, стенд меряет его индекс")
     return контекст.identities["personal"].worktree_root

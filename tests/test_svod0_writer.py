@@ -2751,3 +2751,153 @@ class UsageObservationTests(Base):
                 notes = self.notes(config)
             self.assertEqual([n for n in notes if n.startswith(("автомат закрытого", "просрочено"))],
                              ожидание)
+
+
+class StandFingerprintTests(Base):
+    """Отпечаток стенда без полей сводок заказчиков (решение владельца
+    08.10.2026). Сторож: настоящий CLI в отдельных процессах на двух
+    конфигурациях, различающихся только этими полями, набитыми словами
+    вопросов и заголовками записей, обязан дать тот же результат.
+
+    Фикстура задевает оба места отбора: тридцать заметок дают полнотекстовому
+    второму месту настоящую редкость слов, «Огород» находится только им, а
+    «Лампа в гараже» и «Чайник в офисе» стоят на одно слово заголовка ниже
+    порога, и любая надбавка от этих полей вытолкнула бы их в выдачу.
+    «Морковный сок» так же ждёт у вопроса про огород, где первое место пусто:
+    хватит и одного очка."""
+
+    RECORDS = (("reference_kettle", "Чайник", "как кипятить воду в чайнике",
+                "Чайник кипятит воду за три минуты.\n"),
+               ("reference_lamp", "Настольная лампа", "как включить настольную лампу",
+                "Лампа включается шнурком.\n"),
+               ("reference_garden", "Огород", "что растёт на даче",
+                "Морковь, свёкла, укроп и щавель растут у забора; поливать из бочки.\n"),
+               ("reference_garage_lamp", "Лампа в гараже", "свет над верстаком",
+                "Над верстаком висит переноска.\n"),
+               ("reference_office_kettle", "Чайник в офисе", "кухня на работе",
+                "На работе электрический, с фильтром.\n"),
+               ("reference_juice", "Морковный сок", "что пить утром",
+                "Выжимать утром, пить свежим.\n"))
+    QUESTIONS = {
+        "questions": [
+            {"id": "q1", "group": "tuned", "text": "как чинить зелёный принтер",
+             "expect": "reference_printer", "markers": ["зелёный принтер"]},
+            {"id": "q2", "group": "heldout", "text": "чайник: как кипятить воду",
+             "expect": "reference_kettle", "markers": ["кипятит воду"]},
+            {"id": "q3", "group": "heldout", "text": "как включить настольную лампу",
+             "expect": "reference_lamp", "markers": ["включается шнурком"]},
+            {"id": "q4", "group": "heldout", "text": "морковь свёкла укроп щавель у забора",
+             "expect": "reference_garden", "markers": ["укроп"]},
+        ],
+        "negatives": [{"id": "n1", "text": "погода на марсе завтра"}],
+    }
+
+    def setUp(self):
+        super().setUp()
+        root = self.fed.root("a")
+        заметки = tuple((f"reference_note{n}", f"Заметка номер {n}", "разное про предмет",
+                         "Текст заметки про разный предмет.\n") for n in range(30))
+        for slug, title, index, body in self.RECORDS + заметки:
+            (root / "memory" / f"{slug}.md").write_bytes(record(
+                slug, type="reference", title=title, index=index, source="разговор",
+                observed_at="2026-09-04", probe=index, body=body))
+        (root / "memory" / "personal_inbox.md").write_text(
+            "# Инбокс\n\n## Дела\n[2026-09-04] Купить чайник.\n", encoding="utf-8")
+        sh(root, "add", "-A", "--", "memory")
+        sh(root, "commit", "--quiet", "--no-verify", "-m", "memory: стенд")
+
+    def config(self, name: str, edit=None) -> Path:
+        target = self.fed.base / f"cfg-{name}"
+        shutil.copytree(self.fed.config, target)
+        (target / "eval_questions.json").write_text(
+            json.dumps(self.QUESTIONS, ensure_ascii=False), encoding="utf-8")
+        topics = json.loads((target / "topics.json").read_text(encoding="utf-8"))
+        text = json.dumps(edit(topics) if edit else topics, ensure_ascii=False)
+        (target / "topics.json").write_text(text, encoding="utf-8")
+        return target
+
+    def cli(self, config: Path, command: str = "run") -> subprocess.CompletedProcess:
+        env = dict(os.environ, MEMORY_CONFIG_DIR=str(config),
+                   MEMORYCTL_STATE_DIR=str(self.fed.base / "eval-state"))
+        return subprocess.run(
+            [sys.executable, str(REPO_SOURCE / "bin" / "memory-eval"), command, "--json",
+             "--root", str(self.fed.machines["a"])],
+            env=env, capture_output=True, text=True, timeout=120)
+
+    def measure(self, config: Path) -> dict:
+        result = self.cli(config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def stuffed(self, topics: dict) -> dict:
+        фразы = [q["text"] for q in self.QUESTIONS["questions"] + self.QUESTIONS["negatives"]]
+        слова = sorted({w.strip(",.:?") for f in фразы for w in f.split()})
+        заголовки = [title for _, title, _, _ in self.RECORDS] + ["Зелёный принтер"]
+        for тема in topics["topics"].values():
+            тема["sectionTerms"] = {"Обзор": фразы + слова + заголовки, "Всё": слова,
+                                    **{з: слова for з in заголовки + слова}}
+            тема["defaultSections"] = заголовки + слова + фразы
+        return topics
+
+    @staticmethod
+    def emptied(topics: dict) -> dict:
+        for тема in topics["topics"].values():
+            тема["sectionTerms"], тема["defaultSections"] = {}, []
+        return topics
+
+    @staticmethod
+    def favouring(topics: dict) -> dict:
+        """Поля называют только конкурентов: надбавка за них досталась бы
+        одной стороне, а не всем записям поровну."""
+        заголовки = ["Лампа в гараже", "Чайник в офисе", "Морковный сок"]
+        for тема in topics["topics"].values():
+            тема["sectionTerms"] = {з: з.split() for з in заголовки + ["гараже", "офисе"]}
+            тема["defaultSections"] = заголовки + ["гараже", "офисе"]
+        return topics
+
+    def test_client_section_fields_change_neither_numbers_nor_fingerprint(self):
+        base = self.measure(self.config("base"))
+        self.assertTrue(all(q["found"] for q in base["questions"].values()), base)
+        self.assertFalse(base["negatives"]["n1"]["fired"])
+        # «Огород» без слов вопроса в заголовке: его даёт только второе место.
+        self.assertGreater(base["questions"]["q4"]["rank"], 1, base)
+        for name, edit in (("stuffed", self.stuffed), ("emptied", self.emptied),
+                           ("favouring", self.favouring)):
+            with self.subTest(name):
+                other = self.measure(self.config(name, edit))
+                self.assertEqual(other["questions"], base["questions"])
+                self.assertEqual(other["negatives"], base["negatives"])
+                self.assertEqual(other["versions"], base["versions"])
+
+    def test_other_fields_still_change_the_fingerprint(self):
+        import memoryeval
+        def tokens(topics):
+            topics["topics"]["home"]["tokens"].append("лампа")
+            return topics
+        def unknown(topics):
+            topics["topics"]["home"]["newField"] = ["x"]
+            return topics
+        base = self.config("base")
+        версии = {name: self.measure(self.config(name, edit))["versions"]["measurement_sha256"]
+                  for name, edit in (("tokens", tokens), ("unknown", unknown))}
+        отпечаток = self.measure(base)["versions"]["measurement_sha256"]
+        self.assertNotIn(отпечаток, версии.values())
+        сырой = (base / "topics.json").read_bytes()
+        переставленный = json.dumps(dict(reversed(json.loads(сырой).items())),
+                                    ensure_ascii=False, indent=4).encode()
+        self.assertEqual(memoryeval.measured_topics(сырой),
+                         memoryeval.measured_topics(переставленный))
+        self.assertEqual(memoryeval.measured_topics(b"{not json"), b"{not json")
+        # Одиночный суррогат в удерживаемом поле не роняет проекцию.
+        self.assertTrue(memoryeval.measured_topics(b'{"topics": {"x": {"label": "\\ud800"}}}'))
+
+    def test_broken_member_list_is_named_in_words(self):
+        def broken(topics):
+            del topics["federationMembers"]
+            return topics
+        config = self.config("broken", broken)
+        for command in ("run", "probes"):
+            result = self.cli(config, command)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("federationMembers", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)

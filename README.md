@@ -83,7 +83,9 @@ Unit tests use neutral fixtures and a simulated scanner. The separate
 drill exercises the actual scanner and CLI. These tests do not establish
 that a scheduler or credentials work on another physical machine. The
 public suite covers the writer, verifier, sync and config paths, and of
-`memoryeval` only the baseline commit (`tests/test_configpaths.py`); the
+`memoryeval` only the baseline commit (`tests/test_configpaths.py`) and
+the measurement fingerprint, through the real `memory-eval` CLI on a
+neutral fixture (`StandFingerprintTests`); the
 router (`memorycontext`), `memoryrecall`, `memoryprobes` and the rest of
 `memoryeval` are covered only by the author's private suite, which reads a
 private corpus. The export script runs every `bin/*` with `--help`
@@ -213,7 +215,10 @@ and local pending candidates unless they have a separate backup.
 `selfcheck` exercises a deliberately empty and excessive result set;
 `probes` reports hit@1, hit@2 and hit@5 of every record's probe.
 `baseline` commits only the baseline file in the configuration repository
-and reports whether its push succeeded. The example configuration ships no
+and reports whether its push succeeded. Edits to client rollup terms
+(`sectionTerms`, `defaultSections`) keep the baseline valid; any other
+change to `topics.json` or to the measuring code invalidates it until
+you take a new baseline. The example configuration ships no
 baseline: run `baseline` on your own corpus first. A green comparison is
 not proof that every possible question can be answered.
 
