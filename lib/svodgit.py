@@ -305,17 +305,23 @@ STDERR_NOISE = ("To ", "hint:", "error: failed to push some refs",
                 "and the repository exists.")
 # Причина ложится в pending, кэш таймера, статус и журнал: одна строка.
 REASON_LIMIT = 400
+# Push отправляет коммит по хешу, и строка ссылки несёт его целиком: 40 знаков
+# съедали 100 знаков подсказки старта раньше причины в скобках.
+REF_HASH = re.compile(r"\b([0-9a-f]{12})[0-9a-f]{28,52}\b")
 
 
 def stderr_reason(stderr: bytes) -> str:
     """Причина отказа git одной строкой: значимые строки stderr без шума,
-    строки состояния ссылки (`! [rejected] ... (stale info)`) первыми."""
+    строки состояния ссылки (`! [rejected] ... (stale info)`) первыми, хеш
+    коммита в них до 12 знаков."""
     lines = [" ".join(raw.split()) for raw in stderr.decode("utf-8", "replace").splitlines()]
     lines = [line for line in lines if line]
     if not lines:
         return "без текста"
     meaningful = [line for line in lines if not line.startswith(STDERR_NOISE)
                   and any(ch.isalnum() for ch in line.removeprefix("remote:"))]
+    meaningful = [REF_HASH.sub(r"\1", line) if line.startswith("! [") else line
+                  for line in meaningful]
     meaningful.sort(key=lambda line: not line.startswith("! ["))
     text = "; ".join(dict.fromkeys(meaningful)) or lines[-1]
     return text if len(text) <= REASON_LIMIT else text[:REASON_LIMIT - 1] + "…"

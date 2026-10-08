@@ -951,15 +951,19 @@ class GitToolsTests(Base):
             "reference_iron", "как гладить утюгом", "гладить утюг"), "memory: iron")
         accepted, words = svodgit.push(root, commit, commit)  # lease не на вершину сервера
         self.assertFalse(accepted)
-        self.assertTrue(words.startswith("сервер не принял push: ! [rejected] "), words)
-        self.assertIn("(stale info)", words)
+        self.assertTrue(words.startswith(
+            f"сервер не принял push: ! [rejected] {commit[:12]} -> main (stale info)"), words)
+        self.assertNotIn(commit, words)
         self.assertNotIn("failed to push", words)
         self.refuse_on_server("отказ сервера: ветка защищена", "", "  ----------",
                               *(f"подробность {n}: " + "слово " * 20 for n in range(30)))
         accepted, words = svodgit.push(root, commit, remote)
         self.assertFalse(accepted)
-        self.assertTrue(words.startswith("сервер не принял push: ! [remote rejected] "), words)
-        self.assertIn("(pre-receive hook declined); remote: отказ сервера: ветка защищена;", words)
+        self.assertTrue(words.startswith(
+            f"сервер не принял push: ! [remote rejected] {commit[:12]} -> main "
+            "(pre-receive hook declined); remote: отказ сервера: ветка защищена;"), words)
+        # Подсказка старта берёт 100 знаков строки таймера: причина в них.
+        self.assertIn("(pre-receive hook declined)", words[:100])
         self.assertNotIn("----", words)
         self.assertNotIn("failed to push", words)
         self.assertLessEqual(len(words), len("сервер не принял push: ") + svodgit.REASON_LIMIT)
@@ -993,6 +997,12 @@ class GitToolsTests(Base):
                   b"Please make sure you have the correct access rights\n"
                   b"and the repository exists.\nhint: try again\n")
         self.assertEqual(svodgit.stderr_reason(stderr), "warning: same; fatal: too many spaces")
+
+    def test_hash_is_shortened_only_in_the_ref_line(self):
+        sha = "0123456789ab" + "c" * 28
+        stderr = f"remote: commit {sha}\n ! [rejected]        {sha} -> main (stale info)\n".encode()
+        self.assertEqual(svodgit.stderr_reason(stderr),
+                         f"! [rejected] 0123456789ab -> main (stale info); remote: commit {sha}")
 
 
 if __name__ == "__main__":
