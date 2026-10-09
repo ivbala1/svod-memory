@@ -167,11 +167,13 @@ or scope marker is not access control.
 A record is Markdown with frontmatter containing `type` (`user`,
 `feedback`, `project`, `reference`), `title`, `index`, `source`,
 `observed_at` and `probe`. The index is generated from record headers.
-`listed: false` removes a personal record from search, except records named
-in `personal.secondPlaceWhitelist` of `topics.json`: the second, full-text
-slot may return those, marked as folded and to be checked for validity.
-Client records are reached through links in their topic rollup. The probe must find the record
-using the router's own selection. Provenance must reflect the actual source
+`listed: false` removes a personal record from automatic selection (`memory
+search` still finds it), except records named in
+`personal.secondPlaceWhitelist` of `topics.json`: the second, full-text slot
+may return those, marked as folded and to be checked for validity. Client
+records are reached through links in their topic rollup. The probe of an
+indexed or client record must find it using the router's own selection;
+folded personal records are not checked. Provenance must reflect the actual source
 and observation date.
 
 ```sh

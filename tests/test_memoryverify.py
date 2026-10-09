@@ -321,15 +321,24 @@ class ProbeTests(unittest.TestCase):
         raw = json.dumps(dict(TOPICS, personal={"secondPlaceWhitelist": ["reference_old"]}),
                          ensure_ascii=False).encode("utf-8")
         self.assertEqual(mv.load_topics(raw).second_place, ("reference_old",))
+        дерево = self._tree("чем чинить принтер зелёного цвета")
+        дерево["memory/reference_old.md"] = record(
+            "reference_old", type="reference", title="Старый принтер", index="картридж",
+            listed="false", body="Картридж менять раз в год.\n")
+        пул: list[str] = []
+        настоящий = mc.second_place_candidates
         with Scanner(0) as scanner, mock.patch.object(
-                mc, "select_index_entries", wraps=mc.select_index_entries) as ranked:
-            mv.check(self._tree("чем чинить принтер зелёного цвета"), base_tree(),
-                     root="personal", config=mv.Config(topics=raw, questions=QUESTIONS_RAW),
+                mc, "select_index_entries", wraps=mc.select_index_entries) as ranked, \
+                mock.patch.object(mc, "second_place_candidates", side_effect=lambda *a: (
+                    пул.extend(e.slug for e in настоящий(*a)) or настоящий(*a))):
+            mv.check(дерево, base_tree(), root="personal",
+                     config=mv.Config(topics=raw, questions=QUESTIONS_RAW),
                      today=TODAY, scanner=scanner)
         self.assertGreater(ranked.call_count, 1)
         for вызов in ranked.call_args_list:
             self.assertEqual(вызов.kwargs.get("whitelist"), ("reference_old",))
-        for плохой in ("reference_old", ["reference_old.md"], [5]):
+        self.assertIn("reference_old.md", пул)
+        for плохой in ("reference_old", ["reference_old.md"], [5], ["reference_old"] * 2):
             with self.subTest(список=плохой), self.assertRaises(mc.MemoryctlError):
                 mv.load_topics(json.dumps(dict(TOPICS, personal={
                     "secondPlaceWhitelist": плохой})).encode("utf-8"))

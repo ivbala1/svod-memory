@@ -199,6 +199,7 @@ def stand(root: Path, questions: dict, *, today=None, ранжировать=Non
         ранжировать = lambda prompt, записи: mc.select_index_entries(
             root, prompt, записи, today=today, whitelist=whitelist)
     записи = mc.parse_index(mc.build_index(root))
+    в_пуле = {Path(e.slug).stem for e in mc.second_place_candidates(root, записи, whitelist)}
 
     по_вопросам = {}
     for q in questions["questions"]:
@@ -216,11 +217,10 @@ def stand(root: Path, questions: dict, *, today=None, ранжировать=Non
         # обрезанная запись это отдельный класс отказа, не «нашлось».
         текст = delivered_text(root, q["text"], записи, отобрано)
         доставлен = any(re.search(м, текст, re.IGNORECASE) for м in q["markers"])
-        # Запрет на запись, которой нет в индексе (свёрнута, удалена), не
-        # проверяем и не считаем: он ничего не ловит, и самопроверка не
-        # должна ждать от него срабатывания.
-        в_индексе = {Path(e.slug).stem for e in записи}
-        устаревшие_запреты = sorted(f for f in q.get("forbid", []) if f not in в_индексе)
+        # Запрет на запись вне пула отбора (свёрнута вне белого списка,
+        # удалена) не проверяем и не считаем: он ничего не ловит, и
+        # самопроверка не должна ждать от него срабатывания.
+        устаревшие_запреты = sorted(f for f in q.get("forbid", []) if f not in в_пуле)
         по_вопросам[q["id"]] = {
             "group": q["group"],
             "found": ожидаемая in выдано,
@@ -286,7 +286,7 @@ def summarize(result: dict) -> dict:
                         "of": len(свои)}
     итог["negatives_fired"] = sum(1 for r in result["negatives"].values() if r["fired"])
     итог["absolute"] = [f"{item['id']}: {item['why']}" for item in absolute_failures(result)]
-    итог["stale_forbid"] = [f"{qid}: запрет {slug} вне индекса, не проверяется"
+    итог["stale_forbid"] = [f"{qid}: запрет {slug} вне отбора, не проверяется"
                             for qid, r in result["questions"].items()
                             for slug in r.get("stale_forbid", [])]
     return итог
@@ -374,9 +374,10 @@ def pairwise(baseline: dict, current: dict) -> dict:
     }
 
 
-def _everything(prompt, записи):
-    """Саботаж «всё подряд»: каждая достижимая запись в выдаче."""
-    return tuple((e, 0) for e in записи)
+def _everything(root: Path):
+    """Саботаж «всё подряд»: каждая достижимая запись в выдаче, включая
+    свёрнутые белого списка, которые может отдать второе место."""
+    return lambda prompt, записи: tuple((e, 0) for e in mc.second_place_candidates(root, записи))
 
 
 def selfcheck(root: Path) -> dict:
@@ -405,7 +406,7 @@ def selfcheck(root: Path) -> dict:
                 "why": f"пустой отбор пойман не целиком: {поймано} из {находимых} регрессий",
                 "detail": сравнение}
 
-    всё = run(root, questions=вопросы, ранжировать=_everything)
+    всё = run(root, questions=вопросы, ранжировать=_everything(personal_root(root)))
     сравнение_всё = compare(базис, всё)
     отрицательных = len(всё["negatives"])
     сработало = sum(1 for r in всё["negatives"].values() if r["fired"])
@@ -415,7 +416,8 @@ def selfcheck(root: Path) -> dict:
                    if set(q.get("forbid", [])) - set(всё["questions"][q["id"]]["stale_forbid"]))
     попаданий = sum(1 for r in сравнение_всё.get("absolute", [])
                     if r["why"].startswith("выдана запрещённая запись"))
-    записей = len(mc.parse_index(mc.build_index(personal_root(root))))
+    личный = personal_root(root)
+    записей = len(mc.second_place_candidates(личный, mc.parse_index(mc.build_index(личный))))
     шире = sum(1 for r in сравнение_всё.get("absolute", [])
                if r["why"].startswith("выдача шире потолка"))
     ожидается_шире = len(всё["questions"]) if записей > mc.DELIVERY_LIMIT else 0

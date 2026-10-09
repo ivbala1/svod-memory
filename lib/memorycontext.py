@@ -320,6 +320,9 @@ def topics_from_config(raw, path) -> dict[str, TopicSpec]:
             not isinstance(v, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", v) for v in список):
         raise MemoryctlError(f"{path}: personal.secondPlaceWhitelist должен быть списком "
                              "имён записей без .md")
+    if len(список) != len(set(список)):
+        # Повтор имени дважды считал бы документ в частотах BM25.
+        raise MemoryctlError(f"{path}: в personal.secondPlaceWhitelist есть повторы")
 
     result: dict[str, TopicSpec] = {}
     for key in order:
@@ -685,7 +688,7 @@ def _record_text(root: Path, slug_md: str) -> str:
         return ""
     try:
         return _read_limited(target, HEADER_READ_LIMIT)
-    except OSError:
+    except (OSError, UnicodeError):
         return ""
 
 
@@ -850,10 +853,11 @@ def second_place_whitelist(config: dict | None = None) -> tuple[str, ...]:
 
 @functools.lru_cache(maxsize=4)
 def folded_entries(root: Path, whitelist: tuple[str, ...]) -> tuple[IndexEntry, ...]:
-    """Записи белого списка, которые сейчас свёрнуты. Вернувшаяся в индекс
-    уже кандидат, удалённая или ушедшая в архив выпадает сама, истёкший срок
-    отсекает отбор. Кэш на процесс, как у _bm25_documents: писатель зовёт
-    отбор на каждый крючок дерева."""
+    """Записи белого списка, свёрнутые на момент первого чтения. Вернувшаяся в
+    индекс уже кандидат, удалённая, ушедшая в архив или нечитаемая выпадает,
+    истёкший срок отсекает отбор. Снимок на процесс, как у _bm25_documents:
+    писатель зовёт отбор на каждый крючок дерева, а хук и команды живут один
+    вызов; правка дерева внутри процесса требует cache_clear."""
     итог: list[IndexEntry] = []
     for имя in whitelist:
         if (root / "memory" / f"{имя}.md").is_symlink():
@@ -868,9 +872,15 @@ def folded_entries(root: Path, whitelist: tuple[str, ...]) -> tuple[IndexEntry, 
 
 def second_place_candidates(root: Path, entries: tuple[IndexEntry, ...],
                             whitelist: tuple[str, ...] | None = None) -> tuple[IndexEntry, ...]:
-    """Кандидаты второго места: записи индекса и свёрнутые из белого списка."""
+    """Кандидаты второго места: записи индекса и свёрнутые из белого списка.
+    Имя, уже стоящее в индексе, второй раз не входит: двойник исказил бы
+    частоты BM25."""
     список = second_place_whitelist() if whitelist is None else whitelist
-    return tuple(entries) + (folded_entries(root, список) if список else ())
+    if not список:
+        return tuple(entries)
+    в_индексе = {e.slug for e in entries}
+    return tuple(entries) + tuple(e for e in folded_entries(root, список)
+                                  if e.slug not in в_индексе)
 
 
 def select_index_entries(
