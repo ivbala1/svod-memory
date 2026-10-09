@@ -360,7 +360,9 @@ def explain(
     преемник = mc.resolve_final_successor(найденный_корень, имя) if в_архиве else None
     if преемник == имя:
         преемник = None
-    доставка = not в_архиве and проиндексирована and просрочена is None
+    в_списке = (not в_архиве and найденный_корень == personal_root and файл_имя in {
+        e.slug for e in mc.folded_entries(найденный_корень, mc.second_place_whitelist())})
+    доставка = not в_архиве and (проиндексирована or в_списке) and просрочена is None
 
     # Запись без строки индекса может быть свёрнута в сводку темы, и после
     # переезда сводок каноническая формулировка живёт у владельца. Называть
@@ -397,6 +399,9 @@ def explain(
         причина = "в архиве без преемника"
     elif просрочена:
         причина = f"просрочена: {просрочена}"
+    elif в_списке:
+        причина = ("свёрнута, в белом списке второго места: приходит только вторым "
+                   f"местом с пометкой «{mc.FOLDED_MARK}»")
     elif not проиндексирована and свёрнута_в:
         причина = f"свёрнута в сводку {свёрнута_в}: канон формулировки в сводке темы"
     elif (not проиндексирована and найденный_корень == personal_root
@@ -532,16 +537,22 @@ def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
         части.append(f"- {d['score']:>3} memory/{d['slug']}{метка}: " + "; ".join(куски))
     if not any(d["score"] > 0 for d in разбор):
         части.append("- ни одна запись не набрала ни балла")
-    bm25 = mc.bm25_ranking(personal, prompt, записи)[:3]
+    кандидаты = mc.second_place_candidates(personal, записи)
+    свёрнутые = {e.slug for e in кандидаты if e.section == mc.FOLDED_SECTION}
+    пометка = lambda slug: f" ({mc.FOLDED_MARK})" if slug in свёрнутые else ""
+    bm25 = mc.bm25_ranking(personal, prompt, кандидаты)[:3]
     части.append(f"второе место, BM25 по телам (порог {mc.bm25_threshold(prompt):g}, разных "
                  f"ключей вопроса {mc.bm25_key_count(prompt)}: базовый {mc.BM25_THRESHOLD:g} "
-                 f"до {mc.BM25_LENGTH_NORM} ключей, дальше растёт пропорционально):")
+                 f"до {mc.BM25_LENGTH_NORM} ключей, дальше растёт пропорционально"
+                 + (f"; в кандидатах и свёрнутые из белого списка: {len(свёрнутые)}"
+                    if свёрнутые else "") + "):")
     for slug, счёт in bm25:
-        части.append(f"- {счёт:5.1f} memory/{slug}")
+        части.append(f"- {счёт:5.1f} memory/{slug}{пометка(slug)}")
     if not bm25:
         части.append("- совпадений нет")
     выдача = mc.select_index_entries(personal, prompt, записи, today=сегодня)
-    части.append("выдача: " + (", ".join(f"memory/{e.slug}" for e, _ in выдача) or "пусто"))
+    части.append("выдача: " + (", ".join(f"memory/{e.slug}{пометка(e.slug)}" for e, _ in выдача)
+                               or "пусто"))
     return "\n".join(части)
 
 

@@ -255,6 +255,7 @@ class Topics:
     drift: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...]
     budget: dict                                  # пороги индекса из topics.json
     archived: dict = field(default_factory=dict)  # сводки ушедших заказчиков
+    second_place: tuple = ()                      # белый список второго места
 
     def link_placement(self) -> dict[str, tuple[str, str | None]]:
         """Раскладка для ссылок и архива: действующие и архивные сводки."""
@@ -280,7 +281,8 @@ def load_topics(raw: bytes) -> Topics:
         drift.append((name, tuple(tokens), frozenset(entry.get("hotKeep") or ())))
     return Topics(specs=specs, placement=placement, drift=tuple(drift),
                   budget=dict(parsed.get("budget") or {}),
-                  archived=topiclayout.archived_from_config(parsed, label, placement))
+                  archived=topiclayout.archived_from_config(parsed, label, placement),
+                  second_place=mc.second_place_whitelist(parsed))
 
 
 def client_name(root: str) -> str | None:
@@ -836,7 +838,8 @@ def probe_errors(candidate: dict[str, bytes], *,
         if client is None:
             # Рабочий отбор роутера по выложенному дереву; записи индекса
             # готовые, одни на все крючки дерева.
-            chosen = mc.select_index_entries(laid_out, probe, entries, today=today)
+            chosen = mc.select_index_entries(laid_out, probe, entries, today=today,
+                                             whitelist=topics.second_place)
             found = f"{slug}.md" in {entry.slug for entry, _ in chosen}
             hint = "отбор роутера по индексу его не выбирает; перепиши крючок или строку index"
         elif spec is None:
@@ -1035,7 +1038,7 @@ def delivery_warnings(base: dict[str, bytes], candidate: dict[str, bytes], *,
 
 def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
                  today: dt.date, warnings: list[str],
-                 changed: set[str] = frozenset()) -> list[str]:
+                 changed: set[str] = frozenset(), whitelist: tuple = ()) -> list[str]:
     """Отказ только за свою запись: подача тронула ожидаемую запись вопроса,
     и та перестала находиться. Если новая запись перебила чужую или зацепила
     отрицательный вопрос, факт принимается с предупреждением: перебитую
@@ -1045,8 +1048,9 @@ def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
     import memoryeval
     data = json.loads(questions.decode("utf-8"))
     ожидаемые = {q["id"]: q["expect"] for q in data["questions"]}
-    after = memoryeval.stand(new_root, data, today=today)
-    before = memoryeval.stand(old_root, data, today=today) if old_root else after
+    after = memoryeval.stand(new_root, data, today=today, whitelist=whitelist)
+    before = (memoryeval.stand(old_root, data, today=today, whitelist=whitelist)
+              if old_root else after)
     verdict = memoryeval.pairwise(before, after)
     errors = [f"стенд: вопрос {item['id']} {item['why']}"
               for item in verdict["absolute"]]
@@ -1188,7 +1192,7 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
             # ищет; глобальный отдаётся контрактом целиком, клиентский
             # доставляется сводкой, его проверяют крючки.
             errors += stand_errors(old_root, new_root, config.questions, today, warnings,
-                                   changed_records(base, candidate))
+                                   changed_records(base, candidate), topics.second_place)
     if root == "global":
         errors += contract_errors(candidate)
         warnings += client_name_warnings(candidate, topics, svodgit.federation_members(config.topics))

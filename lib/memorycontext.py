@@ -314,6 +314,12 @@ def topics_from_config(raw, path) -> dict[str, TopicSpec]:
             owner = seen_aliases.setdefault(alias.casefold(), key)
             if owner != key:
                 raise MemoryctlError(f"{path}: алиас {alias!r} принадлежит и {owner}, и {key}")
+    личное = raw.get("personal", {})
+    список = личное.get("secondPlaceWhitelist", []) if isinstance(личное, dict) else None
+    if not isinstance(список, list) or any(
+            not isinstance(v, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", v) for v in список):
+        raise MemoryctlError(f"{path}: personal.secondPlaceWhitelist должен быть списком "
+                             "имён записей без .md")
 
     result: dict[str, TopicSpec] = {}
     for key in order:
@@ -822,8 +828,49 @@ def bm25_threshold(prompt: str) -> float:
 
 def bm25_ranking(root: Path, prompt: str,
                  entries: tuple[IndexEntry, ...]) -> list[tuple[str, float]]:
-    """BM25 по записям индекса: второе место в выдаче."""
+    """BM25 по данным записям; второму месту их даёт second_place_candidates."""
     return bm25_over(root, prompt, tuple((e.slug, e.label, e.summary) for e in entries))
+
+
+# Свёрнутые записи из белого списка второго места (topics.json,
+# personal.secondPlaceWhitelist; решение владельца 09.10.2026, этап 1 политики
+# роста): BM25 по телам видит их наравне с индексом, первое место, каталог
+# владельца и проверка крючков нет. Свёрнутая запись вне списка остаётся
+# поиску по корпусу. Пустой список это прежнее поведение и откат.
+FOLDED_SECTION = "Свёрнутые"
+FOLDED_MARK = "свёрнутая запись вне индекса, проверь, действует ли"
+
+
+def second_place_whitelist(config: dict | None = None) -> tuple[str, ...]:
+    """Белый список из разобранного topics.json (по умолчанию этого процесса);
+    форму проверяет topics_from_config."""
+    личное = (TOPICS_CONFIG if config is None else config).get("personal") or {}
+    return tuple(личное.get("secondPlaceWhitelist") or ())
+
+
+@functools.lru_cache(maxsize=4)
+def folded_entries(root: Path, whitelist: tuple[str, ...]) -> tuple[IndexEntry, ...]:
+    """Записи белого списка, которые сейчас свёрнуты. Вернувшаяся в индекс
+    уже кандидат, удалённая или ушедшая в архив выпадает сама, истёкший срок
+    отсекает отбор. Кэш на процесс, как у _bm25_documents: писатель зовёт
+    отбор на каждый крючок дерева."""
+    итог: list[IndexEntry] = []
+    for имя in whitelist:
+        if (root / "memory" / f"{имя}.md").is_symlink():
+            continue
+        поля = parse_frontmatter(_record_text(root, f"{имя}.md"))[0]
+        if поля.get("listed") != "false" or record_index_line("", {**поля, "listed": ""}) is None:
+            continue
+        итог.append(IndexEntry(FOLDED_SECTION, _clean_inline(поля["title"]), f"{имя}.md",
+                               _clean_inline(поля["index"]), 10**6 + len(итог)))
+    return tuple(итог)
+
+
+def second_place_candidates(root: Path, entries: tuple[IndexEntry, ...],
+                            whitelist: tuple[str, ...] | None = None) -> tuple[IndexEntry, ...]:
+    """Кандидаты второго места: записи индекса и свёрнутые из белого списка."""
+    список = second_place_whitelist() if whitelist is None else whitelist
+    return tuple(entries) + (folded_entries(root, список) if список else ())
 
 
 def select_index_entries(
@@ -832,6 +879,7 @@ def select_index_entries(
     entries: tuple[IndexEntry, ...],
     *,
     today: dt.date | None = None,
+    whitelist: tuple[str, ...] | None = None,
 ) -> tuple[tuple[IndexEntry, int], ...]:
     """Отбор записей для доставки: два места, и достаются они по-разному.
 
@@ -847,6 +895,10 @@ def select_index_entries(
     максимальным счётом не вытесняет действующую. frontmatter читается только у
     верхних кандидатов, не у всего корпуса. review_after здесь не участвует
     (R8): он не скрывает запись и не меняет её счёт.
+
+    Второе место видит и свёрнутые записи белого списка (`whitelist`, по
+    умолчанию из topics.json этого процесса; проверки кандидата передают
+    свою версию конфигурации).
     """
     сегодня = today if today is not None else today_utc()
     выбрано: list[tuple[IndexEntry, int]] = []
@@ -860,9 +912,10 @@ def select_index_entries(
         выбрано.append((entry, score))
         break
     занято = {entry.slug for entry, _ in выбрано}
-    по_слагу = {e.slug: e for e in entries}
+    кандидаты = second_place_candidates(root, entries, whitelist)
+    по_слагу = {e.slug: e for e in кандидаты}
     порог = bm25_threshold(prompt)
-    for slug, счёт in bm25_ranking(root, prompt, entries):
+    for slug, счёт in bm25_ranking(root, prompt, кандидаты):
         if счёт < порог or slug in занято:
             continue
         entry = по_слагу[slug]
@@ -901,7 +954,8 @@ def _entry_block(root: Path, entry: IndexEntry, maximum: int = 2_400) -> str | N
     if target is None or not target.is_file():
         return None
     body = body_without_frontmatter(_read_limited(target)).strip()
-    heading = f"[Совпавшая запись индекса: {entry.label}]\nИсточник: memory/{entry.slug}"
+    вид = FOLDED_MARK if entry.section == FOLDED_SECTION else "запись индекса"
+    heading = f"[Совпавшая {вид}: {entry.label}]\nИсточник: memory/{entry.slug}"
     if entry.summary:
         heading += f"\nРезюме индекса: {entry.summary}"
     return _clip_block(f"{heading}\n\n{body}", maximum, f"memory/{entry.slug}")
@@ -1690,8 +1744,11 @@ def _nonproject_context(
                 if record_keys is not None:
                     ключ = hashlib.sha256(parts[-1].encode("utf-8")).hexdigest()[:16]
                     if record_keys.get(entry.slug) == ключ:
-                        parts[-1] = (f"[Совпавшая запись индекса уже в контексте: memory/{entry.slug}, "
-                                     "текст выше в этой сессии не менялся; если его выше нет "
+                        свёрнута = entry.section == FOLDED_SECTION
+                        вид = "свёрнутая запись вне индекса" if свёрнута else "запись индекса"
+                        проверка = "проверь, действует ли; " if свёрнута else ""
+                        parts[-1] = (f"[Совпавшая {вид} уже в контексте: memory/{entry.slug}, "
+                                     f"{проверка}текст выше в этой сессии не менялся; если его выше нет "
                                      f"(правка или откат реплики), прочитай {root / 'memory' / entry.slug}]")
                     record_keys[entry.slug] = ключ
                 included.append(entry.slug)

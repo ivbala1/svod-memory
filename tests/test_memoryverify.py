@@ -313,6 +313,27 @@ class ProbeTests(unittest.TestCase):
         for вызов in ranked.call_args_list:
             self.assertIs(вызов.args[2], первый)
 
+    def test_probes_and_stand_use_whitelist_of_config_version(self):
+        """Второе место писателя и стенда видит белый список своей версии
+        конфигурации, а не живого файла: иначе крючок прошёл бы у писателя и
+        не сработал у роутера. Битый список отказывает словами."""
+        import memorycontext as mc
+        raw = json.dumps(dict(TOPICS, personal={"secondPlaceWhitelist": ["reference_old"]}),
+                         ensure_ascii=False).encode("utf-8")
+        self.assertEqual(mv.load_topics(raw).second_place, ("reference_old",))
+        with Scanner(0) as scanner, mock.patch.object(
+                mc, "select_index_entries", wraps=mc.select_index_entries) as ranked:
+            mv.check(self._tree("чем чинить принтер зелёного цвета"), base_tree(),
+                     root="personal", config=mv.Config(topics=raw, questions=QUESTIONS_RAW),
+                     today=TODAY, scanner=scanner)
+        self.assertGreater(ranked.call_count, 1)
+        for вызов in ranked.call_args_list:
+            self.assertEqual(вызов.kwargs.get("whitelist"), ("reference_old",))
+        for плохой in ("reference_old", ["reference_old.md"], [5]):
+            with self.subTest(список=плохой), self.assertRaises(mc.MemoryctlError):
+                mv.load_topics(json.dumps(dict(TOPICS, personal={
+                    "secondPlaceWhitelist": плохой})).encode("utf-8"))
+
     def test_client_probe_through_topic_delivery(self):
         rollup = ("# Acme\n\n## Обзор\n\nУстройство системы.\n\n"
                   "## Доступы\n\nSSH идёт через бастион, см. [[reference_acme_bastion]].\n")

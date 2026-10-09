@@ -187,7 +187,8 @@ def delivered_text(root: Path, prompt: str, записи, отобрано) -> s
     return текст
 
 
-def stand(root: Path, questions: dict, *, today=None, ранжировать=None) -> dict:
+def stand(root: Path, questions: dict, *, today=None, ранжировать=None,
+          whitelist=None) -> dict:
     """Чистый прогон стенда по одному выложенному дереву: результат ПО
     КАЖДОМУ вопросу. Ничего живого не читает; проверки кандидата
     (memoryverify) зовут его по обеим сторонам."""
@@ -196,7 +197,7 @@ def stand(root: Path, questions: dict, *, today=None, ранжировать=Non
         # (R7), а не голое ранжирование: иначе зелёный стенд мог бы скрыть
         # запись, отфильтрованную настоящим читателем.
         ранжировать = lambda prompt, записи: mc.select_index_entries(
-            root, prompt, записи, today=today)
+            root, prompt, записи, today=today, whitelist=whitelist)
     записи = mc.parse_index(mc.build_index(root))
 
     по_вопросам = {}
