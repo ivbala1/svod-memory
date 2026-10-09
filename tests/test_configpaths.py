@@ -105,16 +105,6 @@ class КореньДанных(unittest.TestCase):
                 os.environ["MEMORY_REPO"] = прежний
 
 
-class СтрокаИндекса(unittest.TestCase):
-    """Слаг строки-указателя: строка без ссылки на запись слага не имеет."""
-
-    def test_слаг_строки(self):
-        import memoryremember
-        self.assertEqual(memoryremember.index_line_slug("- [Х](foo_bar.md) - о чём"),
-                         "foo_bar")
-        self.assertIsNone(memoryremember.index_line_slug("голый текст"))
-
-
 class ПересдачаТочки(unittest.TestCase):
     def test_history_is_git_and_unrelated_index_is_preserved(self):
         with tempfile.TemporaryDirectory() as d:

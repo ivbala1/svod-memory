@@ -59,6 +59,11 @@ BODY_LIMIT = SOFT_CONTEXT_LIMIT
 SECTION_CAP_HOWTO = 1_200
 SECTION_CAP_MANDATORY = 2_500
 SECTION_CAP_RELEVANT = 3_400
+# Список записей раздела заказчика (поле section шапки) собирается при выдаче:
+# столько лучших под реплику, остальные называются строкой поиска. Потолок
+# раздела к списку не относится: список стоит под заголовком, потолок режет
+# прозу. Общий бюджет выдачи может срезать хвост последнего раздела целиком.
+SECTION_LIST_LIMIT = 6
 PERSONAL_INBOX_CAP = 2_600
 # Личный режим сессии. Не пробел и не ошибка, а осознанный выбор: в нём можно
 # обсуждать хоть все проекты сразу, и роллап заказчика не подмешивается.
@@ -1400,7 +1405,7 @@ def scan_code_fences(lines) -> tuple[list[bool], bool]:
 def parse_sections(text: str) -> tuple[MarkdownSection, ...]:
     """Разделы по заголовкам `## `; строка `## …` внутри ограждённого кода
     заголовком не считается, иначе хвост раздела уезжал бы в раздел-призрак,
-    который роутер никогда не выберет. Та же маска у писателя указателей."""
+    который роутер никогда не выберет."""
     lines = text.splitlines(keepends=True)
     fenced = scan_code_fences(lines)[0]
     starts = [index for index, line in enumerate(lines)
@@ -1538,8 +1543,10 @@ def topic_preamble(
     # против shell). В теле она по замыслу, но бюджет разделов от неё
     # зависеть не должен: иначе на границе один вызывающий получает лишний
     # раздел, а другой нет, и выдачи расходятся не только шапкой. Возвращаем
-    # её длину в бюджет.
-    поправка = len(route_source)
+    # её длину в бюджет. То же с путём сводки и ревизией: проверка писателя
+    # собирает выдачу над временным каталогом без ревизии, и на границе
+    # бюджета ссылка доезжала бы в проверке, но не в живой выдаче.
+    поправка = len(route_source) + len(str(topic_path)) + len(revision[:12])
     if full_context:
         parts = [
             "[Канонический контекст общей памяти]",
@@ -1594,6 +1601,41 @@ def selectable_sections(
     )
 
 
+def section_records(owner_root: Path) -> dict[str, tuple[IndexEntry, ...]]:
+    """Записи корня-владельца сводки по полю section шапки: заголовок раздела
+    (casefold) -> записи. Только memory/*.md этого корня: запись другого
+    корня с тем же section в список чужой сводки не попадает."""
+    разделы: dict[str, list[IndexEntry]] = {}
+    for файл in sorted((owner_root / "memory").glob("*.md")):
+        if файл.name == "MEMORY.md" or файл.is_symlink():
+            continue
+        try:
+            поля = parse_frontmatter(_read_limited(файл, HEADER_READ_LIMIT))[0]
+        except (OSError, UnicodeError):
+            continue
+        раздел = поля.get("section", "").strip().casefold()
+        if раздел:
+            свои = разделы.setdefault(раздел, [])
+            свои.append(IndexEntry(раздел, _clean_inline(поля.get("title", "")), файл.name,
+                                   _clean_inline(поля.get("index", "")), len(свои)))
+    return {раздел: tuple(свои) for раздел, свои in разделы.items()}
+
+
+def section_list(owner_root: Path, records: tuple[IndexEntry, ...], prompt: str,
+                 scope: str) -> str:
+    """Список записей раздела под реплику: счёт первого места, при равенстве
+    BM25 по телам записей этого раздела, затем имя. Порогов нет, только
+    порядок: раздел уже выбран терминами."""
+    bm25 = dict(bm25_ranking(owner_root, prompt, records))
+    порядок = sorted(records, key=lambda e: (-_entry_score(prompt, e), -bm25.get(e.slug, 0.0),
+                                             e.slug))
+    строки = [f"- [[{e.slug[:-3]}]] {e.label}".rstrip() for e in порядок[:SECTION_LIST_LIMIT]]
+    if len(порядок) > SECTION_LIST_LIMIT:
+        строки.append(f"- ещё {len(порядок) - SECTION_LIST_LIMIT}: "
+                      f'memory search --scope {scope} "вопрос"')
+    return "Записи раздела:\n" + "\n".join(строки)
+
+
 def _topic_context(
     root: Path,
     spec: TopicSpec,
@@ -1638,13 +1680,25 @@ def _topic_context(
     )
     included, dropped = [], []
     delivered = set()
+    # Список записей раздела берётся из корня той же сводки (topic_path это
+    # <корень>/memory/topics/<файл>) и встаёт под заголовок: бюджет режет
+    # хвост прозы, а не ссылки.
+    owner_root = topic_path.parents[2]
+    по_разделам = section_records(owner_root)
     # Порог берём через section_cap в обоих циклах, а не литералом во втором.
     # Иначе раздел, попавший в defaults и одновременно обязательный, уехал бы
     # дважды и со слабым порогом 3400 вместо своего 2500.
     for section in mandatory + tuple(s for s in relevant if s not in mandatory):
         if section.title in delivered:
             continue
-        if _append_with_budget(parts, section.text, section_cap(section), relative_source, budget=budget):
+        текст, предел = section.text, section_cap(section)
+        записи = по_разделам.get(section.title.casefold())
+        if записи:
+            список = section_list(owner_root, записи, prompt, spec.scope)
+            заголовок, _, проза = section.text.partition("\n")
+            текст = f"{заголовок}\n{список}\n\n{проза.strip()}".rstrip()
+            предел += len(текст) - len(section.text)
+        if _append_with_budget(parts, текст, предел, relative_source, budget=budget):
             included.append(section.title)
             delivered.add(section.title)
         else:

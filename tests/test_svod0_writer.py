@@ -242,6 +242,9 @@ class Base(unittest.TestCase):
 
 NEW_BODY = fresh_record("reference_kettle", "как кипятить воду в чайнике",
                         "кипятить воду чайник", "Чайник кипятит воду.\n")
+ACME_VPN = record("acme_vpn", type="project", title="VPN Acme", index="vpn acme",
+                  source="разговор", observed_at="2026-09-04", section="Доступы",
+                  probe="как попасть в сеть заказчика по ssh", body="Доступ через бастион.\n")
 
 
 class WriterTests(Base):
@@ -476,34 +479,32 @@ class WriterTests(Base):
         self.assertFalse(mr.reached(root, {"commit": "0" * 40, "result": {}}, remote),
                          "пустой diff доставкой не считается")
 
-    def test_client_record_gets_pointer_in_rollup_section(self):
-        body = record("acme_vpn", type="project", title="VPN Acme", index="vpn acme",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="как попасть в сеть заказчика по ssh", listed="false",
-                      body="Доступ по ssh через бастион.\n")
-        projection = {"record_slug": "acme_vpn", "index_section": "Доступы",
-                      "index_line": "- [[acme_vpn]] ssh через бастион"}
-        code, result = self.fed.remember("a", "clients/acme", "acme-vpn-1", body, projection)
+    def test_client_record_names_its_section_and_the_rollup_stays(self):
+        code, result = self.fed.remember("a", "clients/acme", "acme-vpn-1", ACME_VPN,
+                                         {"record_slug": "acme_vpn"})
         self.assertEqual(result["state"], "saved", result)
         tree = self.fed.origin_tree("clients/acme")
         self.assertIn("memory/acme_vpn.md", tree)
-        rollup = tree["memory/topics/acme.md"].decode()
-        self.assertIn("## Доступы\n\nПо ssh.\n- [[acme_vpn]] ssh через бастион\n", rollup)
+        self.assertEqual(tree["memory/topics/acme.md"].decode(),
+                         "# Acme\n\n## Обзор\n\nЗаказчик Acme.\n\n## Доступы\n\nПо ssh.\n")
         self.assertNotIn("memory/acme_vpn.md", self.fed.origin_tree("personal"))
 
-    def test_client_record_without_pointer_or_section_refused(self):
+    def test_client_record_without_or_with_unknown_section_refused(self):
         body = record("acme_vpn", type="project", title="VPN", index="vpn",
                       source="разговор", observed_at="2026-09-04", probe="как в сеть",
                       body="Факт.\n")
         code, result = self.fed.remember("a", "clients/acme", "acme-1", body,
                                          {"record_slug": "acme_vpn"})
         self.assertEqual(code, mr.EXIT_FAILED)
-        self.assertIn("указатель", result["reason"])
-        code, result = self.fed.remember("a", "clients/acme", "acme-2", body,
-                                         {"record_slug": "acme_vpn", "index_section": "Нет такого",
-                                          "index_line": "- [[acme_vpn]] x"})
-        self.assertEqual(code, mr.EXIT_FAILED)
-        self.assertIn("раздела", result["reason"])
+        self.assertIn("полем section", result["reason"])
+        code, result = self.fed.remember("a", "clients/acme", "acme-2",
+                                         ACME_VPN.replace("Доступы".encode(), "Нет такого".encode()),
+                                         {"record_slug": "acme_vpn"})
+        self.assertIn("раздела «Нет такого» нет", result["reason"])
+        code, result = self.dry("a", "clients/acme", "acme-3", ACME_VPN,
+                                {"record_slug": "acme_vpn", "index_section": "Доступы",
+                                 "index_line": "- [[acme_vpn]] x"})
+        self.assertIn("--section и --line сняты", result["reason"])
 
     def test_manifest_put_and_remove_with_base_revision(self):
         root = self.fed.root("a")
@@ -1097,13 +1098,8 @@ class SplitTests(Base):
                                       {"record_slug": "reference_kettle"})
         self.assertEqual(code, mr.EXIT_ERROR, res)
         self.assertIn("нет на этой машине", res["reason"])
-        body = record("acme_vpn", type="project", title="VPN Acme", index="vpn acme",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="как попасть в сеть заказчика по ssh", listed="false",
-                      body="Доступ по ssh через бастион.\n")
-        projection = {"record_slug": "acme_vpn", "index_section": "Доступы",
-                      "index_line": "- [[acme_vpn]] ssh через бастион"}
-        code, res = self.fed.remember("c", "clients/acme", "acme-vpn-1", body, projection)
+        code, res = self.fed.remember("c", "clients/acme", "acme-vpn-1", ACME_VPN,
+                                      {"record_slug": "acme_vpn"})
         self.assertEqual(res["state"], "saved", res)
         outcomes = ms.sync_all(data_root=data, today=TODAY, state=self.fed.states["c"])
         self.assertEqual({o["scope"] for o in outcomes}, {"global", "clients/acme"})
@@ -1193,9 +1189,7 @@ class ReviewRegressionTests(Base):
                            "rollup broken", no_verify=True)
         code, result = self.fed.remember(
             "a", "clients/acme", "acme-1",
-            fresh_record("reference_gate", "как открыть ворота", "открыть ворота", "Кодом.\n"),
-            {"record_slug": "reference_gate", "index_line": "- [Ворота](reference_gate.md) - как открыть",
-             "index_section": "Обзор"})
+            ACME_VPN, {"record_slug": "acme_vpn"})
         self.assertEqual(code, mr.EXIT_FAILED, result)
         self.assertIn("проверка не выполнилась", result["reason"])
         self.assertEqual(len(self.failed("a", "clients/acme")), 1)
@@ -1215,30 +1209,6 @@ class ReviewRegressionTests(Base):
         self.assertEqual(code, mr.EXIT_FAILED, result)
         self.assertNotIn("file", result, "небезопасный id файла не получает")
         self.assertEqual(self.failed("a"), [])
-
-    def test_pointer_lands_in_the_named_section_and_leaves_the_rest_alone(self):
-        rollup = "# Acme\n\n## Обзор\n\nЗаказчик.\n\n## Доступы\n\n- [Ворота](reference_gate.md) - старый\n"
-        new, слова = mr.insert_rollup_pointer(rollup, "Обзор", "- [Ворота](reference_gate.md) - новый")
-        # Строка в чужом разделе остаётся на месте и называется словами:
-        # молчаливое удаление теряло принятые факты заказчика.
-        self.assertIn("- [Ворота](reference_gate.md) - старый", new)
-        self.assertIn("- [Ворота](reference_gate.md) - новый", new)
-        self.assertTrue(any("упомянута ещё в разделах" in w and "Доступы" in w for w in слова), слова)
-        same, слова = mr.insert_rollup_pointer(rollup, "Доступы",
-                                               "- [Ворота](reference_gate.md) - новый")
-        self.assertIn("- новый\n", same)
-        self.assertNotIn("- старый", same)
-        self.assertTrue(any("заменена прежняя строка" in w for w in слова), слова)
-        with self.assertRaises(mr.Refusal):
-            mr.insert_rollup_pointer(rollup, "Нет такого", "- [Ворота](reference_gate.md) - новый")
-
-    def test_prose_that_merely_links_the_record_survives(self):
-        rollup = ("# Acme\n\n## Обзор\n\nСхему сети смотреть в [[acme_dns]], она главная.\n"
-                  "\n## Доступы\n\nПо ssh.\n")
-        new, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] доступ по ssh")
-        self.assertIn("Схему сети смотреть в [[acme_dns]], она главная.", new)
-        self.assertIn("- [[acme_dns]] доступ по ssh", new)
-        self.assertTrue(слова)
 
     def test_base_is_taken_from_main_not_from_a_detached_head(self):
         root_a = self.fed.root("a")
@@ -1388,13 +1358,6 @@ class CodexRoundTests(Base):
         self.assertEqual([c["state"] for c in outcome["candidates"]], ["delivered"], outcome)
         self.assertIn("memory/reference_kettle.md", self.fed.origin_tree())
 
-    def test_pointer_lands_after_the_last_line_of_the_section(self):
-        rollup = "## A\nfirst\nlast\n## B\n- [x](reference_x.md) - старый\n"
-        moved, _ = mr.insert_rollup_pointer(rollup, "A", "- [x](reference_x.md) - новый")
-        self.assertEqual(moved,
-                         "## A\nfirst\nlast\n- [x](reference_x.md) - новый\n"
-                         "## B\n- [x](reference_x.md) - старый\n")
-
     def test_fenced_examples_are_neither_sections_nor_pointers(self):
         import memorycontext as mc
         text = ("## Обзор\n\n````md\n```\n## пример\n- [x](reference_x.md) - пример\n```\n````\n"
@@ -1402,9 +1365,6 @@ class CodexRoundTests(Base):
         sections = mc.parse_sections(text)
         self.assertEqual([s.title for s in sections], ["Обзор", "Доступы"])
         self.assertIn("хвост", sections[0].text)
-        moved, _ = mr.insert_rollup_pointer(text, "Доступы", "- [x](reference_x.md) - новый")
-        self.assertIn("- [x](reference_x.md) - пример\n", moved, "пример в коде не тронут")
-        self.assertTrue(moved.endswith("ssh\n- [x](reference_x.md) - новый\n"), moved)
 
     def test_unwritable_lock_file_does_not_stop_a_reader(self):
         import memoryctl
@@ -1444,12 +1404,10 @@ class CodexRoundTests(Base):
         self.assertFalse(svodgit.engine_rebase_marker(root_b).exists())
         self.assertEqual(svodgit.branch(root_b), "main")
 
-    def test_fence_opener_with_backtick_in_info_is_text_and_unclosed_fence_refuses(self):
+    def test_fence_opener_with_backtick_in_info_is_text(self):
         import memorycontext as mc
         sections = mc.parse_sections("## A\n```foo`bar\n## B\ntext\n")
         self.assertEqual([s.title for s in sections], ["A", "B"])
-        with self.assertRaises(mr.Refusal):
-            mr.insert_rollup_pointer("## A\n```\nкод без конца\n", "A", "- [x](reference_x.md) - новый")
 
 
 class CleanupTests(Base):
@@ -1622,14 +1580,6 @@ class ViolationListTests(Base):
         self.assertIn("--record", result["reason"])
         self.assertIn("дальше не проверялось", result["reason"])
 
-    def test_pointer_names_missing_link_and_missing_section(self):
-        with self.assertRaises(mr.Refusal) as caught:
-            mr.insert_rollup_pointer("# Тема\n\n## Обзор\n\nТекст.\n",
-                                     "Нет такого", "- строка без ссылки")
-        words = str(caught.exception)
-        self.assertIn("без ссылки", words)
-        self.assertIn("раздела", words)
-
     def test_bad_path_names_both_place_and_extension(self):
         manifest = json.dumps({"changes": [
             {"operation": "put", "path": "other/x.txt", "content": "x\n"}]})
@@ -1657,21 +1607,17 @@ class OneCommandTests(Base):
         self.assertEqual(json.loads(done.stdout)["state"], "saved", done.stdout)
         self.assertEqual(self.fed.origin_tree()["memory/reference_kettle.md"], NEW_BODY)
 
-    def test_client_pointer_is_two_more_flags(self):
+    def test_client_record_needs_only_the_record_flag(self):
         env = dict(os.environ, MEMORY_REPO=str(self.fed.machines["a"]),
                    MEMORYCTL_STATE_DIR=str(self.fed.states["a"]))
         body = self.fed.base / "acme-vpn.md"
-        body.write_bytes(record("acme_vpn", type="project", title="VPN", index="vpn acme",
-                                source="разговор", observed_at="2026-09-04",
-                                probe="какой доступ в сеть acme", body="Через ssh.\n"))
+        body.write_bytes(ACME_VPN)
         done = subprocess.run([sys.executable, str(REPO_SOURCE / "bin" / "memory"), "remember",
                                "--scope", "clients/acme", "--id", "acme-flag", "--json",
-                               "--file", str(body), "--record", "acme_vpn",
-                               "--section", "Доступы", "--line", "- [[acme_vpn]] доступ по ssh"],
+                               "--file", str(body), "--record", "acme_vpn"],
                               env=env, text=True, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        rollup = self.fed.origin_tree("clients/acme")["memory/topics/acme.md"].decode("utf-8")
-        self.assertIn("- [[acme_vpn]] доступ по ssh", rollup)
+        self.assertIn("memory/acme_vpn.md", self.fed.origin_tree("clients/acme"))
 
     def test_manifest_change_may_name_a_local_file(self):
         source = self.fed.base / "kettle-body.md"
@@ -1962,7 +1908,7 @@ class LateReviewFixTests(Base):
                                 {"record_slug": "Не Slug", "index_section": "Reference",
                                  "index_line": "- [Чайник](reference_kettle.md) - как кипятить"})
         self.assertEqual(code, mr.EXIT_FAILED)
-        self.assertIn("только у клиентской записи", result["reason"])
+        self.assertIn("--section и --line сняты", result["reason"])
         self.assertIn("--record", result["reason"])
 
     def test_personal_record_with_unclosed_header_is_refused_by_the_check(self):
@@ -1972,39 +1918,6 @@ class LateReviewFixTests(Base):
                                   {"record_slug": "reference_kettle"})
             self.assertEqual(code, mr.EXIT_FAILED, result)
             self.assertIn("memory/reference_kettle.md: unclosed frontmatter", result["reason"])
-
-    def test_delivery_proof_covers_the_rollup_pointer(self):
-        body = record("acme_vpn", type="project", title="VPN", index="vpn acme",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="какой доступ в сеть acme", body="Через ssh.\n")
-        code, result = self.fed.remember(
-            "a", "clients/acme", "acme-1", body,
-            {"record_slug": "acme_vpn", "index_section": "Доступы",
-             "index_line": "- [[acme_vpn]] доступ по ssh"})
-        self.assertEqual(result["state"], "saved", result)
-        candidate = svodgit.read_json(
-            svodgit.failed_dir("clients/acme", self.fed.states["a"]) / "нет.json")
-        self.assertIsNone(candidate)
-        # Кандидат уже снят, поэтому доказательство проверяем прямо: результат
-        # прохода обязан покрывать и запись, и сводку темы.
-        path, cand = mr.submit(scope="clients/acme", candidate_id="acme-2", source="t",
-                               session="s", content_type="markdown",
-                               body=record("acme_dns", type="project", title="DNS",
-                                           index="dns acme", source="разговор",
-                                           observed_at="2026-09-04",
-                                           probe="какой доступ к dns acme",
-                                           body="Через ssh.\n"),
-                               projection={"record_slug": "acme_dns",
-                                           "index_section": "Доступы",
-                                           "index_line": "- [[acme_dns]] доступ к dns"},
-                               root=self.fed.root("a", "clients/acme"),
-                               state=self.fed.states["a"])
-        with svodgit.lock(self.fed.root("a", "clients/acme"), exclusive=True):
-            mr.apply(path, cand, root=self.fed.root("a", "clients/acme"), scope="clients/acme",
-                     config=self.fed.verify_config, today=TODAY, state=self.fed.states["a"])
-        self.assertIn("memory/topics/acme.md", cand["result"])
-        self.assertIn("memory/acme_dns.md", cand["result"])
-
 
 class SecondRoundFixTests(Base):
     """Находки второго круга разбора."""
@@ -2048,16 +1961,6 @@ class SecondRoundFixTests(Base):
 class ThirdRoundFixTests(Base):
     """Находки третьего круга разбора."""
 
-    def test_pointer_to_another_record_is_refused(self):
-        body = record("acme_vpn", type="project", title="VPN", index="vpn acme",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="какой доступ в сеть acme", body="Через ssh.\n")
-        code, result = self.dry("a", "clients/acme", "acme-wrong", body,
-                                {"record_slug": "acme_vpn", "index_section": "Доступы",
-                                 "index_line": "- [[acme_dns]] чужая запись"})
-        self.assertEqual(code, mr.EXIT_FAILED)
-        self.assertIn("со ссылкой на запись acme_vpn", result["reason"])
-
     def test_same_base_written_short_and_full_is_one_base(self):
         root = self.fed.root("a")
         полная = svodgit.head(root)
@@ -2093,43 +1996,6 @@ class ThirdRoundFixTests(Base):
         self.assertIn("дважды и по-разному", result["reason"])
 
 
-class FourthRoundFixTests(Base):
-    """Находки четвёртого круга: указатель узнаётся строго."""
-
-    def test_replacing_inside_the_named_section_says_what_was_replaced(self):
-        """В названном разделе замена это обычный ход: в живых сводках
-        указатель и есть абзац с фактами. Но автор обязан увидеть, что
-        именно уехало."""
-        rollup = ("# Acme\n\n## Доступы\n\nСхему сети смотреть в [[acme_dns]], "
-                  "она главная: эпик ACME-12.\n")
-        new, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] доступ по ssh")
-        self.assertIn("- [[acme_dns]] доступ по ssh", new)
-        self.assertNotIn("эпик ACME-12", new)
-        self.assertTrue(any("заменена прежняя строка" in w and "ACME-12" in w for w in слова), слова)
-
-    def test_a_strict_pointer_wins_over_prose_inside_the_section(self):
-        rollup = ("# Acme\n\n## Доступы\n\nСхему сети смотреть в [[acme_dns]], эпик ACME-12.\n"
-                  "- [[acme_dns]] старый крючок\n")
-        new, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] новый крючок")
-        self.assertIn("эпик ACME-12", new)
-        self.assertIn("- [[acme_dns]] новый крючок", new)
-        self.assertNotIn("старый крючок", new)
-
-    def test_a_real_pointer_inside_the_section_is_replaced_in_place(self):
-        rollup = "# Acme\n\n## Доступы\n\n- [[acme_dns]] старый текст\n"
-        new, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] новый текст")
-        self.assertIn("новый текст", new)
-        self.assertNotIn("старый текст", new)
-        self.assertTrue(any("заменена прежняя строка" in w for w in слова), слова)
-
-    def test_section_names_in_notes_are_counted_before_editing(self):
-        rollup = ("# Acme\n\n## Обзор\n\nПро [[acme_dns]] сказано тут.\n"
-                  "\n## Доступы\n\nПо ssh.\n")
-        new, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] доступ по ssh")
-        self.assertTrue(any("«Обзор»" in w for w in слова), слова)
-        self.assertNotIn("«Доступы»", " ".join(слова))
-
-
 class OctoberReviewTests(Base):
     """Ревью 06.10.2026: отказ «похоже на секрет» не хранит тело в failed/."""
 
@@ -2163,83 +2029,58 @@ class ManifestFileTests(Base):
         self.assertNotIn("не читается", result["reason"])
 
 
-class LinkOwnerTests(Base):
-    """Владелец строки это самая левая ссылка, а не первая markdown."""
+class SectionFieldTests(Base):
+    """Этап 3 политики роста: раздел записи заказчика в шапке, список при выдаче."""
 
-    def test_leftmost_link_decides_the_owner_of_the_line(self):
-        self.assertEqual(mr.index_line_slug("- [[наша]] и потом [отчёт](other.md)"), "наша")
-        self.assertEqual(mr.index_line_slug("- [отчёт](other.md) и потом [[наша]]"), "other")
-        self.assertIsNone(mr.index_line_slug("- просто текст"))
+    def test_list_goes_under_the_heading_ranked_capped_and_own_root_only(self):
+        import memorycontext as mc
+        data = self.fed.machines["a"]
+        for i in range(8):
+            (data / "clients/acme/memory" / f"acme_r{i}.md").write_bytes(
+                record(f"acme_r{i}", title=f"Запись {i}", index="запись", section="Доступы"))
+        (data / "clients/acme/memory/acme_router.md").write_bytes(
+            record("acme_router", title="Роутер филиала", index="роутер", section="доступы"))
+        (data / "personal/memory/acme_foreign.md").write_bytes(
+            record("acme_foreign", title="Роутер чужой", index="роутер", section="Доступы"))
+        (data / "clients/acme/memory/topics/acme.md").write_text(
+            "# Acme\n\n## Обзор\n\nЗаказчик.\n\n## Доступы\n\nПо ssh, см. [[acme_old]].\n")
+        spec = mv.load_topics(self.fed.verify_config.topics).specs["acme"]
+        области = {"clients/acme": data / "clients/acme", "personal": data / "personal"}
+        with mock.patch.object(mc, "reader_federation", return_value=области):
+            text, _ = mc._topic_context(data, spec, mc.RouteDecision("clients/acme", "t"),
+                                        "доступ к роутеру", "", "", full_context=True,
+                                        include_hot=False)
+        self.assertIn("## Доступы\nЗаписи раздела:\n- [[acme_router]] Роутер филиала\n"
+                      "- [[acme_r0]] Запись 0\n", text)
+        self.assertIn("- [[acme_r4]] Запись 4\n- ещё 3: memory search --scope acme", text)
+        self.assertIn("По ssh, см. [[acme_old]].", text, "прежняя проза со ссылкой едет")
+        self.assertNotIn("acme_foreign", text)
 
-    def test_rich_pointer_line_is_accepted_by_submission(self):
-        body = record("acme_vpn", type="project", title="VPN", index="vpn acme",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="какой доступ в сеть acme", body="Через ssh.\n")
-        code, result = self.dry(
-            "a", "clients/acme", "acme-rich", body,
-            {"record_slug": "acme_vpn", "index_section": "Доступы",
-             "index_line": "- **Доступ по ssh (10.09.2026):** через бастион, детали в [[acme_vpn]]."})
-        self.assertEqual(code, mr.EXIT_SAVED, result)
-
-    def test_pointer_is_only_a_list_item_that_starts_with_the_link(self):
-        self.assertEqual(mr.pointer_slug("- [[наша]] чем полезна"), "наша")
-        self.assertEqual(mr.pointer_slug("  * [Имя](наша.md) - чем полезна"), "наша")
-        self.assertIsNone(mr.pointer_slug("Про [[наша]] сказано в тексте."))
-        self.assertIsNone(mr.pointer_slug("- текст, а ссылка [[наша]] в середине"))
-        # Пункт-задача открывается скобкой, но не ссылкой.
-        self.assertIsNone(mr.pointer_slug("- [ ] проверить канал, схема в [[наша]]"))
-        self.assertIsNone(mr.pointer_slug("- [x] сделано, детали в [[наша]]"))
-        # Пункт открывается ВНЕШНЕЙ ссылкой: слаг пришёл бы из середины строки.
-        self.assertIsNone(mr.pointer_slug("- [Инцидент](https://example.org/17) схема в [[наша]]"))
-
-
-class PointerKeepsNeighboursTests(Base):
-    """Из нестрогих упоминаний заменяется ровно одно, остальные живут."""
-
-    def test_only_one_loose_mention_is_replaced_and_the_rest_survive(self):
-        rollup = ("# Acme\n\n## Доступы\n\nПервый абзац про [[acme_dns]], эпик ACME-12.\n"
-                  "Второй абзац про [[acme_dns]], заморозка доступа 26.06.\n")
-        new, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] доступ по ssh")
-        self.assertIn("заморозка доступа 26.06", new)
-        self.assertNotIn("эпик ACME-12", new)
-        self.assertTrue(any("заменена прежняя строка" in w and "ACME-12" in w for w in слова), слова)
-        self.assertTrue(any("упомянута ещё" in w for w in слова), слова)
-
-    def test_every_touched_line_comes_back_in_words(self):
-        rollup = ("# Acme\n\n## Доступы\n\n- [[acme_dns]] первый указатель\n"
-                  "- [[acme_dns]] второй указатель\n"
-                  "Проза про [[acme_dns]] с фактом заморозки.\n"
-                  "\n## Обзор\n\nЕщё про [[acme_dns]] в другом разделе.\n")
-        new, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] новый указатель")
-        текст = " | ".join(слова)
-        self.assertIn("заменена прежняя строка", текст)
-        self.assertIn("убран лишний указатель", текст)
-        self.assertIn("упомянута ещё 1 раз", текст)
-        self.assertIn("«Обзор»", текст)
-        self.assertIn("заморозки", new, "проза раздела не удаляется")
-        self.assertIn("в другом разделе", new)
-
-    def test_mentions_above_the_first_heading_and_under_an_empty_one_are_named(self):
-        rollup = ("Вступление про [[acme_dns]].\n## Доступы\n\n- [[acme_dns]] старый\n"
-                  "##  \nПод пустым заголовком [[acme_dns]].\n")
-        _, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] новый")
-        текст = " | ".join(слова)
-        self.assertIn("до первого раздела", текст)
-        self.assertIn("«»", текст, "пустой заголовок это раздел, а не начало сводки")
-
-    def test_long_replaced_line_is_marked_as_clipped(self):
-        длинная = "Проза про [[acme_dns]] " + "и много фактов " * 20
-        rollup = f"# Acme\n\n## Доступы\n\n{длинная}\n"
-        _, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] новый")
-        self.assertTrue(any("всего" in w and "знаков" in w for w in слова), слова)
-
-    def test_repeating_the_same_submission_changes_nothing(self):
-        rollup = ("# Acme\n\n## Доступы\n\nПервый абзац про [[acme_dns]], эпик ACME-12.\n"
-                  "Второй абзац про [[acme_dns]], заморозка 26.06.\n")
-        один, _ = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] доступ по ssh")
-        два, слова = mr.insert_rollup_pointer(один, "Доступы", "- [[acme_dns]] доступ по ssh")
-        self.assertEqual(один, два)
-        self.assertFalse(any("заменена прежняя строка" in w for w in слова), слова)
+    def test_section_field_errors_name_each_case(self):
+        topics = mv.load_topics(self.fed.verify_config.topics)
+        rollup = ("# Acme\n\n## Договор темы\n\nx\n\n## Доступы\n\ny\n\n## Обзор\n\nz\n"
+                  "\n## Обзор\n\nw\n\n## Raw-факты\n\nq\n").encode()
+        tree = {"memory/topics/acme.md": rollup, **{
+            f"memory/acme_{i}.md": record(f"acme_{i}", section=section, probe="x")
+            for i, section in enumerate(("Нет такого", "Обзор", "Договор темы", "Raw-факты",
+                                         "Доступы"))}}
+        errors = " | ".join(mv.section_field_errors({}, tree, topics, "clients/acme"))
+        for expected in ("acme_0.md: раздела «Нет такого» нет", "acme_1.md: в сводке 2 раздела",
+                         "acme_2.md: раздел «Договор темы» обязательный",
+                         "acme_3.md: раздел «Raw-факты» обязательный"):
+            self.assertIn(expected, errors)
+        self.assertNotIn("acme_4", errors)
+        renamed = {**tree, "memory/topics/acme.md": rollup.replace("## Доступы".encode(),
+                                                                   "## Доступ".encode())}
+        self.assertEqual(mv.section_field_errors(tree, renamed, topics, "clients/acme"),
+                         ["memory/acme_4.md: раздела «Доступы» нет в сводке темы; "
+                          "section называет заголовок раздела целиком"])
+        self.assertIn("полем section", " ".join(mv.section_field_errors(
+            tree, {**tree, "memory/acme_5.md": record("acme_5", probe="x")}, topics,
+            "clients/acme")))
+        self.assertIn("только у записи заказчика", " ".join(mv.section_field_errors(
+            {}, {"memory/reference_x.md": record("reference_x", section="Обзор")}, topics,
+            "personal")))
 
 
 def expiring(slug: str, title: str, index: str, probe: str, until: str | None = "2026-09-10") -> bytes:
@@ -2319,13 +2160,8 @@ class SelfMaintenanceTests(Base):
         code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
                                          {"record_slug": "reference_kettle"})
         self.assertEqual(result["state"], "saved", result)
-        body = record("acme_vpn", type="project", title="VPN Acme", index="vpn acme",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="как попасть в сеть заказчика по ssh", listed="false",
-                      body="Доступ по ssh через бастион.\n")
-        code, result = self.fed.remember("a", "clients/acme", "acme-vpn-1", body,
-                                         {"record_slug": "acme_vpn", "index_section": "Доступы",
-                                          "index_line": "- [[acme_vpn]] ssh через бастион"})
+        code, result = self.fed.remember("a", "clients/acme", "acme-vpn-1", ACME_VPN,
+                                         {"record_slug": "acme_vpn"})
         self.assertEqual(result["state"], "saved", result)
 
     def test_machine_name_ignores_case_and_local_suffix(self):

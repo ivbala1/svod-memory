@@ -69,7 +69,8 @@ DATE_FIELDS = ("valid_until", "review_after", "observed_at")
 # теряла бы факт, поэтому неизвестное поле у новой и переписанной записи
 # это отказ.
 SCHEMA_FIELDS = ("valid_until", "review_after", "supersedes", "type",
-                 "title", "index", "listed", "probe", "source", "observed_at")
+                 "title", "index", "listed", "probe", "source", "observed_at",
+                 "section")
 DESCRIPTIVE_TOP_FIELDS = frozenset({"name", "description", "metadata"})
 KNOWN_TOP_FIELDS = DESCRIPTIVE_TOP_FIELDS | frozenset(SCHEMA_FIELDS)
 # Поля, обязательные у новой и переписанной записи (решение владельца
@@ -484,8 +485,8 @@ def header_errors(base: dict[str, bytes], candidate: dict[str, bytes]) -> list[s
 def probe_required_errors(candidate: dict[str, bytes], root: str) -> list[str]:
     """Доставляемая запись без крючка (цель 4), по всему дереву кандидата.
     Доставляемая: в индексном корне запись со строкой индекса, в
-    клиентском любая запись (её отдаёт указатель сводки, listed ей не
-    указ). Свёрнутая запись индексного корня и архив крючка не требуют:
+    клиентском любая запись (её отдаёт сводка темы, listed ей не указ).
+    Свёрнутая запись индексного корня и архив крючка не требуют:
     свёрнутую в личном корне находит поиск по корпусу, в глобальном свёртки
     нет (контракт отказывает), архив находит тот же поиск по корпусу."""
     import memorycontext as mc
@@ -646,16 +647,19 @@ def folded_slugs(tree: dict[str, bytes]) -> set[str]:
 
 def unreachable_records(tree: dict[str, bytes], known_topics: set[str], *,
                         searchable_folded: bool = False) -> set[str]:
-    """Записи, недостижимые ни из индекса, ни из сводки темы. known_topics
-    это пути сводок вида topics/<файл>. В личной области достижима и
-    свёрнутая запись (`listed: false`): её находит поиск по корпусу. У
-    заказчика свёрнутую держит сводка."""
+    """Записи, недостижимые ни из индекса, ни из сводки темы (упоминание в
+    тексте либо раздел по полю section). known_topics это пути сводок вида
+    topics/<файл>. В личной области достижима и свёрнутая запись (`listed:
+    false`): её находит поиск по корпусу. У заказчика свёрнутую держит сводка."""
     import memorycontext as mc
     from_index = {entry.slug for entry in mc.parse_index(router_index_text(tree))}
     if searchable_folded:
         from_index |= folded_slugs(tree)
     rollups = "\n".join(text.decode("utf-8", "replace") for path, text in tree.items()
                         if path[len(MEMORY_PREFIX):] in known_topics)
+    sections = {s.title.casefold() for s in mc.parse_sections(rollups) if s.title}
+    from_sections = {f"{slug}.md" for slug, text in _records(tree).items()
+                     if parse_frontmatter(text)[0].get("section", "").strip().casefold() in sections}
     orphans = set()
     for path in tree:
         if not path.startswith(MEMORY_PREFIX):
@@ -663,7 +667,7 @@ def unreachable_records(tree: dict[str, bytes], known_topics: set[str], *,
         name = path[len(MEMORY_PREFIX):]
         if name == "MEMORY.md" or name in known_topics or name.startswith("archive/"):
             continue
-        if name in from_index or _slug_mentioned(name, rollups):
+        if name in from_index or name in from_sections or _slug_mentioned(name, rollups):
             continue
         orphans.add(name)
     return orphans
@@ -710,8 +714,8 @@ def reach_errors(base: dict[str, bytes], candidate: dict[str, bytes],
                        - unreachable_records(base, known, searchable_folded=folded)):
         errors.append(
             f"memory/{name}: запись становится недостижимой (нет ни строки в индексе, "
-            "ни упоминания в сводке темы); дай ей строку индекса в шапке (type, title, "
-            "index) или упомяни в сводке той же подачей")
+            "ни раздела сводки темы); дай ей строку индекса в шапке (type, title, "
+            "index), а записи заказчика раздел сводки полем section")
     before = invalid_archive(base, topics.link_placement(), root)
     after = invalid_archive(candidate, topics.link_placement(), root)
     replaced = {name for name in before & after
@@ -763,15 +767,16 @@ def tautology_candidates(slug: str, text: str) -> list[str]:
     return [c for c in out if c]
 
 
-def topic_delivery(root: Path, spec, question: str) -> str:
-    """Полная выдача темы по вопросу тем же сборщиком, что у роутера,
-    над выложенным деревом: сводка читается из него самого, без владельца."""
+def topic_delivery(root: Path, spec, question: str, *, full_context: bool = True) -> str:
+    """Выдача темы по вопросу тем же сборщиком, что у роутера, над выложенным
+    деревом: сводка читается из него самого, без владельца. Полная выдача в
+    худшем случае: первая реплика везёт и контракт в полный потолок."""
     import dataclasses
     import memorycontext as mc
     local = dataclasses.replace(spec, owner=None)
     decision = mc.RouteDecision(scope=spec.scope, source="check")
-    text, _ = mc._topic_context(root, local, decision, question, "", "",
-                                full_context=True, include_hot=False)
+    text, _ = mc._topic_context(root, local, decision, question, "", "." * mc.CONTRACT_LIMIT,
+                                full_context=full_context, include_hot=full_context)
     return text
 
 
@@ -809,9 +814,12 @@ def probe_errors(candidate: dict[str, bytes], *,
     import memorycontext as mc
     errors: list[str] = []
     client = client_name(root)
-    spec = None
+    spec, sections = None, ()
     if client is not None:
         spec = next((s for s in topics.specs.values() if s.owner == root), None)
+    if spec is not None:
+        сводка = candidate.get(f"memory/topics/{spec.filename}", b"")
+        sections = mc.parse_sections(_decode(сводка) or "")
     for slug, text in sorted(_records(candidate).items()):
         fields, error = parse_frontmatter(text)
         if error:
@@ -846,8 +854,19 @@ def probe_errors(candidate: dict[str, bytes], *,
             continue
         else:
             found = delivered_link_present(topic_delivery(laid_out, spec, probe), slug)
-            hint = (f"выдача сводки {spec.filename} по этому вопросу не содержит ссылки "
-                    "на запись; добавь указатель в выбираемый раздел или перепиши крючок")
+            # Продолжение сессии отдаёт только разделы, выбранные вопросом, и
+            # с меньшим бюджетом: выбранный раздел записи обязан донести ссылку
+            # и там. Раздел только по умолчанию продолжение не отдаёт по замыслу.
+            раздел = fields.get("section", "").strip().casefold()
+            if found and раздел and раздел in {s.title.casefold() for s in mc.select_sections(
+                    spec, sections, probe, include_defaults=False)}:
+                found = delivered_link_present(
+                    topic_delivery(laid_out, spec, probe, full_context=False), slug)
+            hint = (f"выдача сводки {spec.filename} по этому вопросу (полная либо "
+                    "продолжение сессии) не содержит ссылки на запись: раздел из section "
+                    f"не выбран вопросом либо запись не вошла в {mc.SECTION_LIST_LIMIT} "
+                    "лучших списка или срезана бюджетом; перепиши крючок словами раздела "
+                    "и заголовка или раздели раздел")
         if not found:
             errors.append(f"{label}: крючок «{probe}» не находит запись: {hint}")
     return errors
@@ -953,14 +972,64 @@ def section_errors(base: dict[str, bytes], candidate: dict[str, bytes],
                 errors.append(
                     f"{path}: раздел «{section.title}» весит {len(section.text)} символов "
                     f"при потолке доставки {cap}; освободи {len(section.text) - cap} "
-                    "символов переносом абзаца в другой раздел, иначе хвост раздела "
-                    "с указателями не доедет")
+                    "символов переносом абзаца в другой раздел или в запись, иначе "
+                    "хвост раздела не доедет")
             if (spec is not None and section.title not in selectable
                     and not mc._is_mandatory(section) and not mc._is_raw(section)):
                 warnings.append(
                     f"{path}: раздел «{section.title}» роутер не выберет ни по терминам, "
                     "ни по умолчанию; его содержимое придёт только при чтении файла")
     return errors, warnings
+
+
+def record_section_errors(tree: dict[str, bytes], topics: Topics, root: str) -> set[str]:
+    """Поле section по всему дереву. У записи общего корня его быть не
+    может: сводок там нет. У записи заказчика оно называет ровно один раздел
+    сводки своего корня, и не обязательный и не сырой: там проза, а не список."""
+    import memorycontext as mc
+    client = client_name(root)
+    разделы: dict[str, list] = {}
+    for path, data in tree.items():
+        if client is None or not path.startswith("memory/topics/"):
+            continue
+        if (topics.placement.get(path[len("memory/topics/"):]) or ("", ""))[1] == root:
+            for раздел in mc.parse_sections(_decode(data) or ""):
+                разделы.setdefault(раздел.title.casefold(), []).append(раздел)
+    errors: set[str] = set()
+    for slug, text in _records(tree).items():
+        значение = parse_frontmatter(text)[0].get("section", "").strip()
+        if not значение:
+            continue
+        найдено = разделы.get(значение.casefold(), [])
+        label = f"memory/{slug}.md"
+        if client is None:
+            errors.add(f"{label}: поле section только у записи заказчика, в этом корне сводок нет")
+        elif not найдено:
+            errors.add(f"{label}: раздела «{значение}» нет в сводке темы; section называет "
+                       "заголовок раздела целиком")
+        elif len(найдено) > 1:
+            errors.add(f"{label}: в сводке {len(найдено)} раздела «{значение}»; раздел "
+                       "с записями должен быть единственным с этим заголовком")
+        elif mc._is_mandatory(найдено[0]) or mc._is_raw(найдено[0]):
+            errors.add(f"{label}: раздел «{значение}» обязательный или сырой, в нём только "
+                       "проза; запись ставится в обычный раздел")
+    return errors
+
+
+def section_field_errors(base: dict[str, bytes], candidate: dict[str, bytes],
+                         topics: Topics, root: str) -> list[str]:
+    """Новые нарушения поля section против основы (переименованный или
+    удалённый раздел называет здесь каждую потерянную запись) и раздел у
+    новой или переписанной записи заказчика: строк-указателей в прозе
+    сводки больше нет, запись держит её список."""
+    errors = record_section_errors(candidate, topics, root) - record_section_errors(base, topics, root)
+    if client_name(root) is not None:
+        записи = _records(candidate)
+        for slug in touched_records(base, candidate):
+            if not parse_frontmatter(записи[slug])[0].get("section", "").strip():
+                errors.add(f"memory/{slug}.md: запись заказчика называет свой раздел "
+                           "сводки полем section в шапке")
+    return sorted(errors)
 
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1244,7 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
     section_bad, section_warn = section_errors(base, candidate, topics)
     errors += section_bad
     warnings += section_warn
+    errors += section_field_errors(base, candidate, topics, root)
     with tempfile.TemporaryDirectory(prefix="svod-check-") as tmp:
         new_root = lay_out(candidate, Path(tmp) / "new")
         old_root = lay_out(base, Path(tmp) / "old") if base else None

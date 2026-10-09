@@ -170,10 +170,16 @@ A record is Markdown with frontmatter containing `type` (`user`,
 `listed: false` removes a personal record from automatic selection (`memory
 search` still finds it), except records named in
 `personal.secondPlaceWhitelist` of `topics.json`: the second, full-text slot
-may return those, marked as folded and to be checked for validity. Client
-records are reached through links in their topic rollup. The probe of an
-indexed or client record must find it using the router's own selection;
-folded personal records are not checked. Provenance must reflect the actual source
+may return those, marked as folded and to be checked for validity. A client
+record names its rollup section in the `section` header field; the router
+lists the section's records under its heading when it delivers the section
+(the six best for the prompt, then a search hint), so the stored rollup does
+not grow with the number of records. The section cap trims prose, not the
+list; the overall delivery budget may still cut the last section. The probe of an indexed or client record
+must find it using the router's own selection, for a client record in the
+worst-case full delivery and, when the question selects the record's section,
+in the smaller session-continuation delivery; folded personal records are not
+checked. Provenance must reflect the actual source
 and observation date.
 
 ```sh
@@ -182,9 +188,9 @@ bin/memory remember --scope personal --id example-1 --record reference_example \
   --file /absolute/path/to/record.md --json
 ```
 
-`--record` names the record: it lands in `memory/<name>.md`. A client
-record also needs `--section` (an existing rollup section) and `--line`
-(the pointer line linking to the record). `--base` names the corpus
+`--record` names the record: it lands in `memory/<name>.md`. A new or
+rewritten client record must carry `section` naming one ordinary section of
+its own rollup by its full heading. `--base` names the corpus
 revision the author actually read, full or abbreviated to seven or more
 characters; it prevents overwriting a later edit and allows rewriting the
 record under the same `--id`. `--dry-run` prints the same verdict without

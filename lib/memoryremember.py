@@ -89,10 +89,10 @@ def symlink_errors(root: Path, path: str) -> list[str]:
     return []
 
 
-def parse_projection(projection: dict | None, scope: str, content_type: str) -> dict:
+def parse_projection(projection: dict | None, content_type: str) -> dict:
     if content_type == "manifest":
         if projection is not None:
-            raise Refusal("манифесту имя записи и указатель не нужны: пути лежат в нём самом")
+            raise Refusal("манифесту имя записи не нужно: пути лежат в нём самом")
         return {}
     if content_type != "markdown":
         raise Refusal("content-type только markdown либо manifest")
@@ -102,33 +102,10 @@ def parse_projection(projection: dict | None, scope: str, content_type: str) -> 
     slug = projection.get("record_slug")
     if not isinstance(slug, str) or not memoryverify.SLUG_RE.fullmatch(slug):
         errors.append("имя записи (--record) это slug вида [a-z0-9_]{1,64}")
-    keys = set(projection)
-    client = memoryverify.client_name(scope) is not None
-    pointer = client and keys == {"record_slug", "index_line", "index_section"}
-    if not client and keys != {"record_slug"}:
-        errors.append("--section и --line только у клиентской записи; личной и глобальной "
-                      "хватает --record: индекс собирается из шапки")
-    elif client and keys == {"record_slug"}:
-        errors.append("клиентской записи нужен указатель: --section и --line "
-                      "(строка уезжает в раздел сводки темы)")
-    elif client and not pointer:
-        errors.append("подача несёт --record, либо --record вместе с --section и --line")
-    if pointer:
-        line = projection["index_line"]
-        section = projection["index_section"]
-        if not isinstance(line, str) or not line.strip() or "\n" in line or len(line.encode()) > 1024:
-            errors.append("--line: одна непустая строка со ссылкой на запись")
-        if not isinstance(section, str) or not section.strip():
-            errors.append("--section: непустое имя раздела сводки")
-        # Ссылка в строке обязана вести на подаваемую запись: иначе указатель
-        # уезжает в сводку за чужую запись, а поданная остаётся без него.
-        if isinstance(line, str) and isinstance(slug, str) and index_line_slug(line) != slug:
-            errors.append(f"--line: строка со ссылкой на запись {slug}, например "
-                          "«- [[имя]] чем полезна»")
+    if set(projection) != {"record_slug"}:
+        errors.append("--section и --line сняты: раздел записи заказчика это "
+                      "поле section в её шапке, подаче хватает --record")
     refuse_all(errors)
-    if pointer:
-        return {"record_slug": slug, "index_line": projection["index_line"],
-                "index_section": projection["index_section"]}
     return {"record_slug": slug}
 
 
@@ -227,145 +204,6 @@ def expand_manifest_files(body: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Указатели: раздел сводки
-
-def index_line_slug(line: str) -> str | None:
-    """Запись, которой принадлежит строка: САМАЯ ЛЕВАЯ ссылка любого вида.
-    Раньше markdown-ссылки перебирались раньше вики-ссылок независимо от
-    места, и строка «[отчёт](other.md) про [[нашу_запись]]» приписывалась
-    чужой записи."""
-    clean = memoryverify.strip_code(line)
-    кандидаты: list[tuple[int, str]] = []
-    for match in memoryverify.MARKDOWN_LINK_RE.finditer(clean):
-        name = Path(match.group(1)).name
-        if name.endswith(".md"):
-            кандидаты.append((match.start(), name[:-3]))
-    for match in memoryverify.DELIVERED_WIKI_LINK_RE.finditer(clean):
-        name = Path(match.group(1).strip()).name
-        if name:
-            кандидаты.append((match.start(), name[:-3] if name.endswith(".md") else name))
-    return min(кандидаты)[1] if кандидаты else None
-
-
-def pointer_slug(line: str) -> str | None:
-    """Слаг строки, которая является УКАЗАТЕЛЕМ: пункт списка, начинающийся со
-    ссылки на запись. Ровно такую строку писатель и порождает, поэтому только
-    такую он вправе заменить. Проза со ссылкой в середине предложения это
-    факт заказчика, а не указатель: её не трогают."""
-    match = re.match(r"^\s*[-*]\s+(.*)$", line)
-    if not match:
-        return None
-    # Слаг берётся ТОЛЬКО из ссылки, которая открывает пункт. Иначе указателем
-    # считались бы «- [ ] задача, схема в [[запись]]» (пункт-дело) и
-    # «- [Инцидент](https://…) ещё открыт, схема в [[запись]]» (пункт с
-    # внешней ссылкой), где слаг пришёл бы из середины строки.
-    начало = match.group(1)
-    if начало.startswith("[["):
-        конец = начало.find("]]")
-        ссылка = начало[:конец + 2] if конец > 0 else ""
-    else:
-        первая = re.match(r"^\[[^\]]*\]\([^)\s]+\)", начало)
-        ссылка = первая.group(0) if первая else ""
-    return index_line_slug(ссылка) if ссылка else None
-
-
-def insert_rollup_pointer(rollup_text: str, section: str, line: str) -> tuple[str, list[str]]:
-    """Строка-указатель в названный раздел сводки темы (по заголовку, регистр
-    и краевые пробелы не значимы). Прежняя строка этой записи внутри раздела
-    заменяется на месте, лишние повторы внутри раздела убираются.
-
-    ⚠️ За пределами названного раздела не трогается ничего. Упоминание записи
-    там это чаще всего проза заказчика с фактами, а не указатель, и молчаливое
-    удаление такой строки теряло принятый факт. Найденные упоминания
-    возвращаются словами: переносить их или нет, решает автор отдельной
-    подачей, где обе правки видны и сторожатся объявленной основой."""
-    slug = index_line_slug(line)
-    import memorycontext as mc
-    lines = rollup_text.splitlines()
-    fenced, _open = mc.scan_code_fences(lines)
-    wanted = section.strip().casefold()
-    # Один проход по заголовкам вне ограждённого кода: номера строк-заголовков
-    # и раздел каждой строки (None выше первого заголовка).
-    заголовки: list[int] = []
-    раздел: list[str | None] = []
-    for i, current in enumerate(lines):
-        heading = None if fenced[i] else re.match(r"^##\s+(.+?)\s*$", current)
-        if heading:
-            заголовки.append(i)
-        раздел.append(heading.group(1).strip() if heading else (раздел[-1] if раздел else None))
-    start = next((i for i in заголовки if раздел[i].casefold() == wanted), None)
-    end = next((i for i in заголовки if start is not None and i > start), len(lines))
-    # Обе беды независимы: строка без ссылки и раздел, которого нет.
-    refuse_all(([] if slug is not None else
-                ["--line без ссылки на запись указателем не является"])
-               + ([] if start is not None else [f"раздела {section!r} нет в сводке темы"]))
-    # Внутри названного раздела заменяем прежнюю строку записи: сперва
-    # строгий указатель (пункт списка со ссылки), а если такого нет, любое
-    # упоминание. В живых сводках указатель это чаще абзац с фактами и
-    # ссылкой, и запрещать эту форму значит запрещать привычный стиль.
-    строгие = [i for i in range(start + 1, end)
-               if not fenced[i] and pointer_slug(lines[i]) == slug]
-    любые = [i for i in range(start + 1, end)
-             if not fenced[i] and index_line_slug(lines[i]) == slug]
-    # Повторы убираются только среди СТРОГИХ указателей: их писатель и делал.
-    # Из нестрогих упоминаний заменяется ровно одно, первое; остальные строки
-    # раздела это чужая проза, их не удаляют, о них говорят словами.
-    inside = строгие or любые[:1]
-    прочие = [i for i, current in enumerate(lines)
-              if not fenced[i] and i not in inside and index_line_slug(current) == slug]
-    # Всё, что уедет из сводки, запоминается ДО правки списка: после вставки и
-    # удаления строк прежние номера указывают не туда, а автор обязан увидеть
-    # каждую тронутую строку.
-    заменено = lines[inside[0]].strip() if inside else ""
-    убранные = [lines[i].strip() for i in sorted(set(inside) - set(inside[:1]))]
-    свои = [i for i in прочие if start < i < end]
-    чужие_разделы = sorted({f"«{раздел[i]}»" if раздел[i] is not None else "до первого раздела"
-                            for i in прочие if i not in свои})
-    if inside:
-        lines[inside[0]] = line
-        for i in sorted(set(inside) - {inside[0]}, reverse=True):
-            del lines[i]
-            if i < end:
-                end -= 1
-    else:
-        position = start
-        for i in range(start + 1, end):
-            if lines[i].strip():
-                position = i
-        if mc.scan_code_fences(lines[start:end])[1]:
-            raise Refusal(f"раздел {section!r} заканчивается незакрытым блоком кода; "
-                          "указатель класть некуда")
-        lines.insert(position + 1, line)
-    notes = []
-    if заменено and заменено != line.strip():
-        notes.append(f"в разделе {section!r} заменена прежняя строка записи: {_кратко(заменено)}")
-    for убранная in убранные:
-        notes.append(f"в разделе {section!r} убран лишний указатель этой записи: {_кратко(убранная)}")
-    if свои:
-        notes.append(f"в разделе {section!r} запись упомянута ещё {len(свои)} раз "
-                     "(строки не тронуты): указатель у записи один, остальное это проза")
-    if чужие_разделы:
-        notes.append(f"запись упомянута ещё в разделах {', '.join(чужие_разделы)}; "
-                     "строки оставлены как есть, перенос решает автор отдельной подачей")
-    return "\n".join(lines) + ("\n" if rollup_text.endswith("\n") else ""), notes
-
-
-def _кратко(текст: str, предел: int = 160) -> str:
-    """Длинная строка в словах обрезается ЗАМЕТНО: без пометки автор решил
-    бы, что уехало ровно столько, сколько показано."""
-    return текст if len(текст) <= предел else f"{текст[:предел]}… (всего {len(текст)} знаков)"
-
-
-def rollup_path(scope: str, config: memoryverify.Config) -> str:
-    topics = memoryverify.load_topics(config.topics)
-    mine = [name for name, (_topic, owner) in topics.placement.items() if owner == scope]
-    if not mine:
-        raise Refusal(f"у области {scope} нет темы-владельца: указатель класть некуда")
-    # Сводка у области одна: topiclayout требует owner == clients/<ключ темы>.
-    return f"memory/topics/{mine[0]}"
-
-
-# ---------------------------------------------------------------------------
 # Кандидат
 
 def direct_paths(candidate: dict) -> list[str]:
@@ -375,33 +213,16 @@ def direct_paths(candidate: dict) -> list[str]:
     return [f"memory/{candidate['projection']['record_slug']}.md"]
 
 
-def compute_files(candidate: dict, head_tree: dict[str, bytes], scope: str,
-                  config: memoryverify.Config) -> tuple[dict[str, bytes | None], list[str]]:
-    """Файлы кандидата: путь -> байты либо None (удаление). Производный
-    путь один, указатель в разделе сводки, он считается заново на текущей
-    сводке."""
-    notes: list[str] = []
+def compute_files(candidate: dict) -> dict[str, bytes | None]:
+    """Файлы кандидата: путь -> байты либо None (удаление)."""
     body = candidate["body"].encode("utf-8")
     if candidate["content_type"] == "manifest":
         changes, _ = parse_manifest(body)
         return {c["path"]: (c["content"].encode("utf-8") if c["operation"] == "put" else None)
-                for c in changes}, notes
-    projection = candidate["projection"]
-    slug = projection["record_slug"]
+                for c in changes}
     if not body.strip():
         raise Refusal("тело записи пустое")
-    files: dict[str, bytes | None] = {f"memory/{slug}.md": body}
-    if memoryverify.client_name(scope) is None:
-        return files, notes
-    pointer = rollup_path(scope, config)
-    rollup = head_tree.get(pointer)
-    if rollup is None:
-        raise Refusal(f"{pointer}: сводки темы нет в репозитории, указатель класть некуда")
-    текст, слова = insert_rollup_pointer(
-        rollup.decode("utf-8"), projection["index_section"], projection["index_line"])
-    files[pointer] = текст.encode("utf-8")
-    notes += [f"{pointer}: {w}" for w in слова]
-    return files, notes
+    return {f"memory/{candidate['projection']['record_slug']}.md": body}
 
 
 def candidate_tree(base_tree: dict[str, bytes],
@@ -462,7 +283,7 @@ def make_candidate(*, scope: str, candidate_id: str, source: str, session: str,
         errors.append("тело не в UTF-8")
     parsed: dict = {}
     try:
-        parsed = parse_projection(projection, scope, content_type)
+        parsed = parse_projection(projection, content_type)
     except Refusal as exc:
         errors.append(str(exc))
     base_revision = None
@@ -600,7 +421,7 @@ def precheck(candidate: dict, *, root: Path, scope: str, config: memoryverify.Co
     записи в рабочее дерево и отката."""
     base = svodgit.rev(root, "refs/heads/main") or svodgit.head(root)
     base_tree = svodgit.read_tree(root, base)
-    files, notes = compute_files(candidate, base_tree, scope, config)
+    files, notes = compute_files(candidate), []
     tree = candidate_tree(base_tree, files)
     if tree == base_tree:
         # Менять нечего (повтор принятого тела): проверять заново тот же
@@ -761,8 +582,7 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
             raise Wait(f"репозиторий не на ветке main ({where}); верни main руками")
         head = svodgit.head(root)
         head_tree = svodgit.read_tree(root, head)
-        files, file_notes = compute_files(candidate, head_tree, scope, config)
-        notes += file_notes
+        files = compute_files(candidate)
         _clean_leftovers(root, files, head_tree)
         fetched, why = svodgit.fetch(root)
         remote = None
@@ -771,12 +591,6 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
             if svodgit.fast_forward(root, head, remote):
                 head = remote
                 head_tree = svodgit.read_tree(root, head)
-                # Слова о файлах пересчитываются вместе с самими файлами:
-                # сводка после перемотки другая, и прежние слова про неё
-                # уже неверны.
-                files, свежие = compute_files(candidate, head_tree, scope, config)
-                notes = [note for note in notes if note not in file_notes] + свежие
-                file_notes = свежие
         else:
             notes.append(f"сети нет ({why}); работаем от локальной вершины, таймер отправит")
         _check_base(candidate, root, head, head_tree, files)
@@ -832,8 +646,6 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
                                  "-m", COMMIT_PREFIX + candidate["id"])
             svodgit.update_ref(root, "refs/heads/main", commit, head)
         candidate["commit"] = commit
-        # Все файлы кандидата, а не только прямые пути: указатель клиентской
-        # записи живёт в сводке, и доставка без него это не доставка.
         candidate["result"] = {p: svodgit.blob(root, commit, p) for p in files}
         candidate["reason"] = None if fetched else "сети нет; коммит локальный, таймер отправит"
         save_candidate(path, candidate)
@@ -998,7 +810,7 @@ def drop_settled_failures(root: Path, scope: str, config: memoryverify.Config, *
         if not candidate or candidate.get("body") is None:
             continue
         try:
-            files, _notes = compute_files(candidate, head_tree, scope, config)
+            files = compute_files(candidate)
         except Exception:  # noqa: BLE001 - неисполнимый отказ просто остаётся
             continue
         if candidate_tree(head_tree, files) != head_tree:

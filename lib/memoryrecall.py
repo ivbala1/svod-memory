@@ -622,13 +622,12 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--source", default="shell", help="агент-источник")
     m.add_argument("--session", default="shell", help="идентификатор сессии")
     m.add_argument("--record", default=None,
-                   help="имя записи: файл memory/<имя>.md. Личной и глобальной "
-                        "записи этого достаточно")
+                   help="имя записи: файл memory/<имя>.md. Раздел записи заказчика "
+                        "задаёт поле section в её шапке")
     m.add_argument("--section", default=None,
-                   help="раздел сводки темы, куда уезжает указатель клиентской записи")
+                   help="снят, подача с ним отказывает: раздел это поле section шапки")
     m.add_argument("--line", default=None,
-                   help="строка-указатель со ссылкой на запись, только у клиентской "
-                        "записи и вместе с --section")
+                   help="снят, подача с ним отказывает: строк-указателей больше нет")
     m.add_argument("--base", default=None,
                    help="хеш версии корпуса, на которой читалась запись; короткий "
                         "от семи знаков годится. Сверка не даст затереть более "
@@ -712,8 +711,8 @@ def main(argv: list[str] | None = None) -> int:
                                   ensure_ascii=False, sort_keys=True)
         elif args.command == "remember":
             import memoryremember
-            # Указатель записи это три флага, а не файл JSON: у подачи
-            # остаётся одна команда и на одно понятие меньше.
+            # Снятые --section и --line доходят до писателя, и тот
+            # отказывает словами, что делать вместо них.
             проекция = None
             if args.record is not None or args.section is not None or args.line is not None:
                 проекция = {"record_slug": args.record}

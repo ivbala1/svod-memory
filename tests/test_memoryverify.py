@@ -345,19 +345,31 @@ class ProbeTests(unittest.TestCase):
 
     def test_client_probe_through_topic_delivery(self):
         rollup = ("# Acme\n\n## Обзор\n\nУстройство системы.\n\n"
-                  "## Доступы\n\nSSH идёт через бастион, см. [[reference_acme_bastion]].\n")
+                  "## Доступы\n\nSSH идёт через бастион.\n")
         base = {"memory/topics/acme.md": rollup.encode("utf-8")}
         cand = dict(base)
         cand["memory/reference_acme_bastion.md"] = record(
             "reference_acme_bastion", source="разговор", observed_at="2026-09-04",
-            probe="как попасть по ssh на серверы", body="Бастион.\n")
+            section="доступы", probe="как попасть по ssh на серверы", body="Бастион.\n")
         report = check(cand, base, root="clients/acme")
         self.assertTrue(report.ok, report.errors)
         cand["memory/reference_acme_bastion.md"] = record(
             "reference_acme_bastion", source="разговор", observed_at="2026-09-04",
-            probe="какой у нас обзор устройства", body="Бастион.\n")
+            section="Доступы", probe="какой у нас обзор устройства", body="Бастион.\n")
         report = check(cand, base, root="clients/acme")
         self.assertTrue(any("не содержит ссылки" in e for e in report.errors), report.errors)
+
+    def test_client_probe_also_through_the_session_continuation(self):
+        """Полная выдача доносит шестую строку списка, продолжение сессии с
+        бюджетом 4 200 срезает её: крючок обязан дойти в обоих режимах."""
+        rollup = "# Acme\n\n## Обзор\n\n" + "о" * 3380 + "\n\n## Доступы\n\nSSH.\n"
+        cand = {"memory/topics/acme.md": rollup.encode("utf-8"), **{
+            f"memory/acme_{c}.md": record(f"acme_{c}", section="Доступы", probe="обзор, доступ",
+                                         title="Заголовок записи " + c * 100, index="запись")
+            for c in "abcdef"}}
+        errors = " ".join(check(cand, {}, root="clients/acme").errors)
+        self.assertIn("acme_f.md: крючок «обзор, доступ» не находит", errors)
+        self.assertNotIn("acme_a.md: крючок", errors)
 
 
 class ProbesReportTests(unittest.TestCase):
