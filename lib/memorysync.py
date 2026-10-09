@@ -26,8 +26,10 @@ import sys
 import time
 import traceback
 
+import memorycontext as mc
 from memoryctl import utc_now
 import memoryremember
+import memoryverify as mv
 import svodgit
 
 
@@ -58,10 +60,6 @@ def hooks_state(root: Path) -> tuple[bool, str]:
     if missing:
         return False, "хуки не исполняемы: " + ", ".join(missing)
     return True, ""
-
-
-def install_hooks(root: Path) -> None:
-    svodgit.git(root, "config", "core.hooksPath", str(HOOKS_DIR))
 
 
 # ---------------------------------------------------------------------------
@@ -113,22 +111,17 @@ def _sync_locked(scope: str, root: Path, config, outcome: dict, *, scanner, toda
         return
     head = svodgit.head(root)
     remote = svodgit.remote_head(root) if fetched else None
-    if fetched and remote and head != remote:
-        if svodgit.fast_forward(root, head, remote):
-            outcome["done"].append(f"fast-forward до {remote[:12]}")
-            head = remote
-        else:
-            state_word, words, final = memoryremember.publish(
-                root, scope, head, config, scanner=scanner, today=today, verify_ahead=True)
-            if state_word == "saved":
-                outcome["done"].append(f"опубликовано {final[:12]}")
-            else:
-                outcome["problems"].append(words)
-    elif fetched and remote is None and head is not None:
+    if fetched and remote and head != remote and svodgit.fast_forward(root, head, remote):
+        outcome["done"].append(f"fast-forward до {remote[:12]}")
+        head = remote
+    elif fetched and head is not None and head != remote:
+        # Локально впереди, расхождение или пустой сервер (remote None):
+        # fast_forward при head None сдвигает всегда, сюда он не доходит.
         state_word, words, final = memoryremember.publish(
             root, scope, head, config, scanner=scanner, today=today, verify_ahead=True)
         if state_word == "saved":
-            outcome["done"].append(f"опубликовано {final[:12]} (первая публикация)")
+            outcome["done"].append(f"опубликовано {final[:12]}"
+                                   + ("" if remote else " (первая публикация)"))
         else:
             outcome["problems"].append(words)
     outcome["candidates"] = memoryremember.retry_pending(
@@ -161,7 +154,6 @@ def prune_router_cache(state: Path | None = None, days: int = ROUTER_CACHE_DAYS)
     его возраст не доказывает, что сессия кончилась; снятое закрепление
     старой сессии дало бы заказчику соседа. Уборка молчит: удалять нечего,
     разговора нет."""
-    import memorycontext as mc
     claude = (state or svodgit.state_dir()) / "claude"
     base = claude / "sessions"
     edge = time.time() - days * 86400
@@ -193,6 +185,8 @@ def prune_router_cache(state: Path | None = None, days: int = ROUTER_CACHE_DAYS)
 
 AUTO_CLOSE_LIMIT = 10
 AUTO_CLOSE_ID = "auto-close-"
+# Свёртка автомата первой строкой шапки; по ней же возврат узнаёт его свёртку.
+AUTO_FOLD = "---\nlisted: false\n"
 AUTO_REOPEN_ID = "auto-reopen-"
 # Коммиты автомата: их правка не считается правкой человека.
 AUTO_SUBJECTS = tuple(memoryremember.COMMIT_PREFIX + вид for вид in (AUTO_CLOSE_ID, AUTO_REOPEN_ID))
@@ -222,7 +216,6 @@ def same_machine(executor: str) -> bool:
 
 def protected_records(config) -> set[str]:
     """Ожидаемые записи стенда и hotKeep тем: их автомат не трогает."""
-    import memoryverify as mv
     держать = {name.removesuffix(".md")
                for _topic, _tokens, keep in mv.load_topics(config.topics).drift for name in keep}
     if config.questions:
@@ -248,18 +241,9 @@ def _commits(root: Path, paths, *options: str) -> list[tuple[str, float, str, li
 
 def _listed_at(root: Path, rev: str, path: str) -> str | None:
     """Значение поля listed шапки файла в ревизии; None, если файла нет."""
-    import memoryverify as mv
     файл = svodgit.git(root, "show", f"{rev}:{path}", check=False)
     return (mv.parse_frontmatter(файл.stdout.decode("utf-8", "replace"))[0].get("listed")
             if файл.returncode == 0 else None)
-
-
-def _unfold(text: str) -> tuple[str, int]:
-    """Текст без строк listed в шапке и их число."""
-    конец = text.find("\n---\n", 4)
-    строки = text[4:конец].split("\n")
-    шапка = [s for s in строки if s.split(":", 1)[0].strip() != "listed"]
-    return "---\n" + "\n".join(шапка) + text[конец:], len(строки) - len(шапка)
 
 
 def _fold_origin(root: Path, path: str) -> str:
@@ -283,7 +267,6 @@ def reopen_candidates(root: Path, tree: dict[str, bytes], today: dt.date) -> dic
     (rebase сливает правки без конфликта в любом порядке): одна строка listed
     первой в шапке, как её ставит автомат, срок в будущем или снят, и поле
     последним менял коммит свёртки (_fold_origin). slug -> текст без listed."""
-    import memoryverify as mv
     итог = {}
     for slug, text in sorted(mv._records(tree).items()):
         fields, _ = mv.parse_frontmatter(text)
@@ -293,10 +276,10 @@ def reopen_candidates(root: Path, tree: dict[str, bytes], today: dt.date) -> dic
                 continue
         except ValueError:
             continue  # битую дату называет проверка формы
-        без, строк = _unfold(text)
+        без = "---\n" + text.removeprefix(AUTO_FOLD)
         # Подпись автомата дёшево отсекает ручные свёртки: историю читаем мало.
-        if строк == 1 and text.startswith("---\nlisted: false\n") and _fold_origin(
-                root, f"memory/{slug}.md").startswith(memoryremember.COMMIT_PREFIX + AUTO_CLOSE_ID):
+        if (text.startswith(AUTO_FOLD) and "listed" not in mv.parse_frontmatter(без)[0]
+                and _fold_origin(root, f"memory/{slug}.md").startswith(AUTO_SUBJECTS[0])):
             итог[slug] = без
     return итог
 
@@ -339,7 +322,6 @@ def close_expired(root: Path, config, *, current: bool = True, data_root: Path |
     удался, вершина сервера в HEAD, проблем нет). В режиме on снимает свои
     отказы, возвращает (reopen_candidates), затем сворачивает; observe лишь
     называет. Не под замками обхода: писатель берёт замок сам."""
-    import memorycontext as mc
     итог: dict = {"done": [], "problems": []}
     try:
         настройка = maintenance_from_config(config.topics)
@@ -374,7 +356,7 @@ def close_expired(root: Path, config, *, current: bool = True, data_root: Path |
             # Строка первая, а не у срока: встречная правка срока дала бы
             # конфликт rebase и расходящуюся main; слияние чинит возврат.
             _auto_submit(итог, AUTO_CLOSE_ID, ("свёрнуто по сроку", "свёртка по сроку"),
-                         {s: "---\nlisted: false\n" + tree[f"memory/{s}.md"].decode("utf-8")[4:]
+                         {s: AUTO_FOLD + tree[f"memory/{s}.md"].decode("utf-8")[4:]
                           for s in слаги}, head=head, **писатель)
     except Exception as exc:  # noqa: BLE001 - шаг не роняет таймер, слова в итог
         итог["problems"].append(f"автомат закрытого: {type(exc).__name__}: {exc}")
@@ -446,11 +428,10 @@ SECTION_HEADROOM = 200
 def dated_records(tree: dict[str, bytes], today: dt.date) -> tuple[list[str], list[str]]:
     """Записи с истёкшим сроком: слаги с просроченным valid_until и слаги, у
     которых review_after уже прошёл, оба по дереву HEAD. Граница у обоих та
-    же, что у отбора (memorycontext._entry_expired): дата действует ПО
+    же, что у отбора (memoryverify.date_passed): дата действует ПО
     указанный день включительно, «после» начинается со следующего. Битая
     дата не считается: её называет проверка формы писателя. Свёрнутые
     записи (`listed: false`) не считаются: они и так вне выдачи."""
-    import memoryverify as mv
     expired: list[str] = []
     review: list[str] = []
     for slug, text in sorted(mv._records(tree).items()):
@@ -460,14 +441,7 @@ def dated_records(tree: dict[str, bytes], today: dt.date) -> tuple[list[str], li
         if fields.get("listed") == "false":
             continue
         for key, bucket in (("valid_until", expired), ("review_after", review)):
-            value = fields.get(key)
-            if not value:
-                continue
-            try:
-                boundary = dt.date.fromisoformat(value)
-            except ValueError:
-                continue
-            if today > boundary:
+            if mv.date_passed(fields, key, today):
                 bucket.append(slug)
     return expired, review
 
@@ -487,8 +461,6 @@ def usage_notes(root: Path, tree: dict[str, bytes], config, today: dt.date,
     последние 60) называет записи проекта в индексе без срока, не из стенда
     и hotKeep, не выданные хуком и не правленные человеком 60 суток. Плюс
     счёт свёрнутого автоматом за 30 суток."""
-    import memorycontext as mc
-    import memoryverify as mv
     метки = (state or svodgit.state_dir()) / "claude" / mc.USAGE_DIR
     полночь = dt.datetime.combine(today, dt.time(), dt.timezone.utc).timestamp()
     граница = полночь - OBSERVE_DAYS * 86400
@@ -536,7 +508,6 @@ def lagging_closed(tree: dict[str, bytes], expired: list[str], config,
     """При closed: on незащищённое истёкшее это работа автомата:
     «просрочено» оставляет стенд и hotKeep, а истёкшее больше 2 суток назад
     значит автомат отстал. Это заметка: исполнитель бывает выключен."""
-    import memoryverify as mv
     try:
         настройка = maintenance_from_config(config.topics)
     except ValueError:
@@ -545,8 +516,8 @@ def lagging_closed(tree: dict[str, bytes], expired: list[str], config,
         return expired, None
     защищённые = protected_records(config)
     край = today - dt.timedelta(days=AUTO_LAG_DAYS)
-    отстало = [s for s in expired if s not in защищённые and dt.date.fromisoformat(
-        mv.parse_frontmatter(tree[f"memory/{s}.md"].decode("utf-8"))[0]["valid_until"]) < край]
+    отстало = [s for s in expired if s not in защищённые and mv.date_passed(
+        mv.parse_frontmatter(tree[f"memory/{s}.md"].decode("utf-8"))[0], "valid_until", край)]
     note = (f"автомат закрытого отстал (исполнитель {настройка['executor']}, эта машина "
             f"{socket.gethostname()}): {', '.join(отстало)}") if отстало else None
     return [s for s in expired if s in защищённые], note
@@ -566,8 +537,6 @@ def repo_health(scope: str, root: Path, config,
     статус вовсе. Личный индекс целиком в сессию не отдаётся, и писатель по
     его размеру не отказывает: размер показатель обслуживания. Уезжает
     только каталог раздела User, поэтому его запас виден заметкой."""
-    import memorycontext as mc
-    import memoryverify as mv
     head = svodgit.head(root)
     if head is None:
         return [], []
@@ -683,19 +652,40 @@ def status(*, data_root: Path | None = None, fetch: bool = False,
     return {"at": utc_now(), "repos": repos, "ok": all(_repo_ok(r) for r in repos)}
 
 
-def _repo_ok(info: dict) -> bool:
-    if info.get("problem") or info.get("hooks_problem"):
-        return False
-    if info.get("branch") != "main" or info.get("rebase_in_progress"):
-        return False
-    if info.get("dirty") or info.get("pending") or info.get("failed"):
-        return False
-    if info.get("health"):
-        return False
+def _breakages(info: dict) -> list[str]:
+    """Поломки области словами, без её имени: они красят итог статуса и
+    они же составляют ежедневную строку подсказки."""
+    bits: list[str] = []
+    if info.get("problem"):
+        bits.append(info["problem"])
+    if info.get("hooks_problem"):
+        bits.append(f"хуки: {info['hooks_problem']}")
+    if info.get("rebase_in_progress") or ("branch" in info and info["branch"] != "main"):
+        bits.append(f"ветка {info.get('branch') or 'отсоединена'}")
+    if info.get("dirty"):
+        bits.append(f"грязных путей {len(info['dirty'])}")
     if info.get("ahead") or info.get("behind"):
-        return False
-    last = info.get("last_sync") or {}
-    return not last.get("problems")
+        bits.append(f"впереди {info['ahead']}, позади {info['behind']}")
+    if info.get("pending"):
+        bits.append(f"ждёт {len(info['pending'])}")
+    отказы = info.get("failed", [])
+    if отказы:
+        bits.append(f"отказ {отказы[0]['id']}"
+                    + (f" и ещё {len(отказы) - 1}" if len(отказы) > 1 else ""))
+    измерение = list(info.get("health", []))
+    if измерение:
+        # Ежедневная строка ОДНА и короткая: перечислять два десятка
+        # разделов у потолка значит приучить её пролистывать.
+        хвост = f" и ещё {len(измерение) - 1}" if len(измерение) > 1 else ""
+        bits.append(f"{измерение[0]}{хвост}")
+    problems = (info.get("last_sync") or {}).get("problems")
+    if problems:
+        bits.append(f"таймер: {'; '.join(problems)[:100]}")
+    return bits
+
+
+def _repo_ok(info: dict) -> bool:
+    return "branch" in info and not _breakages(info)
 
 
 def format_human(result: dict) -> str:
@@ -747,36 +737,10 @@ def format_nudge(result: dict, monthly: bool = False) -> str:
     индекса не приходят и тогда: раздел у потолка остановит писатель в
     момент записи, порог это ранний сигнал `status`."""
     bits: list[str] = []
-    подсказки: list[bool] = []
     заметки: list[str] = []
     for info in result["repos"]:
         scope = info["scope"]
-        if info.get("problem"):
-            bits.append(f"{scope}: {info['problem']}")
-        if info.get("hooks_problem"):
-            bits.append(f"{scope}: хуки: {info['hooks_problem']}")
-        if info.get("rebase_in_progress") or ("branch" in info and info["branch"] != "main"):
-            bits.append(f"{scope}: ветка {info.get('branch') or 'отсоединена'}")
-        if info.get("dirty"):
-            bits.append(f"{scope}: грязных путей {len(info['dirty'])}")
-        if info.get("ahead") or info.get("behind"):
-            bits.append(f"{scope}: впереди {info['ahead']}, позади {info['behind']}")
-        if info.get("pending"):
-            bits.append(f"{scope}: ждёт {len(info['pending'])}")
-        отказы = info.get("failed", [])
-        if отказы:
-            bits.append(f"{scope}: отказ {отказы[0]['id']}"
-                        + (f" и ещё {len(отказы) - 1}" if len(отказы) > 1 else ""))
-        измерение = list(info.get("health", []))
-        if измерение:
-            # Ежедневная строка ОДНА и короткая: перечислять два десятка
-            # разделов у потолка значит приучить её пролистывать.
-            хвост = f" и ещё {len(измерение) - 1}" if len(измерение) > 1 else ""
-            bits.append(f"{scope}: {измерение[0]}{хвост}")
-        подсказки.append(bool(измерение))
-        problems = (info.get("last_sync") or {}).get("problems")
-        if problems:
-            bits.append(f"{scope}: таймер: {'; '.join(problems)[:100]}")
+        bits += [f"{scope}: {b}" for b in _breakages(info)]
         if monthly:
             заметки += [f"{scope}: {f}" for f in info.get("notes", [])
                         if not f.startswith("запас:") and "выше порога" not in f]
@@ -785,7 +749,8 @@ def format_nudge(result: dict, monthly: bool = False) -> str:
         # Хвост выбирается по находкам измерения, а не по подстроке во всей
         # строке: имя отказа со словом «индекс» уводило подсказку не туда.
         строки.append("Память: " + "; ".join(bits)
-                      + (" → /memory-compact" if any(подсказки) else " → memory status"))
+                      + (" → /memory-compact" if any(r.get("health") for r in result["repos"])
+                         else " → memory status"))
     if заметки:
         только_итог = all(f.split(": ", 1)[1].startswith(AUTO_NOTE) for f in заметки)
         строки.append("Память, раз в месяц: " + "; ".join(заметки)
@@ -805,7 +770,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    import memorycontext as mc
     if mc.TOPICS_ERROR:
         # Единственный вход таймера обязан отвечать словами, а не
         # трассировкой: чаще всего это забытый MEMORY_CONFIG_DIR.

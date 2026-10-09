@@ -1,10 +1,9 @@
 """Адресация конфигурации слоя (срез 4).
 
 Каталог конфигурации задаётся снаружи, а не выводится из расположения
-кода. Проверяется: перечень закрыт, исходная точка через него НЕ
-адресуется, логические имена манифеста разворачиваются одним резолвером,
-отпечаток измерителя чувствителен к байтам конфигурации в чужом каталоге,
-история исходной точки сохраняется в git.
+кода. Проверяется: умолчание и перекрытие переменной, исходная точка
+следует каталогу, корень данных не выводится из кода, история исходной
+точки сохраняется в git.
 """
 
 import hashlib
@@ -42,7 +41,7 @@ class ПодменаКаталога:
         self.tmp = tempfile.TemporaryDirectory()
         каталог = Path(self.tmp.name) / "config"
         каталог.mkdir()
-        for имя in configpaths.CONFIG_NAMES:
+        for имя in ("eval_questions.json", "topics.json"):
             shutil.copy2(configpaths.config_dir() / имя, каталог / имя)
         self.прежний = os.environ.get(configpaths.CONFIG_ENV)
         os.environ[configpaths.CONFIG_ENV] = str(каталог)
@@ -87,33 +86,20 @@ class РазрешениеПутей(unittest.TestCase):
             self.assertEqual(configpaths.config_path("topics.json"),
                              каталог / "topics.json")
 
-    def test_имя_вне_перечня_отказ(self):
-        with self.assertRaises(configpaths.ConfigPathError):
-            configpaths.config_path("passwd")
-
-    def test_исходная_точка_живёт_в_конфигурации_но_вне_перечня(self):
-        """В-11: точка переехала к вопросам стенда, но своим адресом.
-
-        Перечень определяет снимок кода и логические имена манифестов;
-        точке не нужно ни то, ни другое. Поэтому config_path её по-
-        прежнему отвергает, а baseline_path следует каталогу."""
-        self.assertNotIn("eval_baseline.json", configpaths.CONFIG_NAMES)
-        with self.assertRaises(configpaths.ConfigPathError):
-            configpaths.config_path("eval_baseline.json")
+    def test_исходная_точка_следует_каталогу(self):
+        """В-11: точка живёт в каталоге конфигурации рядом с вопросами."""
         with ПодменаКаталога() as каталог:
-            self.assertEqual(configpaths.baseline_path(),
+            self.assertEqual(configpaths.config_path("eval_baseline.json"),
                              каталог / "eval_baseline.json")
 
 
 class КореньДанных(unittest.TestCase):
     def test_default_root_не_выводится_из_кода(self):
         import memorycontext
-        import memoryctl
         прежний = os.environ.pop("MEMORY_REPO", None)
         try:
             ожидание = (Path.home() / ".agent-memory").resolve()
             self.assertEqual(memorycontext.default_root(), ожидание)
-            self.assertEqual(memoryctl.default_root(), ожидание)
         finally:
             if прежний is not None:
                 os.environ["MEMORY_REPO"] = прежний

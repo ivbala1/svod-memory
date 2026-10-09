@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 import re
 
 import configpaths
+import memoryctl
 import memoryverify
 import svodgit
 
@@ -90,7 +91,7 @@ def symlink_errors(root: Path, path: str) -> list[str]:
 
 def parse_projection(projection: dict | None, scope: str, content_type: str) -> dict:
     if content_type == "manifest":
-        if projection not in (None, {}, {"kind": "manifest"}):
+        if projection is not None:
             raise Refusal("манифесту имя записи и указатель не нужны: пути лежат в нём самом")
         return {}
     if content_type != "markdown":
@@ -101,13 +102,16 @@ def parse_projection(projection: dict | None, scope: str, content_type: str) -> 
     slug = projection.get("record_slug")
     if not isinstance(slug, str) or not memoryverify.SLUG_RE.fullmatch(slug):
         errors.append("имя записи (--record) это slug вида [a-z0-9_]{1,64}")
-    keys = set(projection) - {"base_revision"}
-    pointer = keys == {"record_slug", "index_line", "index_section"}
-    if keys == {"record_slug"}:
-        if memoryverify.client_name(scope) is not None:
-            errors.append("клиентской записи нужен указатель: --section и --line "
-                          "(строка уезжает в раздел сводки темы)")
-    elif not pointer:
+    keys = set(projection)
+    client = memoryverify.client_name(scope) is not None
+    pointer = client and keys == {"record_slug", "index_line", "index_section"}
+    if not client and keys != {"record_slug"}:
+        errors.append("--section и --line только у клиентской записи; личной и глобальной "
+                      "хватает --record: индекс собирается из шапки")
+    elif client and keys == {"record_slug"}:
+        errors.append("клиентской записи нужен указатель: --section и --line "
+                      "(строка уезжает в раздел сводки темы)")
+    elif client and not pointer:
         errors.append("подача несёт --record, либо --record вместе с --section и --line")
     if pointer:
         line = projection["index_line"]
@@ -151,8 +155,6 @@ def parse_manifest(body: bytes) -> tuple[list[dict], str | None]:
             errors.append(f"изменение {i}: operation только put либо remove")
             continue
         path = raw.get("path")
-        if isinstance(raw.get("area"), str) and isinstance(path, str) and not path.startswith("memory/"):
-            path = f"{raw['area']}/{path}"
         bad = path_errors(path)
         if bad:
             errors += [f"изменение {i}: {problem}" for problem in bad]
@@ -225,60 +227,7 @@ def expand_manifest_files(body: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Указатели: шапка записи и раздел сводки
-
-def _yaml_scalar(value: str, откуда: str = "шапки") -> str:
-    if '"' not in value:
-        return f'"{value}"'
-    if "'" not in value:
-        return f"'{value}'"
-    raise Refusal(f"значение {откуда} содержит оба вида кавычек, шапку из него не собрать")
-
-
-def apply_index_projection(body: bytes, slug: str, projection: dict) -> tuple[bytes, str]:
-    """Указатель общего корня переезжает в шапку записи: поля type, title,
-    index, если шапка их ещё не несёт. Шапка главнее проекции."""
-    import memorycontext as mc
-    text = body.decode("utf-8")
-    fields, error = memoryverify.parse_frontmatter(text)
-    if error:
-        raise Refusal(f"memory/{slug}.md: {error}")
-    if "index_line" not in projection:
-        return body, ""
-    # Полнота шапки считается прямо по её полям. Раньше её выводили из
-    # record_index_line, а та отдаёт None по трём разным причинам сразу
-    # (снята из индекса, чужой type, пустое поле), и запись с полной шапкой
-    # и `listed: false` получала отказ «несёт часть полей».
-    ключи = {key for key in ("type", "title", "index") if key in fields}
-    полные = {key for key in ключи if fields.get(key, "").strip()}
-    if полные == {"type", "title", "index"}:
-        return body, (f"--line не использована: шапка записи {slug} "
-                      "уже несёт type, title и index")
-    errors: list[str] = []
-    if ключи:
-        errors.append(f"шапка записи {slug} несёт часть полей индекса; нужны все три "
-                      "(type, title, index) непустыми либо ни одного")
-    match = mc.INDEX_ITEM_RE.match(projection["index_line"])
-    if match is None or Path(match.group(2)).name != f"{slug}.md":
-        errors.append(f"--line не ссылается на {slug}.md")
-    kinds = {section: kind for kind, section in mc.INDEX_SECTIONS.items()}
-    kind = kinds.get(projection.get("index_section"))
-    if kind not in mc.INDEX_TYPES:
-        errors.append(f"раздел {projection.get('index_section')!r} не раздел индекса "
-                      f"({', '.join(mc.INDEX_SECTIONS[k] for k in mc.INDEX_TYPES)})")
-    title, hook = ("", "") if match is None else (match.group(1).strip(), match.group(3).strip())
-    if match is not None and (not title or not hook):
-        errors.append("--line: пустой заголовок или крючок")
-    refuse_all(errors)
-    insert = (f"type: {kind}\ntitle: {_yaml_scalar(title, 'заголовка в --line')}\n"
-              f"index: {_yaml_scalar(hook, 'крючка в --line')}\n")
-    if text.startswith("---\n"):
-        end = text.find("\n---\n", 4)
-        new = text[:end + 1] + insert + text[end + 1:]
-    else:
-        new = "---\n" + insert + "---\n" + text
-    return new.encode("utf-8"), ""
-
+# Указатели: раздел сводки
 
 def index_line_slug(line: str) -> str | None:
     """Запись, которой принадлежит строка: САМАЯ ЛЕВАЯ ссылка любого вида.
@@ -335,16 +284,17 @@ def insert_rollup_pointer(rollup_text: str, section: str, line: str) -> tuple[st
     lines = rollup_text.splitlines()
     fenced, _open = mc.scan_code_fences(lines)
     wanted = section.strip().casefold()
-    start, end = None, len(lines)
+    # Один проход по заголовкам вне ограждённого кода: номера строк-заголовков
+    # и раздел каждой строки (None выше первого заголовка).
+    заголовки: list[int] = []
+    раздел: list[str | None] = []
     for i, current in enumerate(lines):
         heading = None if fenced[i] else re.match(r"^##\s+(.+?)\s*$", current)
-        if not heading:
-            continue
-        if start is not None:
-            end = i
-            break
-        if heading.group(1).strip().casefold() == wanted:
-            start = i
+        if heading:
+            заголовки.append(i)
+        раздел.append(heading.group(1).strip() if heading else (раздел[-1] if раздел else None))
+    start = next((i for i in заголовки if раздел[i].casefold() == wanted), None)
+    end = next((i for i in заголовки if start is not None and i > start), len(lines))
     # Обе беды независимы: строка без ссылки и раздел, которого нет.
     refuse_all(([] if slug is not None else
                 ["--line без ссылки на запись указателем не является"])
@@ -369,7 +319,8 @@ def insert_rollup_pointer(rollup_text: str, section: str, line: str) -> tuple[st
     заменено = lines[inside[0]].strip() if inside else ""
     убранные = [lines[i].strip() for i in sorted(set(inside) - set(inside[:1]))]
     свои = [i for i in прочие if start < i < end]
-    чужие_разделы = sorted({_section_of(lines, fenced, i) for i in прочие if i not in свои})
+    чужие_разделы = sorted({f"«{раздел[i]}»" if раздел[i] is not None else "до первого раздела"
+                            for i in прочие if i not in свои})
     if inside:
         lines[inside[0]] = line
         for i in sorted(set(inside) - {inside[0]}, reverse=True):
@@ -405,26 +356,12 @@ def _кратко(текст: str, предел: int = 160) -> str:
     return текст if len(текст) <= предел else f"{текст[:предел]}… (всего {len(текст)} знаков)"
 
 
-def _section_of(lines: list[str], fenced: list[bool], index: int) -> str:
-    """Заголовок раздела, в котором лежит строка; «до первого раздела», если
-    строка стоит выше любого заголовка."""
-    for i in range(index, -1, -1):
-        if fenced[i]:
-            continue
-        heading = re.match(r"^##\s+(.+?)\s*$", lines[i])
-        if heading:
-            return f"«{heading.group(1).strip()}»"
-    return "до первого раздела"
-
-
 def rollup_path(scope: str, config: memoryverify.Config) -> str:
     topics = memoryverify.load_topics(config.topics)
     mine = [name for name, (_topic, owner) in topics.placement.items() if owner == scope]
     if not mine:
         raise Refusal(f"у области {scope} нет темы-владельца: указатель класть некуда")
-    if len(mine) > 1:
-        raise Refusal(f"у области {scope} несколько сводок ({', '.join(sorted(mine))}): "
-                      "указатель неоднозначен")
+    # Сводка у области одна: topiclayout требует owner == clients/<ключ темы>.
     return f"memory/topics/{mine[0]}"
 
 
@@ -453,14 +390,9 @@ def compute_files(candidate: dict, head_tree: dict[str, bytes], scope: str,
     slug = projection["record_slug"]
     if not body.strip():
         raise Refusal("тело записи пустое")
-    files: dict[str, bytes | None] = {}
+    files: dict[str, bytes | None] = {f"memory/{slug}.md": body}
     if memoryverify.client_name(scope) is None:
-        data, note = apply_index_projection(body, slug, projection)
-        if note:
-            notes.append(note)
-        files[f"memory/{slug}.md"] = data
         return files, notes
-    files[f"memory/{slug}.md"] = body
     pointer = rollup_path(scope, config)
     rollup = head_tree.get(pointer)
     if rollup is None:
@@ -559,8 +491,7 @@ def make_candidate(*, scope: str, candidate_id: str, source: str, session: str,
     candidate = {
         "scope": scope, "id": candidate_id, "source": source, "session": session,
         "content_type": content_type, "projection": projection, "body": text,
-        "submitted_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-        .replace("+00:00", "Z"),
+        "submitted_at": memoryctl.utc_now(),
         "base": None, "declared": base_revision is not None, "expectations": {},
         "commit": None, "result": {}, "reason": None,
     }
@@ -620,13 +551,11 @@ def refuse_before_submit(*, scope: str, candidate_id: str, source: str, session:
     candidate = {
         "scope": scope, "id": candidate_id, "source": source, "session": session,
         "content_type": content_type, "projection": None, "body": None,
-        "submitted_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-        .replace("+00:00", "Z"),
+        "submitted_at": memoryctl.utc_now(),
         "base": None, "expectations": {}, "commit": None, "result": {}, "reason": reason,
     }
     target = failed_path(scope, candidate_id, state)
-    svodgit.replace_file(target, json.dumps(candidate, ensure_ascii=False, indent=1,
-                                            sort_keys=True).encode("utf-8"))
+    save_candidate(target, candidate)
     return target
 
 
@@ -640,8 +569,7 @@ def fail_candidate(path: Path, candidate: dict, reason: str, state: Path | None 
     if "на секрет" in reason or "possible secret" in reason:
         candidate["body"] = None  # отказ лежит до удаления, секрет в нём не хранить
     target = failed_path(candidate["scope"], candidate["id"], state)
-    svodgit.replace_file(target, json.dumps(candidate, ensure_ascii=False, indent=1,
-                                            sort_keys=True).encode("utf-8"))
+    save_candidate(target, candidate)
     if path.exists():
         path.unlink()
     return target
@@ -875,7 +803,7 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
             notes.append("дерево уже равно HEAD, нового коммита нет")
         else:
             if head and candidate.get("commit") is None and not candidate.get("declared") \
-                    and svodgit.subject_exists(root, COMMIT_PREFIX + candidate["id"], "HEAD"):
+                    and svodgit.subject_exists(root, COMMIT_PREFIX + candidate["id"]):
                 # Имя уже занято в истории, и подача не назвала версию, на
                 # которой читала запись: без этого не отличить осознанную
                 # правку от случайного повтора чужого id. С объявленной
@@ -900,21 +828,16 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
             if not report.ok:
                 _restore(root, files, head_tree)
                 raise Refusal("; ".join(report.errors))
-            commit = svodgit.commit_tree(root, tree, head, COMMIT_PREFIX + candidate["id"])
-            if svodgit.tree_of(root, commit) != tree:
-                _restore(root, files, head_tree)
-                raise Wait("дерево коммита не равно проверенному; повтор в следующем проходе")
+            commit = svodgit.out(root, "commit-tree", tree, *(["-p", head] if head else []),
+                                 "-m", COMMIT_PREFIX + candidate["id"])
             svodgit.update_ref(root, "refs/heads/main", commit, head)
-            candidate["commit"] = commit
         candidate["commit"] = commit
         # Все файлы кандидата, а не только прямые пути: указатель клиентской
         # записи живёт в сводке, и доставка без него это не доставка.
         candidate["result"] = {p: svodgit.blob(root, commit, p) for p in files}
-        candidate["reason"] = None
+        candidate["reason"] = None if fetched else "сети нет; коммит локальный, таймер отправит"
         save_candidate(path, candidate)
         if not fetched:
-            candidate["reason"] = "сети нет; коммит локальный, таймер отправит"
-            save_candidate(path, candidate)
             return {"state": "pending", "commit": commit, "reason": candidate["reason"],
                     "notes": notes, "warnings": report.warnings}
         outcome, words, final = publish(root, scope, commit, config, scanner=scanner, today=today,
@@ -1001,10 +924,9 @@ def rebase_onto(root: Path, scope: str, commit: str, remote: str,
 def publish(root: Path, scope: str, commit: str, config: memoryverify.Config, *,
             scanner: str | None = None, today: dt.date | None = None,
             verify_ahead: bool = False) -> tuple[str, str, str]:
-    """Опубликовать ровно этот коммит в main сервера. Вершина сервера
-    берётся из fetch этого прохода. (saved|pending, слова, итоговый коммит)."""
-    if not svodgit.has_remote(root):
-        return "pending", "у репозитория нет origin; публиковать некуда", commit
+    """Опубликовать ровно этот коммит в main сервера. Зовётся только после
+    удавшегося fetch этого прохода (без origin fetch не удаётся), вершина
+    сервера берётся из него. (saved|pending, слова, итоговый коммит)."""
     for _round in range(PUBLISH_ROUNDS):
         remote = svodgit.remote_head(root)
         if remote and svodgit.is_ancestor(root, commit, remote):
@@ -1036,30 +958,18 @@ def publish(root: Path, scope: str, commit: str, config: memoryverify.Config, *,
 # ---------------------------------------------------------------------------
 # Доставка и повтор ожидающих (таймер)
 
-def blobs_match(root: Path, commit: str, result: dict[str, str | None]) -> bool:
-    return bool(result) and all(svodgit.blob(root, commit, p) == oid for p, oid in result.items())
-
-
-def delivered(root: Path, candidate: dict) -> bool:
-    """Доставка доказана git-ом: хеш достижим из origin/main либо blob
-    каждого прямого пути на сервере равен результату коммита."""
+def reached(root: Path, candidate: dict, tip: str | None) -> bool:
+    """Коммит кандидата дошёл до вершины, и доказывает это git: хеш достижим
+    из неё либо blob каждого файла результата в ней равен результату коммита.
+    Вершина сервера (origin/main) доказывает доставку, HEAD локальный коммит.
+    Пустой result доставкой не считается."""
     commit = candidate.get("commit")
-    remote = svodgit.remote_head(root)
-    if not commit or not remote:
+    if not commit or not tip:
         return False
-    if svodgit.rev(root, commit) and svodgit.is_ancestor(root, commit, remote):
+    if svodgit.rev(root, commit) and svodgit.is_ancestor(root, commit, tip):
         return True
-    return blobs_match(root, remote, candidate.get("result") or {})
-
-
-def committed_locally(root: Path, candidate: dict) -> bool:
-    commit = candidate.get("commit")
-    head = svodgit.head(root)
-    if not commit or not head:
-        return False
-    if svodgit.rev(root, commit) and svodgit.is_ancestor(root, commit, head):
-        return True
-    return blobs_match(root, head, candidate.get("result") or {})
+    result = candidate.get("result") or {}
+    return bool(result) and all(svodgit.blob(root, tip, p) == oid for p, oid in result.items())
 
 
 def drop_settled_failures(root: Path, scope: str, config: memoryverify.Config, *,
@@ -1126,11 +1036,11 @@ def retry_pending(root: Path, scope: str, config: memoryverify.Config, *,
             continue
         try:
             if candidate.get("commit"):
-                if fetched and delivered(root, candidate):
+                if fetched and reached(root, candidate, svodgit.remote_head(root)):
                     path.unlink()
                     outcomes.append({"id": candidate["id"], "state": "delivered"})
                     continue
-                if committed_locally(root, candidate):
+                if reached(root, candidate, svodgit.head(root)):
                     outcomes.append({"id": candidate["id"], "state": "committed",
                                      "reason": candidate.get("reason")})
                     continue

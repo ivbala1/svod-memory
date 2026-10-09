@@ -20,23 +20,22 @@ def probes_for_root(laid_out: Path, *, today=None) -> dict:
     записи не считаются: их автоматический отбор не выдаёт по построению."""
     сегодня = today if today is not None else mc.today_utc()
     записи = mc.parse_index(mc.build_index(laid_out))
-    достижимые = tuple(e for e in записи if e.section in mc.INDEX_SECTIONS.values())
-    по_слагу = {Path(e.slug).stem: e for e in достижимые}
+    по_слагу = {Path(e.slug).stem: e for e in записи}
     итог = {"total": 0, "hit1": 0, "hit2": 0, "hit5": 0, "misses": [], "second_place": []}
     for файл in sorted((laid_out / "memory").glob("*.md")):
         if файл.name in mv.SERVICE_FILES:
             continue
         поля, ошибка = mv.parse_frontmatter(файл.read_text(encoding="utf-8", errors="replace"))
-        if ошибка or поля_probe(поля) is None or поля.get("listed") == "false":
+        probe = (поля.get("probe") or "").strip()
+        if ошибка or not probe or поля.get("listed") == "false":
             continue
         slug = файл.stem
         if slug not in по_слагу:
             continue
-        probe = поля_probe(поля)
         итог["total"] += 1
         выдано = [Path(e.slug).stem for e, _ in mc.select_index_entries(
             laid_out, probe, записи, today=сегодня)]
-        по_счёту = sorted(((mc._entry_score(probe, e), e) for e in достижимые),
+        по_счёту = sorted(((mc._entry_score(probe, e), e) for e in записи),
                           key=lambda p: (-p[0], p[1].index))
         ранг = next((i + 1 for i, (_, e) in enumerate(по_счёту)
                      if Path(e.slug).stem == slug), None)
@@ -52,11 +51,6 @@ def probes_for_root(laid_out: Path, *, today=None) -> dict:
         if ранг is not None and ранг <= 5:
             итог["hit5"] += 1
     return итог
-
-
-def поля_probe(поля: dict) -> str | None:
-    probe = (поля.get("probe") or "").strip()
-    return probe or None
 
 
 def report(root: Path, *, today=None) -> dict:

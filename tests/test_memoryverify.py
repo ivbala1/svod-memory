@@ -187,16 +187,26 @@ class HeaderTests(unittest.TestCase):
         self.assertTrue(any("colour" in e for e in errors), errors)
         self.assertTrue(any("observed_at" in e and "ISO" in e for e in errors), errors)
 
-    def test_supersedes_and_link_fields_still_checked(self):
+    def test_date_passed_is_inclusive_and_broken_date_does_not_hide(self):
+        """Дата действует по свой день включительно; пустая и битая не прошли."""
+        день = dt.date(2026, 10, 9)
+        for значение, итог in (("2026-10-09", None), ("2026-10-08", "2026-10-08"),
+                               ("", None), ("вчера", None)):
+            self.assertEqual(итог, mv.date_passed({"valid_until": значение}, "valid_until", день))
+        self.assertIsNone(mv.date_passed({}, "review_after", день))
+
+    def test_supersedes_checked_link_fields_have_no_reader(self):
+        """Комплекты по requires и contradicts сняты 09.10.2026: поля без
+        читателя у новой записи это отказ, как любая опечатка в имени поля."""
         base = base_tree()
         cand = dict(base)
         cand["memory/user_cat.md"] = record(
             "user_cat", type="user", title="Кот", index="как зовут кота",
             source="разговор", observed_at="2026-09-04", probe="имя кота",
-            supersedes="user_cat", requires="nobody")
+            supersedes="user_cat", requires="nobody", contradicts="nobody")
         errors = mv.header_errors(base, cand)
         self.assertTrue(any("сам на себя" in e for e in errors), errors)
-        self.assertTrue(any("nobody" in e for e in errors), errors)
+        self.assertTrue(any("без читателя: contradicts, requires" in e for e in errors), errors)
 
 
 class LinkTests(unittest.TestCase):
@@ -262,7 +272,6 @@ class ProbeTests(unittest.TestCase):
         base = base_tree()
         good = check(self._tree("чем чинить принтер зелёного цвета"), base)
         self.assertTrue(good.ok, good.errors)
-        self.assertEqual(good.facts["probes"], {"reference_printer": True})
         bad = check(self._tree("рецепт борща на зиму"), base)
         self.assertTrue(any("не находит запись" in e for e in bad.errors), bad.errors)
 
@@ -275,7 +284,6 @@ class ProbeTests(unittest.TestCase):
             b"---\n", b"---\nvalid_until: 2020-01-01\n", 1)
         report = check(cand, base)
         self.assertFalse(any("не находит запись" in e for e in report.errors), report.errors)
-        self.assertNotIn("reference_printer", report.facts["probes"])
         cand["memory/reference_printer.md"] = cand["memory/reference_printer.md"].replace(
             b"valid_until: 2020-01-01", b"valid_until: 2999-12-31", 1)
         report = check(cand, base)
@@ -296,13 +304,14 @@ class ProbeTests(unittest.TestCase):
             cand[f"memory/{name}.md"] = record(
                 name, type="reference", title=hook.capitalize(), index=hook,
                 source="разговор", observed_at="2026-09-04", probe=probe, body="Факт.\n")
-        with mock.patch.object(mc, "build_index", wraps=mc.build_index) as reads:
+        with mock.patch.object(mc, "select_index_entries",
+                               wraps=mc.select_index_entries) as ranked:
             report = check(cand, base_tree(), questions=False)
         self.assertTrue(report.ok, report.errors)
-        self.assertEqual(report.facts["probes"], {"reference_printer": True,
-                                                  "reference_kettle": True,
-                                                  "reference_toaster": True})
-        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(ranked.call_count, 3)
+        первый = ranked.call_args_list[0].args[2]
+        for вызов in ranked.call_args_list:
+            self.assertIs(вызов.args[2], первый)
 
     def test_client_probe_through_topic_delivery(self):
         rollup = ("# Acme\n\n## Обзор\n\nУстройство системы.\n\n"
@@ -409,10 +418,9 @@ class SectionTests(unittest.TestCase):
         topics = mv.load_topics(TOPICS_RAW)
         fat = "# Home\n\n## Обзор\n\n" + ("слово " * 800) + "\n"
         base = {"memory/topics/home.md": fat.encode("utf-8")}
-        facts = {}
-        self.assertEqual(mv.section_errors(base, base, topics, facts)[0], [])
+        self.assertEqual(mv.section_errors(base, base, topics)[0], [])
         cand = {"memory/topics/home.md": (fat + "ещё\n").encode("utf-8")}
-        errors, _ = mv.section_errors(base, cand, topics, facts)
+        errors, _ = mv.section_errors(base, cand, topics)
         self.assertTrue(any("потолке" in e for e in errors), errors)
 
     def test_unselectable_new_section_is_a_warning(self):
@@ -420,7 +428,7 @@ class SectionTests(unittest.TestCase):
         base = base_tree()
         cand = dict(base)
         cand["memory/topics/home.md"] = "# Home\n\n## Обзор\n\nДом.\n\n## Прочее\n\nХвост.\n".encode("utf-8")
-        errors, warnings = mv.section_errors(base, cand, topics, {})
+        errors, warnings = mv.section_errors(base, cand, topics)
         self.assertEqual(errors, [])
         self.assertTrue(any("не выберет" in w for w in warnings), warnings)
 
@@ -471,12 +479,13 @@ class StandTests(unittest.TestCase):
                         report.warnings)
 
     def test_stand_skipped_without_index_or_questions(self):
+        import memoryeval
         base = {"memory/topics/acme.md": b"# Acme\n", "memory/MEMORY.md": b"# I\n"}
-        report = check(base, base, root="clients/acme")
-        self.assertTrue(report.ok, report.errors)
-        self.assertNotIn("stand", report.facts)
-        report = check(base_tree(), base_tree(), questions=False)
-        self.assertNotIn("stand", report.facts)
+        with mock.patch.object(memoryeval, "stand") as stand:
+            report = check(base, base, root="clients/acme")
+            self.assertTrue(report.ok, report.errors)
+            check(base_tree(), base_tree(), questions=False)
+        stand.assert_not_called()
 
     def test_absolute_failures_reject_writer_even_without_a_base(self):
         tree = base_tree()
@@ -508,12 +517,13 @@ class StandTests(unittest.TestCase):
 
 
 class CheckTests(unittest.TestCase):
-    def test_unchanged_tree_is_green_and_facts_are_words(self):
+    def test_unchanged_tree_is_green_and_stand_runs(self):
+        import memoryeval
         base = base_tree()
-        report = check(base, base)
+        with mock.patch.object(memoryeval, "stand", wraps=memoryeval.stand) as stand:
+            report = check(base, base)
         self.assertTrue(report.ok, report.errors)
-        self.assertEqual(report.facts["touched"], {})
-        self.assertEqual(report.facts["stand"]["tuned"], {"found": 1, "delivered": 1, "of": 1})
+        self.assertEqual(stand.call_count, 2)
 
     def test_first_commit_has_no_base(self):
         cand = base_tree()
@@ -524,7 +534,6 @@ class CheckTests(unittest.TestCase):
             body="Зелёный принтер чинится молотком.\n")
         report = check(cand, None)
         self.assertTrue(report.ok, report.errors)
-        self.assertEqual(report.facts["touched"], {"reference_printer": "new"})
 
 
 class DeliveryWarningTests(unittest.TestCase):

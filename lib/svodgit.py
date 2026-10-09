@@ -59,8 +59,7 @@ class Busy(Exception):
 # Подпроцессы
 
 def git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC,
-        check: bool = True, env: dict | None = None,
-        data: bytes | None = None) -> subprocess.CompletedProcess:
+        check: bool = True, data: bytes | None = None) -> subprocess.CompletedProcess:
     """Один вызов git в репозитории. check: ненулевой код это GitError."""
     окружение = dict(os.environ)
     # Ответы git разбираются по словам («couldn't find remote ref»), поэтому
@@ -68,8 +67,6 @@ def git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SEC,
     # не шаблоны: `*`, `?`, `[` в имени записи не должны раскрываться.
     окружение["LC_ALL"] = "C"
     окружение["GIT_LITERAL_PATHSPECS"] = "1"
-    if env:
-        окружение.update(env)
     try:
         # Своя группа процессов: по сроку гасится вся группа, и вместе с git
         # умирает его ssh, а не остаётся сиротой ждать ответа ssh-агента.
@@ -204,12 +201,12 @@ def blob(root: Path, commit: str, path: str) -> str | None:
     return result.stdout.decode().strip()
 
 
-def read_tree(root: Path, commit: str | None, prefix: str = "memory/") -> dict[str, bytes]:
+def read_tree(root: Path, commit: str | None) -> dict[str, bytes]:
     """Дерево области памяти коммита как отображение «путь -> байты».
     Пустое, если коммита нет (репозиторий без истории)."""
     if commit is None:
         return {}
-    listing = git(root, "ls-tree", "-r", "-z", commit, "--", prefix.rstrip("/"), check=False)
+    listing = git(root, "ls-tree", "-r", "-z", commit, "--", "memory", check=False)
     if listing.returncode != 0:
         # У живого коммита ls-tree всегда успешен, даже когда каталога памяти
         # в нём нет: пустая выдача это пустое дерево. Ненулевой код значит
@@ -250,14 +247,6 @@ def write_tree(root: Path) -> str:
     return out(root, "write-tree")
 
 
-def commit_tree(root: Path, tree: str, parent: str | None, message: str) -> str:
-    args = ["commit-tree", tree]
-    if parent:
-        args += ["-p", parent]
-    args += ["-m", message]
-    return out(root, *args)
-
-
 def update_ref(root: Path, ref: str, new: str, old: str | None) -> None:
     """Перевод ссылки со сверкой старого значения; пустое старое значение
     значит «ссылки ещё нет»."""
@@ -283,10 +272,9 @@ def fast_forward(root: Path, head: str | None, remote: str | None) -> bool:
     return True
 
 
-def subject_exists(root: Path, subject: str, ref: str = "HEAD") -> bool:
-    if rev(root, ref) is None:
-        return False
-    result = git(root, "log", "--fixed-strings", "--grep", subject, "--format=%s", ref, check=False)
+def subject_exists(root: Path, subject: str) -> bool:
+    """Коммит с этой темой в истории HEAD; на нерождённом HEAD git log пуст."""
+    result = git(root, "log", "--fixed-strings", "--grep", subject, "--format=%s", "HEAD", check=False)
     return any(line.strip() == subject for line in result.stdout.decode("utf-8", "replace").splitlines())
 
 
@@ -412,13 +400,13 @@ def scan_range(root: Path, old: str | None, new: str, scanner: str | None = None
 # Замок
 
 @contextlib.contextmanager
-def lock(root: Path, *, exclusive: bool, wait: float | None = None):
+def lock(root: Path, *, exclusive: bool):
     """flock на .git/svod.lock. Эксклюзивный ждёт до 60 секунд, дальше Busy;
     разделяемый ждёт до 10 секунд и отдаёт управление даже без замка
     (читатель читает всегда). Отдаёт True, если замок взят; False, если
     замок есть, но не взят (срок вышел, файл не открывается); None, если
     замка у корня нет (выложенное дерево, фикстура без git)."""
-    limit = wait if wait is not None else (EXCLUSIVE_WAIT_SEC if exclusive else SHARED_WAIT_SEC)
+    limit = EXCLUSIVE_WAIT_SEC if exclusive else SHARED_WAIT_SEC
     path = None
     try:
         # Обычный клон: каталог .git известен без подпроцесса; читатель берёт
@@ -530,15 +518,11 @@ def require_marker(root: Path, scope: str) -> None:
     отказывает словами."""
     found = read_marker(root)
     if found is None:
-        raise ValueError(f"{root}: нет {MARKER_NAME}; репозиторий памяти области {scope} "
-                         "помечается установщиком или коммитом перехода")
+        raise ValueError(f"{root}: нет {MARKER_NAME}; метку области {scope} несёт "
+                         "корень репозитория памяти, она приезжает с клоном")
     if found != scope:
         raise ValueError(f"{root}: {MARKER_NAME} говорит {found}, ожидалась область {scope}; "
                          "по этому пути лежит чужой репозиторий")
-
-
-def write_marker(root: Path, scope: str) -> None:
-    (root / MARKER_NAME).write_text(json.dumps({"scope": scope}) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

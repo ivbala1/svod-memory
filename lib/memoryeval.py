@@ -52,14 +52,14 @@ import configpaths
 import memorycontext as mc
 import memoryverify
 import svodgit
-from memoryctl import compute_revision, federation_context
+from memoryctl import compute_revision
 
 QUESTIONS_PATH = configpaths.config_path("eval_questions.json")
 # Исходная точка живёт рядом с вопросами, в каталоге конфигурации
 # (решение владельца В-11 от 31.08.2026): код обязан переноситься и
 # публиковаться отдельно от планки качества личного корпуса. История точки
 # это git того же репозитория: команда baseline коммитит её сама.
-BASELINE_PATH = configpaths.baseline_path()
+BASELINE_PATH = configpaths.config_path("eval_baseline.json")
 
 # Конфигурация тем входит в отпечаток разобранной и без полей сводок
 # заказчиков, которые правят клиентские сессии: терминов и разделов по
@@ -80,44 +80,40 @@ MEASUREMENT_FILES = (
     Path(__file__),
     HERE / "topiclayout.py",
     HERE / "configpaths.py",
-    # Шапки записей (заголовок, крючок, срок) разбирает memoryverify, а
-    # memoryctl его реэкспортирует: правка разбора меняет ранги.
+    # Шапки записей (заголовок, крючок, срок) разбирает memoryverify:
+    # правка разбора меняет ранги. memoryctl даёт роутеру ревизию и карту
+    # областей.
     HERE / "memoryverify.py",
     HERE / "memoryctl.py",
     TOPICS_PATH,
 )
 
 
-class EvalError(Exception):
-    """Отказ стенда, который нельзя молча проглотить."""
-
-
 def load_questions(path: Path = QUESTIONS_PATH) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not data.get("questions") or not data.get("negatives"):
-        raise EvalError(f"{path}: пустые questions или negatives")
+        raise mc.MemoryctlError(f"{path}: пустые questions или negatives")
     ids = [q["id"] for q in data["questions"]] + [n["id"] for n in data["negatives"]]
     if len(ids) != len(set(ids)):
-        raise EvalError(f"{path}: повторяющиеся идентификаторы вопросов")
+        raise mc.MemoryctlError(f"{path}: повторяющиеся идентификаторы вопросов")
     for q in data["questions"]:
         if q.get("group") not in ("tuned", "heldout"):
-            raise EvalError(f"{path}: у вопроса {q['id']} нет группы tuned/heldout")
+            raise mc.MemoryctlError(f"{path}: у вопроса {q['id']} нет группы tuned/heldout")
         expect = q.get("expect")
         if not isinstance(expect, str) or not memoryverify.SLUG_RE.fullmatch(expect):
-            raise EvalError(f"{path}: у вопроса {q['id']} нет ожидаемой записи expect "
-                            "(имя одной записи без .md)")
+            raise mc.MemoryctlError(f"{path}: у вопроса {q['id']} нет ожидаемой записи expect "
+                                    "(имя одной записи без .md)")
         if not q.get("markers"):
-            raise EvalError(f"{path}: у вопроса {q['id']} нет признаков ответа markers")
+            raise mc.MemoryctlError(f"{path}: у вопроса {q['id']} нет признаков ответа markers")
         forbid = q.get("forbid", [])
         if (not isinstance(forbid, list)
                 or any(not isinstance(f, str) or not memoryverify.SLUG_RE.fullmatch(f)
                        for f in forbid)):
-            raise EvalError(f"{path}: у вопроса {q['id']} forbid не список имён записей")
+            raise mc.MemoryctlError(f"{path}: у вопроса {q['id']} forbid не список имён записей")
     return data
 
 
-def measurement_fingerprint(files: tuple[Path, ...] | None = None,
-                            substitute: dict | None = None) -> str:
+def measurement_fingerprint(files: tuple[Path, ...] | None = None) -> str:
     """Отпечаток измерителя: байты модулей ЦЕЛИКОМ, конфигурация тем без
     полей сводок заказчиков (`measured_topics`).
 
@@ -136,10 +132,7 @@ def measurement_fingerprint(files: tuple[Path, ...] | None = None,
     """
     куски = []
     for путь in (files or MEASUREMENT_FILES):
-        if substitute is not None and путь in substitute:
-            байты = substitute[путь]
-        else:
-            байты = путь.read_bytes()
+        байты = путь.read_bytes()
         куски.append(measured_topics(байты) if путь == TOPICS_PATH else байты)
     return hashlib.sha256(b"".join(куски)).hexdigest()
 
@@ -205,7 +198,6 @@ def stand(root: Path, questions: dict, *, today=None, ранжировать=Non
         ранжировать = lambda prompt, записи: mc.select_index_entries(
             root, prompt, записи, today=today)
     записи = mc.parse_index(mc.build_index(root))
-    достижимые = tuple(e for e in записи if e.section in mc.INDEX_SECTIONS.values())
 
     по_вопросам = {}
     for q in questions["questions"]:
@@ -215,7 +207,7 @@ def stand(root: Path, questions: dict, *, today=None, ранжировать=Non
         признак = False if нет else _evidence(файл, q["markers"])
         отобрано = tuple(ранжировать(q["text"], записи))
         выдано = [Path(e.slug).stem for e, _ in отобрано]
-        полный = sorted(((mc._entry_score(q["text"], e), e) for e in достижимые),
+        полный = sorted(((mc._entry_score(q["text"], e), e) for e in записи),
                         key=lambda p: (-p[0], p[1].index))
         ранг = next((i + 1 for i, (_, e) in enumerate(полный)
                      if Path(e.slug).stem == ожидаемая), None)
@@ -226,7 +218,7 @@ def stand(root: Path, questions: dict, *, today=None, ранжировать=Non
         # Запрет на запись, которой нет в индексе (свёрнута, удалена), не
         # проверяем и не считаем: он ничего не ловит, и самопроверка не
         # должна ждать от него срабатывания.
-        в_индексе = {Path(e.slug).stem for e in достижимые}
+        в_индексе = {Path(e.slug).stem for e in записи}
         устаревшие_запреты = sorted(f for f in q.get("forbid", []) if f not in в_индексе)
         по_вопросам[q["id"]] = {
             "group": q["group"],
@@ -266,14 +258,14 @@ def absolute_failures(result: dict) -> list[dict]:
 
 def personal_root(root: Path) -> Path:
     try:
-        контекст = federation_context(root)
+        контекст = mc.reader_federation(root)
     except ValueError as exc:
         # Битый federationMembers: отказ словами, а не трассировка с кодом 1,
         # который у compare значит регрессию.
-        raise EvalError(str(exc)) from exc
-    if "personal" not in контекст.available:
-        raise EvalError(f"{root}: нет личного репозитория personal/memory, стенд меряет его индекс")
-    return контекст.identities["personal"].worktree_root
+        raise mc.MemoryctlError(str(exc)) from exc
+    if "personal" not in контекст:
+        raise mc.MemoryctlError(f"{root}: нет личного репозитория personal/memory, стенд меряет его индекс")
+    return контекст["personal"]
 
 
 def run(root: Path, *, ранжировать=None, questions: dict | None = None) -> dict:
@@ -383,7 +375,7 @@ def pairwise(baseline: dict, current: dict) -> dict:
 
 def _everything(prompt, записи):
     """Саботаж «всё подряд»: каждая достижимая запись в выдаче."""
-    return tuple((e, 0) for e in записи if e.section in mc.INDEX_SECTIONS.values())
+    return tuple((e, 0) for e in записи)
 
 
 def selfcheck(root: Path) -> dict:
@@ -422,8 +414,7 @@ def selfcheck(root: Path) -> dict:
                    if set(q.get("forbid", [])) - set(всё["questions"][q["id"]]["stale_forbid"]))
     попаданий = sum(1 for r in сравнение_всё.get("absolute", [])
                     if r["why"].startswith("выдана запрещённая запись"))
-    записей = len([e for e in mc.parse_index(mc.build_index(personal_root(root)))
-                   if e.section in mc.INDEX_SECTIONS.values()])
+    записей = len(mc.parse_index(mc.build_index(personal_root(root))))
     шире = sum(1 for r in сравнение_всё.get("absolute", [])
                if r["why"].startswith("выдача шире потолка"))
     ожидается_шире = len(всё["questions"]) if записей > mc.DELIVERY_LIMIT else 0

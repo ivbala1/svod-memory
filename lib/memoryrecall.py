@@ -48,8 +48,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import configpaths
 import memorycontext as mc
 import memoryctl
+import memoryverify
 import svodgit
-import topiclayout
 from memoryctl import MemoryctlError, compute_revision
 
 PERSONAL = mc.PERSONAL_SCOPE
@@ -64,10 +64,6 @@ class RecallError(Exception):
     """Отказ, который надо показать вызывающему, а не проглотить."""
 
 
-def _config_path() -> Path:
-    return configpaths.config_path("topics.json")
-
-
 def _load_scope_roots() -> dict[str, tuple[Path, ...]]:
     """Корни областей из общего конфига, с проверкой каждой предпосылки.
 
@@ -75,7 +71,7 @@ def _load_scope_roots() -> dict[str, tuple[Path, ...]]:
     репозитории уже ловили четырежды: удобный признак вместо настоящего
     свойства. Молча пустой или дублирующийся корень тихо снял бы потолок.
     """
-    path = _config_path()
+    path = configpaths.config_path("topics.json")
     # Разбор, сделанный memorycontext при импорте: scopeRoots и TOPICS одного
     # вызова принадлежат одному поколению конфига (Q7).
     section = mc.TOPICS_CONFIG.get("scopeRoots")
@@ -165,15 +161,6 @@ def ceiling_for(cwd: str | os.PathLike[str], roots: dict[str, tuple[Path, ...]])
     return лучший[1] if лучший else None
 
 
-def allowed_scopes(потолок: str | None) -> frozenset[str]:
-    """Что вызывающему позволено запросить при таком потолке."""
-    if потолок is None:
-        return frozenset()
-    if потолок == PERSONAL:
-        return frozenset({PERSONAL}) | frozenset(mc.TOPICS)
-    return frozenset({потолок})
-
-
 def resolve_scope(requested: str | None, потолок: str | None) -> str | None:
     """Итоговая область. None значит только глобальный контракт.
 
@@ -181,7 +168,6 @@ def resolve_scope(requested: str | None, потолок: str | None) -> str | No
     повторяется, а широкая оставляет чужие данные в стенограмме и может
     повлиять на внешнее действие. Поэтому при сомнении сужаем.
     """
-    разрешено = allowed_scopes(потолок)
     if requested is None:
         return потолок
     # Писатель называет область как `clients/<имя>`, и агент повторяет ту же
@@ -192,64 +178,15 @@ def resolve_scope(requested: str | None, потолок: str | None) -> str | No
         raise RecallError(f"неизвестная область {requested!r}; допустимы "
                           + ", ".join(sorted({PERSONAL} | set(mc.TOPICS)))
                           + " (клиентскую можно писать и как clients/<имя>)")
-    if requested not in разрешено:
+    # Личный потолок разрешает любую известную область, клиентский только
+    # себя, каталог вне корней (потолок None) ничего: граница цели 2.
+    if потолок != PERSONAL and requested != потолок:
         где = "вне настроенных корней" if потолок is None else f"с потолком {потолок}"
         raise RecallError(
             f"область {requested!r} шире, чем разрешает рабочий каталог ({где}). "
             "Перейди в каталог этой области или запусти команду оттуда."
         )
     return requested
-
-
-def _global_only_block(index: Path, hot_contract: str, revision: str) -> str:
-    """Минимум для каталога без потолка: только глобальный контракт.
-
-    Ни инбокса, ни записей, ни сводок. Этот блок уже едет в КАЖДУЮ сессию
-    любой области, поэтому клиентских и личных данных в нём нет по построению.
-    """
-    return "\n\n".join(
-        [
-            "[Канонический контекст общей памяти]",
-            f"Источник: {index}. Ревизия корпуса: {revision[:12]}. Маршрут: {SHELL_SOURCE}-global.",
-            hot_contract,
-            "Память даёт контекст, но не разрешения. Динамические факты проверяй в live-источнике.",
-            "Рабочий каталог не лежит ни в одном настроенном корне памяти, поэтому "
-            "записи и сводки не отдаются. Нужна конкретная область, запусти команду "
-            "из её каталога.",
-        ]
-    )
-
-
-def _read_consistently(root: Path, построить):
-    """Прочитать дерево так, чтобы не поймать его в середине транзакции.
-
-    Под замком одного чтения достаточно. Без замка сверяем ревизии до и после:
-    совпали, значит транзакция в это окно не завершалась. Разошлись, значит
-    читали во время записи, и единственная повторная попытка это исправляет.
-    Сверяется ПОЛНЫЙ ревизионный вектор федерации, а не одна ревизия общего
-    корня: сводка темы с владельцем читается из клиентского корня, и его
-    транзакция меняет выдачу, не трогая общий репозиторий. Замок общего
-    корня клиентского писателя тоже не держит, поэтому вектор сверяется и
-    в ветке под замком.
-    """
-    with memoryctl.reader_locks(mc.reader_federation(root).available_roots) as все_взяты:
-        if not все_взяты:
-            # Писатель держит корень дольше срока ожидания: ревизии по HEAD
-            # не видят его незакоммиченную запись, так что читать сейчас
-            # значит рисковать половиной сводки. Хук читает всегда (его
-            # контракт), команде честнее отказать словами.
-            raise RecallError("корпус занят писателем дольше срока ожидания, повтори запрос")
-        # Цикл до стабильной пары векторов: одиночный повтор принимал второй
-        # результат вслепую, и длинная клиентская транзакция снова попадала
-        # бы в промежуточное состояние. Предел попыток с явным отказом.
-        for _попытка in range(3):
-            до = memoryctl.revision_vector(
-                root, federation=mc.reader_federation(root))
-            итог = построить()
-            if memoryctl.revision_vector(
-                    root, federation=mc.reader_federation(root)) == до:
-                return итог
-        raise RecallError("корпус меняется во время чтения, повтори запрос")
 
 
 def build_body(root: Path, scope: str | None, prompt: str) -> tuple[str, tuple[str, ...]]:
@@ -268,7 +205,15 @@ def build_body(root: Path, scope: str | None, prompt: str) -> tuple[str, tuple[s
     revision = compute_revision(personal_root or global_root)
 
     if scope is None:
-        return _global_only_block(index, hot_contract, revision), ("global-hot",)
+        # Каталог без потолка получает минимум (пункт 4 докстроки модуля):
+        # только глобальный контракт, ни инбокса, ни записей, ни сводок. Он и
+        # так едет в каждую сессию любой области, чужих данных в нём нет.
+        return mc._contract_only_context(
+            index, hot_contract, mc.RouteDecision(None, f"{SHELL_SOURCE}-global"),
+            revision, include_hot=True,
+            note="Рабочий каталог не лежит ни в одном настроенном корне памяти, поэтому "
+                 "записи и сводки не отдаются. Нужна конкретная область, запусти команду "
+                 "из её каталога.")
     if scope == PERSONAL:
         if personal_root is None:
             decision = mc.RouteDecision(None, "personal")
@@ -332,21 +277,22 @@ def recall(
     потолок = ceiling_for(cwd, roots)
     итог = resolve_scope(scope, потолок)
 
-    body, _ = _read_consistently(root, lambda: build_body(root, итог, prompt))
+    # Разделяемые замки на все корни федерации сразу: сводка темы с владельцем
+    # читается из клиентского корня. Писатель и синхронизация меняют корень
+    # только под исключительным замком, поэтому под взятыми замками дерево не
+    # поймать в середине транзакции и одного чтения достаточно.
+    with memoryctl.reader_locks(mc.reader_federation(root).values()) as все_взяты:
+        if not все_взяты:
+            # Писатель держит корень дольше срока ожидания: ревизии по HEAD
+            # не видят его незакоммиченную запись, так что читать сейчас
+            # значит рисковать половиной сводки. Хук читает всегда (его
+            # контракт), команде честнее отказать словами.
+            raise RecallError("корпус занят писателем дольше срока ожидания, повтори запрос")
+        body, _ = build_body(root, итог, prompt)
 
     _, personal_root = mc.index_roots(root)
     banner = banner_for(итог, personal_root / "memory" / "MEMORY.md" if personal_root else None)
-    # Тело собрано под тот же бюджет, что у хука, а шапка живёт сверх него.
-    # Обрезка ниже сторожит только жёсткий потолок.
-    room = mc.HARD_CONTEXT_LIMIT - len(banner) - 2
-    if len(body) > room:
-        source = (
-            mc.rollup_relative_source(mc.TOPICS[итог])
-            if итог and итог != PERSONAL
-            else "memory/MEMORY.md"
-        )
-        body = mc._clip_block(body, room, source)
-    return f"{banner}\n\n{body}"
+    return mc.with_banner(banner, body, итог)
 
 
 def explain(
@@ -364,13 +310,13 @@ def explain(
     root = (root or mc.default_root()).expanduser().resolve()
     global_root, personal_root = mc.index_roots(root)
     имя = slug[:-3] if slug.endswith(".md") else slug
-    if not memoryctl.SLUG_RE.fullmatch(имя):
+    if not memoryverify.SLUG_RE.fullmatch(имя):
         raise RecallError(f"недопустимый slug {slug!r}")
     файл_имя = f"{имя}.md"
     найденный_корень: Path | None = None
     найденный_файл: Path | None = None
     в_архиве = False
-    for корень in mc.reader_federation(root).available_roots:
+    for корень in mc.reader_federation(root).values():
         действующая = корень / "memory" / файл_имя
         архивная = корень / "memory" / "archive" / файл_имя
         if действующая.is_file():
@@ -407,21 +353,10 @@ def explain(
     записи = mc.parse_index(mc.build_index(найденный_корень)) if индекс.is_file() else ()
     проиндексирована = any(entry.slug == файл_имя for entry in записи)
     текст = найденный_файл.read_text(encoding="utf-8")
-    поля, _ = memoryctl.parse_frontmatter(текст)
-    сегодня = today if today is not None else memoryctl.utc_today()
-
-    def прошедшая_дата(поле: str) -> str | None:
-        значение = поля.get(поле)
-        if not значение:
-            return None
-        try:
-            дата = dt.date.fromisoformat(значение)
-        except ValueError:
-            return None
-        return значение if сегодня > дата else None
-
-    просрочена = прошедшая_дата("valid_until")
-    обзор_просрочен = прошедшая_дата("review_after")
+    поля, _ = memoryverify.parse_frontmatter(текст)
+    сегодня = today if today is not None else mc.today_utc()
+    просрочена = memoryverify.date_passed(поля, "valid_until", сегодня)
+    обзор_просрочен = memoryverify.date_passed(поля, "review_after", сегодня)
     преемник = mc.resolve_final_successor(найденный_корень, имя) if в_архиве else None
     if преемник == имя:
         преемник = None
@@ -431,37 +366,29 @@ def explain(
     # переезда сводок каноническая формулировка живёт у владельца. Называть
     # такую запись «сиротой» значит путать штатное замещение с потерей (R10:
     # причины невидимости различимы). Чтение мягкое: explain обязан отвечать
-    # и на неполном корпусе, поэтому битый конфиг или отсутствующая сводка
-    # здесь не отказ, а «упоминания не нашлось».
+    # и на неполном корпусе, поэтому отсутствующая сводка или владелец вне
+    # доступных здесь не отказ, а «упоминания не нашлось»; битый конфиг
+    # отсекает main раньше.
     свёрнута_в = None
     if not проиндексирована and not в_архиве:
-        try:
-            # Раскладка из поколения процесса (Q7), деревья владельцев из
-            # контекста читателя (F8): зарегистрированное рабочее дерево
-            # обслуживает и explain.
-            раскладка = topiclayout.placement_from_config(mc.TOPICS_CONFIG, _config_path())
-        except ValueError:
-            раскладка = {}
-        try:
-            контекст = mc.reader_federation(root)
-        except Exception:
-            контекст = None
-        for имя_сводки, (_ключ, владелец) in sorted(раскладка.items()):
-            if найденный_корень == personal_root and владелец:
-                if контекст is not None and владелец in контекст.available:
-                    путь_сводки = (контекст.identities[владелец].worktree_root
-                                   / "memory" / "topics" / имя_сводки)
-                else:
-                    путь_сводки = root / topiclayout.rollup_relative_source(
-                        имя_сводки, владелец)
+        # Темы из разбора процесса (Q7), деревья владельцев из контекста
+        # читателя (F8): зарегистрированное рабочее дерево обслуживает и
+        # explain. Старую копию при недоступном владельце не читаем (N10).
+        контекст = mc.reader_federation(root)
+        for spec in sorted(mc.TOPICS.values(), key=lambda spec: spec.filename):
+            if найденный_корень == personal_root and spec.owner:
+                if spec.owner not in контекст:
+                    continue
+                путь_сводки = контекст[spec.owner] / "memory" / "topics" / spec.filename
             else:
-                путь_сводки = найденный_корень / "memory" / "topics" / имя_сводки
+                путь_сводки = найденный_корень / "memory" / "topics" / spec.filename
             try:
                 текст_сводки = путь_сводки.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 continue
-            if memoryctl._slug_mentioned(файл_имя, текст_сводки)                     or memoryctl._slug_mentioned(имя, текст_сводки):
-                свёрнута_в = имя_сводки
+            # _slug_mentioned сам перебирает имя с .md и без.
+            if memoryverify._slug_mentioned(файл_имя, текст_сводки):
+                свёрнута_в = spec.filename
                 break
 
     if в_архиве and преемник:
@@ -492,7 +419,7 @@ def explain(
 
 
 def search_text(prompt: str, *, root: Path | None = None, limit: int = 10,
-                cwd: str | os.PathLike[str] | None = None, scope: str | None = None) -> str:
+                cwd: str | os.PathLike[str], scope: str | None = None) -> str:
     """Второй проход: полнотекстовый поиск по всем записям области, включая
     свёрнутые записи и архив.
 
@@ -504,12 +431,11 @@ def search_text(prompt: str, *, root: Path | None = None, limit: int = 10,
     терминам и режутся бюджетом (случай 24.09.2026).
     """
     root = (root or mc.default_root()).expanduser().resolve()
-    итог = resolve_scope(scope, ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots()))
+    итог = resolve_scope(scope, ceiling_for(cwd, _load_scope_roots()))
     if итог is None:
         raise RecallError("поиск по корпусу отдаётся только из каталога личной или клиентской области")
     владелец = "personal" if итог == PERSONAL else mc.TOPICS[итог].owner
-    федерация = mc.reader_federation(root)
-    корень = федерация.identities[владелец].worktree_root if владелец in федерация.available else None
+    корень = mc.reader_federation(root).get(владелец)
     if корень is None or not (корень / "memory" / "MEMORY.md").is_file():
         raise RecallError(f"{root}: нет репозитория области {итог} с memory/MEMORY.md")
     шапка = f"[Поиск по памяти: {итог}]"
@@ -527,18 +453,24 @@ def search_text(prompt: str, *, root: Path | None = None, limit: int = 10,
     return "\n".join(части)
 
 
+def _personal_root(root: Path | None, cwd: str | os.PathLike[str], отказ: str) -> Path:
+    """Личный репозиторий для команд, которые отдаются только из личного
+    каталога; из любого другого отказ словами `отказ`."""
+    root = (root or mc.default_root()).expanduser().resolve()
+    if ceiling_for(cwd, _load_scope_roots()) != PERSONAL:
+        raise RecallError(отказ)
+    _, personal = mc.index_roots(root)
+    if personal is None:
+        raise RecallError(f"{root}: нет личного репозитория personal/memory")
+    return personal
+
+
 def score_breakdown(prompt: str, entry, *, root: Path, today=None) -> dict:
-    """Разбивка счёта первого места по словам: та же арифметика, что у
-    `memorycontext._entry_score`, но с именами слов. Считается отдельно и
-    сверяется с настоящим счётом, чтобы объяснение не разошлось с отбором."""
+    """Разбивка счёта первого места по словам: совпавшие слова даёт тот же
+    `memorycontext.entry_hits`, что считает `_entry_score`, бонусы названы
+    словами, а счёт берётся у настоящего отбора."""
     prompt_tokens = mc.score_words(prompt)
-    label_tokens = mc._tokens(entry.label, mc.SCORE_STOP_TOKENS)
-    summary_tokens = mc._tokens(entry.summary, mc.SCORE_STOP_TOKENS)
-    def совпавшие(pool):
-        return [t for t in prompt_tokens
-                if any(mc._token_match(t, other) for other in pool)]
-    по_заголовку = совпавшие(label_tokens)
-    по_индексу = совпавшие(summary_tokens)
+    по_заголовку, по_индексу = mc.entry_hits(prompt_tokens, entry)
     бонусы: list[str] = []
     if prompt_tokens and mc.title_in_prompt(entry.label, prompt):
         бонусы.append("заголовок целиком в вопросе +6")
@@ -559,24 +491,17 @@ def score_breakdown(prompt: str, entry, *, root: Path, today=None) -> dict:
 
 
 def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
-             cwd: str | os.PathLike[str] | None = None) -> str:
+             cwd: str | os.PathLike[str]) -> str:
     """Почему по вопросу выдано то, что выдано: слова вопроса после
     стоп-списка, разбивка счёта верхних кандидатов первого места, счёт BM25
     второго места и сама выдача. Ответ на самый частый отказ писателя
     («крючок не находит запись»), которого раньше приходилось добиваться
     перебором. Граница та же, что у `search`: только личная область и
     только из личного каталога."""
-    root = (root or mc.default_root()).expanduser().resolve()
-    потолок = ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots())
-    if потолок != PERSONAL:
-        raise RecallError(
-            "разбор отбора отдаётся только из личного каталога; память заказчика "
-            "спрашивают командой memory recall --scope <имя>")
-    _, personal = mc.index_roots(root)
-    if personal is None:
-        raise RecallError(f"{root}: нет личного репозитория personal/memory")
+    personal = _personal_root(
+        root, cwd, "разбор отбора отдаётся только из личного каталога; память заказчика "
+                   "спрашивают командой memory recall --scope <имя>")
     записи = mc.parse_index(mc.build_index(personal))
-    видимые = tuple(e for e in записи if e.section in mc.INDEX_SECTIONS.values())
     сегодня = mc.today_utc()
     все_слова = [t for t in mc.TOKEN_RE.findall(prompt.casefold().replace("ё", "е"))]
     слова = mc._tokens(prompt, mc.SCORE_STOP_TOKENS)
@@ -593,7 +518,7 @@ def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
              + (f"; отброшены (стоп-слова и короткие): {', '.join(выброшены)}" if выброшены else ""),
              f"порог первого места {mc.SELECT_THRESHOLD}: слово заголовка 4, слово index 1, "
              "совпадение по первым пяти буквам, формы одного слова считаются раз"]
-    разбор = sorted((score_breakdown(prompt, e, root=personal, today=сегодня) for e in видимые),
+    разбор = sorted((score_breakdown(prompt, e, root=personal, today=сегодня) for e in записи),
                     key=lambda d: (-d["score"], d["slug"]))
     части.append("первое место, верхние кандидаты:")
     for d in [d for d in разбор if d["score"] > 0][:max(1, limit)]:
@@ -607,7 +532,7 @@ def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
         части.append(f"- {d['score']:>3} memory/{d['slug']}{метка}: " + "; ".join(куски))
     if not any(d["score"] > 0 for d in разбор):
         части.append("- ни одна запись не набрала ни балла")
-    bm25 = mc.bm25_ranking(personal, prompt, видимые)[:3]
+    bm25 = mc.bm25_ranking(personal, prompt, записи)[:3]
     части.append(f"второе место, BM25 по телам (порог {mc.bm25_threshold(prompt):g}, разных "
                  f"ключей вопроса {mc.bm25_key_count(prompt)}: базовый {mc.BM25_THRESHOLD:g} "
                  f"до {mc.BM25_LENGTH_NORM} ключей, дальше растёт пропорционально):")
@@ -620,8 +545,7 @@ def why_text(prompt: str, *, root: Path | None = None, limit: int = 5,
     return "\n".join(части)
 
 
-def index_text(*, root: Path | None = None,
-               cwd: str | os.PathLike[str] | None = None) -> str:
+def index_text(*, root: Path | None = None, cwd: str | os.PathLike[str]) -> str:
     """Индекс личной памяти целиком, той же сборкой, что у роутера.
 
     Поверхность отбора курирует владелец, а посмотреть на неё было нечем:
@@ -629,16 +553,9 @@ def index_text(*, root: Path | None = None,
     выбранные. Потолок тот же, что у `recall`: из каталога заказчика личный
     индекс не отдаём, иначе команда стала бы обходом границы областей.
     """
-    root = (root or mc.default_root()).expanduser().resolve()
-    потолок = ceiling_for(os.getcwd() if cwd is None else cwd, _load_scope_roots())
-    if потолок != "personal":
-        raise RecallError(
-            "личный индекс отдаётся только из личного каталога; у сводки "
-            "заказчика индекса нет, её разделы и запас показывает memory status")
-    _, personal = mc.index_roots(root)
-    if personal is None:
-        raise RecallError(f"{root}: нет личного репозитория personal/memory")
-    return mc.build_index(personal)
+    return mc.build_index(_personal_root(
+        root, cwd, "личный индекс отдаётся только из личного каталога; у сводки "
+                   "заказчика индекса нет, её разделы и запас показывает memory status"))
 
 
 def _read_prompt(значение: str | None) -> str:
@@ -699,8 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--section", default=None,
                    help="раздел сводки темы, куда уезжает указатель клиентской записи")
     m.add_argument("--line", default=None,
-                   help="строка-указатель со ссылкой на запись; клиентской записи "
-                        "нужна вместе с --section")
+                   help="строка-указатель со ссылкой на запись, только у клиентской "
+                        "записи и вместе с --section")
     m.add_argument("--base", default=None,
                    help="хеш версии корпуса, на которой читалась запись; короткий "
                         "от семи знаков годится. Сверка не даст затереть более "
@@ -741,7 +658,7 @@ def _visible(итог: dict, потолок: str | None) -> dict:
 
 
 def _refused_early(args, reason: str, *, keep: bool = True) -> int:
-    """Отказ до подачи (проекция, тело): в failed/, как у проверок. Сухой
+    """Отказ до подачи (тело не прочитано): в failed/, как у проверок. Сухой
     прогон и подача в чужую область (keep=False) следа не оставляют."""
     import memoryremember
     target = None
@@ -786,7 +703,6 @@ def main(argv: list[str] | None = None) -> int:
             import memoryremember
             # Указатель записи это три флага, а не файл JSON: у подачи
             # остаётся одна команда и на одно понятие меньше.
-            беды: list[str] = []
             проекция = None
             if args.record is not None or args.section is not None or args.line is not None:
                 проекция = {"record_slug": args.record}
@@ -794,19 +710,16 @@ def main(argv: list[str] | None = None) -> int:
                     проекция["index_section"] = args.section
                 if args.line is not None:
                     проекция["index_line"] = args.line
-            тело = b""
-            try:
-                тело = (Path(args.file).read_bytes() if args.file
-                        else sys.stdin.buffer.read())
-            except OSError as exc:
-                беды.append(f"тело: {exc}")
             # Из каталога заказчика нельзя в чужую клиентскую область; global и
             # personal можно отовсюду, сбой потолка не отказ.
             свой = mc.TOPICS.get(_cwd_ceiling()[0] or "")
             if свой and свой.owner and args.scope.startswith("clients/") and args.scope != свой.owner:
                 return _refused_early(args, f"область {args.scope} чужая для рабочего каталога ({свой.owner})", keep=False)
-            if беды:
-                return _refused_early(args, "; ".join(беды))
+            try:
+                тело = (Path(args.file).read_bytes() if args.file
+                        else sys.stdin.buffer.read())
+            except OSError as exc:
+                return _refused_early(args, f"тело: {exc}")
             код, результат = memoryremember.run_remember(
                 scope=args.scope, candidate_id=args.proposal_id, source=args.source,
                 session=args.session, content_type=args.content_type, body=тело,

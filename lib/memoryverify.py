@@ -14,8 +14,7 @@
 
 Из своих модулей на верхнем уровне сюда входят только svodgit и
 topiclayout: роутер и стенд импортируются внутри функций, потому что роутер
-сам импортирует memoryctl, а memoryctl переэкспортирует переехавшие сюда
-имена.
+сам импортирует этот модуль (напрямую и через memoryctl).
 """
 
 from __future__ import annotations
@@ -50,7 +49,6 @@ class Report:
     ok: bool
     errors: list[str]
     warnings: list[str]
-    facts: dict = field(default_factory=dict)
 
 
 MEMORY_PREFIX = "memory/"
@@ -67,13 +65,11 @@ DELIVERED_WIKI_LINK_RE = re.compile(
 SLUG_RE = re.compile(r"[a-z0-9_]{1,64}")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 DATE_FIELDS = ("valid_until", "review_after", "observed_at")
-LINK_FIELDS = ("requires", "contradicts")
 # Поля шапки, у которых есть читатель. Опечатка в имени поля молча
 # теряла бы факт, поэтому неизвестное поле у новой и переписанной записи
 # это отказ.
-SCHEMA_FIELDS = ("valid_until", "review_after", "supersedes", "requires",
-                 "contradicts", "type", "title", "index", "listed",
-                 "probe", "source", "observed_at")
+SCHEMA_FIELDS = ("valid_until", "review_after", "supersedes", "type",
+                 "title", "index", "listed", "probe", "source", "observed_at")
 DESCRIPTIVE_TOP_FIELDS = frozenset({"name", "description", "metadata"})
 KNOWN_TOP_FIELDS = DESCRIPTIVE_TOP_FIELDS | frozenset(SCHEMA_FIELDS)
 # Поля, обязательные у новой и переписанной записи (решение владельца
@@ -203,12 +199,9 @@ def _records(tree: dict[str, bytes]) -> dict[str, str]:
     называет проверка формы)."""
     out = {}
     for path, data in tree.items():
-        if not _is_record_path(path):
-            continue
-        try:
-            out[path[len(MEMORY_PREFIX):-3]] = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
+        text = _decode(data) if _is_record_path(path) else None
+        if text is not None:
+            out[path[len(MEMORY_PREFIX):-3]] = text
     return out
 
 
@@ -483,7 +476,6 @@ def header_errors(base: dict[str, bytes], candidate: dict[str, bytes]) -> list[s
                     f"{label}: {what} обязана нести {name} "
                     f"({_provenance_hint(name)})")
     errors.extend(supersedes_errors(candidate))
-    errors.extend(link_field_errors(candidate, base))
     return sorted(set(errors))
 
 
@@ -551,75 +543,6 @@ def supersedes_errors(tree: dict[str, bytes]) -> list[str]:
                 errors.append(f"цикл supersedes через «{current}» (A7)")
                 break
             seen.add(current)
-    return sorted(set(errors))
-
-
-def _snapshot_link_fields(tree: dict[str, bytes]) -> dict[str, dict[str, tuple[str, ...]]]:
-    result: dict[str, dict[str, tuple[str, ...]]] = {}
-    for slug, text in _records(tree).items():
-        fields, error = parse_frontmatter(text)
-        if error:
-            continue
-        links = {}
-        for name in LINK_FIELDS:
-            raw = fields.get(name)
-            if raw:
-                links[name] = tuple(x.strip() for x in raw.split(",") if x.strip())
-        if links:
-            result[slug] = links
-    return result
-
-
-def link_field_errors(tree: dict[str, bytes],
-                      before: dict[str, bytes] | None = None) -> list[str]:
-    """requires и contradicts: цель существует и разрешается в действующую
-    запись; новая связь на уже архивную цель не принимается."""
-    edges, active, archived = _snapshot_supersedes(tree)
-    links = _snapshot_link_fields(tree)
-    was = _snapshot_link_fields(before) if before is not None else None
-    backward: dict[str, list[str]] = {}
-    for slug, target in edges.items():
-        backward.setdefault(target, []).append(slug)
-
-    def resolves(slug: str) -> bool:
-        current, seen = slug, {slug}
-        while current not in active:
-            candidates = sorted(backward.get(current, ()),
-                                key=lambda name: (name not in active, name))
-            following = next((name for name in candidates if name not in seen), None)
-            if following is None:
-                return False
-            seen.add(following)
-            current = following
-        return True
-
-    errors: list[str] = []
-    for slug, fields in sorted(links.items()):
-        for name, targets in sorted(fields.items()):
-            for target in targets:
-                label = f"memory/{slug}.md: {name} -> «{target}»"
-                if not SLUG_RE.fullmatch(target):
-                    errors.append(f"{label}: цель не является slug (A4)")
-                    continue
-                if target == slug:
-                    errors.append(f"{label}: связь сама на себя")
-                    continue
-                if target in active:
-                    continue
-                if target not in archived:
-                    errors.append(f"{label}: цель не существует ни среди действующих, "
-                                  "ни в архиве (A6)")
-                    continue
-                fresh = was is not None and target not in was.get(slug, {}).get(name, ())
-                if fresh:
-                    errors.append(
-                        f"{label}: новая связь на уже архивную запись не принимается; "
-                        "укажи действующего преемника (A6)")
-                    continue
-                if not resolves(target):
-                    errors.append(
-                        f"{label}: цепочка supersedes не ведёт к действующему "
-                        "преемнику (A6)")
     return sorted(set(errors))
 
 
@@ -707,36 +630,16 @@ def _slug_mentioned(name: str, text: str) -> bool:
 
 def router_index_text(tree: dict[str, bytes]) -> str:
     """Текст индекса тем же кодом, что у роутера: преамбула плюс строки из
-    шапок. Роутер недоступен, пустой текст: ослаблять проверку нельзя."""
-    try:
-        import memorycontext as mc
-    except Exception:
-        return ""
+    шапок; без преамбулы пустой текст."""
+    import memorycontext as mc
     return mc.build_index_from_snapshot(tree, MEMORY_PREFIX) or ""
-
-
-def router_index_slugs(index_text: str) -> set[str]:
-    try:
-        import memorycontext as mc
-    except Exception:
-        return set()
-    return {entry.slug for entry in mc.parse_index(index_text)}
 
 
 def folded_slugs(tree: dict[str, bytes]) -> set[str]:
     """Свёрнутые записи дерева (`listed: false`): вне индекса, их находит
     поиск по корпусу."""
-    out = set()
-    for path, data in tree.items():
-        if not _is_record_path(path):
-            continue
-        try:
-            fields, _ = parse_frontmatter(data.decode("utf-8"))
-        except UnicodeDecodeError:
-            continue
-        if fields.get("listed") == "false":
-            out.add(path[len(MEMORY_PREFIX):])
-    return out
+    return {f"{slug}.md" for slug, text in _records(tree).items()
+            if parse_frontmatter(text)[0].get("listed") == "false"}
 
 
 def unreachable_records(tree: dict[str, bytes], known_topics: set[str], *,
@@ -745,7 +648,8 @@ def unreachable_records(tree: dict[str, bytes], known_topics: set[str], *,
     это пути сводок вида topics/<файл>. В личной области достижима и
     свёрнутая запись (`listed: false`): её находит поиск по корпусу. У
     заказчика свёрнутую держит сводка."""
-    from_index = router_index_slugs(router_index_text(tree))
+    import memorycontext as mc
+    from_index = {entry.slug for entry in mc.parse_index(router_index_text(tree))}
     if searchable_folded:
         from_index |= folded_slugs(tree)
     rollups = "\n".join(text.decode("utf-8", "replace") for path, text in tree.items()
@@ -857,23 +761,6 @@ def tautology_candidates(slug: str, text: str) -> list[str]:
     return [c for c in out if c]
 
 
-def index_entries(root: Path) -> tuple:
-    """Записи индекса выложенного дерева тем же сборщиком, что у роутера."""
-    import memorycontext as mc
-    if not (root / "memory" / "MEMORY.md").is_file():
-        return ()
-    return mc.parse_index(mc.build_index(root))
-
-
-def index_delivery(root: Path, question: str, today: dt.date, entries: tuple) -> list[str]:
-    """Прогон вопроса рабочим отбором роутера по выложенному дереву; слаги
-    без расширения. Записи индекса приходят готовыми: крючки всего дерева
-    проверяются по одному индексу, а не по индексу на каждую запись."""
-    import memorycontext as mc
-    chosen = mc.select_index_entries(root, question, entries, today=today)
-    return [Path(entry.slug).stem for entry, _ in chosen]
-
-
 def topic_delivery(root: Path, spec, question: str) -> str:
     """Полная выдача темы по вопросу тем же сборщиком, что у роутера,
     над выложенным деревом: сводка читается из него самого, без владельца."""
@@ -902,26 +789,27 @@ def delivered_link_present(delivered_text: str, slug: str) -> bool:
     return False
 
 
-def _expired(fields: dict, today: dt.date) -> bool:
-    """valid_until прошёл: действует ПО указанный день включительно (UTC),
-    та же граница, что у отбора роутера. Битая дата не прячет запись."""
+def date_passed(fields: dict, key: str, today: dt.date) -> str | None:
+    """Значение поля-даты `key`, если дата прошла, иначе None. Дата действует
+    ПО указанный день включительно (UTC), прошла со следующего дня. Пустое
+    поле и битая дата не прошли: запись они не прячут. Одна граница у отбора
+    роутера, его пометок и проверок писателя."""
+    значение = fields.get(key) or ""
     try:
-        return today > dt.date.fromisoformat(fields.get("valid_until") or "")
+        return значение if today > dt.date.fromisoformat(значение) else None
     except ValueError:
-        return False
+        return None
 
 
 def probe_errors(candidate: dict[str, bytes], *,
                  root: str, topics: Topics, laid_out: Path, today: dt.date,
-                 facts: dict, entries: tuple | None = None) -> list[str]:
+                 entries: tuple) -> list[str]:
+    import memorycontext as mc
     errors: list[str] = []
     client = client_name(root)
     spec = None
     if client is not None:
         spec = next((s for s in topics.specs.values() if s.owner == root), None)
-    results: dict[str, bool] = {}
-    if entries is None:
-        entries = index_entries(laid_out) if client is None else ()
     for slug, text in sorted(_records(candidate).items()):
         fields, error = parse_frontmatter(text)
         if error:
@@ -935,7 +823,7 @@ def probe_errors(candidate: dict[str, bytes], *,
             # глобальном свёртки нет (контракт отказывает); крючок молчит.
             # Клиентскую запись ищут через сводку, listed ей не указ.
             continue
-        if client is None and _expired(fields, today):
+        if client is None and date_passed(fields, "valid_until", today):
             # Истёкшую запись отбор тоже не выдаёт (граница _entry_expired):
             # её крючок не находит ничего, и без этого пропуска первый же
             # истёкший valid_until отказывал бы каждой подаче в корень.
@@ -946,19 +834,19 @@ def probe_errors(candidate: dict[str, bytes], *,
                           "напиши, как об этом спросят своими словами")
             continue
         if client is None:
-            found = slug in index_delivery(laid_out, probe, today, entries)
+            # Рабочий отбор роутера по выложенному дереву; записи индекса
+            # готовые, одни на все крючки дерева.
+            chosen = mc.select_index_entries(laid_out, probe, entries, today=today)
+            found = f"{slug}.md" in {entry.slug for entry, _ in chosen}
             hint = "отбор роутера по индексу его не выбирает; перепиши крючок или строку index"
         elif spec is None:
-            results[slug] = True
             continue
         else:
             found = delivered_link_present(topic_delivery(laid_out, spec, probe), slug)
             hint = (f"выдача сводки {spec.filename} по этому вопросу не содержит ссылки "
                     "на запись; добавь указатель в выбираемый раздел или перепиши крючок")
-        results[slug] = found
         if not found:
             errors.append(f"{label}: крючок «{probe}» не находит запись: {hint}")
-    facts["probes"] = results
     return errors
 
 
@@ -999,21 +887,13 @@ def rollup_placement_errors(tree: dict[str, bytes] | set[str], placement: dict,
     return errors
 
 
-_ITEM_PTR_RE = re.compile(r"^\s*[-*]\s*\[[^\]]*\]\(([^)\s]+)\)")
-
-
 def drifted_records(tree: dict[str, bytes], drift, own_client: str | None = None
                     ) -> dict[str, list[str]]:
     """Клиентские записи в общем индексе: тема -> слаги в порядке строк.
     Запись дрейфует по теме, если её имя содержит токен темы целым словом,
     она указана строкой индекса и не входит в hotKeep этой темы."""
-    if "memory/MEMORY.md" not in tree:
-        return {}
-    slugs = []
-    for line in router_index_text(tree).splitlines():
-        m = _ITEM_PTR_RE.match(line)
-        if m and "/" not in m.group(1) and m.group(1).endswith(".md"):
-            slugs.append(m.group(1))
+    import memorycontext as mc
+    slugs = [e.slug for e in mc.parse_index(router_index_text(tree)) if "/" not in e.slug]
     out: dict[str, list[str]] = {}
     for topic, tokens, hot in drift:
         if own_client is not None and topic == own_client:
@@ -1045,11 +925,10 @@ def foreign_errors(base: dict[str, bytes], candidate: dict[str, bytes],
 # 8. Разделы сводки: потолок и выбираемость (цели 2, 4)
 
 def section_errors(base: dict[str, bytes], candidate: dict[str, bytes],
-                   topics: Topics, facts: dict) -> tuple[list[str], list[str]]:
+                   topics: Topics) -> tuple[list[str], list[str]]:
     import memorycontext as mc
     errors: list[str] = []
     warnings: list[str] = []
-    sizes: dict[str, dict[str, list[int]]] = {}
     for path, data in sorted(candidate.items()):
         if not path.startswith("memory/topics/"):
             continue
@@ -1063,10 +942,8 @@ def section_errors(base: dict[str, bytes], candidate: dict[str, bytes],
         old_sections = {s.title: s.text for s in mc.parse_sections(old_text)}
         sections = mc.parse_sections(text)
         selectable = {s.title for s in mc.selectable_sections(spec, sections)} if spec else set()
-        sizes[path] = {}
         for section in sections:
             cap = mc.section_cap(section)
-            sizes[path][section.title] = [len(section.text), cap]
             if old_sections.get(section.title) == section.text:
                 continue
             if len(section.text) > cap:
@@ -1080,7 +957,6 @@ def section_errors(base: dict[str, bytes], candidate: dict[str, bytes],
                 warnings.append(
                     f"{path}: раздел «{section.title}» роутер не выберет ни по терминам, "
                     "ни по умолчанию; его содержимое придёт только при чтении файла")
-    facts["sections"] = sizes
     return errors, warnings
 
 
@@ -1112,13 +988,12 @@ def delivery_warnings(base: dict[str, bytes], candidate: dict[str, bytes], *,
     warnings: list[str] = []
     записи = _records(candidate)
     if entries is None:
-        entries = index_entries(laid_out)
-    по_имени = {Path(e.slug).stem: e for e in entries
-                if e.section in mc.INDEX_SECTIONS.values()}
+        entries = mc.parse_index(router_index_text(candidate))
+    по_имени = {Path(e.slug).stem: e for e in entries}
     for slug in sorted(changed_records(base, candidate)):
         текст = записи.get(slug)
         запись = по_имени.get(slug)
-        if текст is None or запись is None or slug == "personal_inbox":
+        if текст is None or запись is None:
             continue
         блок = mc._entry_block(laid_out, запись)
         хвост = f"\n\n[Раздел сокращён. Полная версия: memory/{запись.slug}]"
@@ -1159,7 +1034,7 @@ def delivery_warnings(base: dict[str, bytes], candidate: dict[str, bytes], *,
 
 
 def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
-                 today: dt.date, facts: dict, warnings: list[str],
+                 today: dt.date, warnings: list[str],
                  changed: set[str] = frozenset()) -> list[str]:
     """Отказ только за свою запись: подача тронула ожидаемую запись вопроса,
     и та перестала находиться. Если новая запись перебила чужую или зацепила
@@ -1171,7 +1046,6 @@ def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
     data = json.loads(questions.decode("utf-8"))
     ожидаемые = {q["id"]: q["expect"] for q in data["questions"]}
     after = memoryeval.stand(new_root, data, today=today)
-    facts["stand"] = memoryeval.summarize(after)
     before = memoryeval.stand(old_root, data, today=today) if old_root else after
     verdict = memoryeval.pairwise(before, after)
     errors = [f"стенд: вопрос {item['id']} {item['why']}"
@@ -1207,7 +1081,7 @@ def contract_errors(candidate: dict[str, bytes]) -> list[str]:
     text = mc.build_index_from_snapshot(candidate)
     if text is None:
         return ["memory/MEMORY.md: у глобального репозитория нет преамбулы индекса"]
-    entries = [e for e in mc.parse_index(text) if e.section in mc.INDEX_SECTIONS.values()]
+    entries = mc.parse_index(text)
     errors: list[str] = []
     if not entries:
         errors.append("контракт пуст: в глобальном репозитории ни одной видимой записи, "
@@ -1278,10 +1152,10 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
           scanner: str | None = None) -> Report:
     """Все проверки над деревом кандидата. scanner - путь к gitleaks,
     None значит найти в системе; отсутствие сканера это отказ."""
+    import memorycontext as mc
     base = dict(base or {})
     today = today or dt.datetime.now(dt.timezone.utc).date()
     topics = load_topics(config.topics)
-    facts: dict = {}
     errors: list[str] = []
     warnings: list[str] = []
     errors += secret_errors(base, candidate,
@@ -1294,7 +1168,7 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
     warnings += link_warn
     errors += reach_errors(base, candidate, topics, root)
     errors += foreign_errors(base, candidate, root, topics)
-    section_bad, section_warn = section_errors(base, candidate, topics, facts)
+    section_bad, section_warn = section_errors(base, candidate, topics)
     errors += section_bad
     warnings += section_warn
     with tempfile.TemporaryDirectory(prefix="svod-check-") as tmp:
@@ -1302,9 +1176,10 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
         old_root = lay_out(base, Path(tmp) / "old") if base else None
         # Индекс кандидата строится один раз на подачу: его читают и
         # крючки, и предупреждение о доставке.
-        entries = index_entries(new_root) if client_name(root) is None else ()
+        entries = (mc.parse_index(router_index_text(candidate))
+                   if client_name(root) is None else ())
         errors += probe_errors(candidate, root=root, topics=topics,
-                               laid_out=new_root, today=today, facts=facts, entries=entries)
+                               laid_out=new_root, today=today, entries=entries)
         warnings += delivery_warnings(base, candidate, root=root, laid_out=new_root,
                                       entries=entries)
         if (config.questions is not None and root == "personal"
@@ -1312,12 +1187,10 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
             # Стенд меряет отбор по индексу личного корня, в нём роутер и
             # ищет; глобальный отдаётся контрактом целиком, клиентский
             # доставляется сводкой, его проверяют крючки.
-            errors += stand_errors(old_root, new_root, config.questions, today, facts, warnings,
+            errors += stand_errors(old_root, new_root, config.questions, today, warnings,
                                    changed_records(base, candidate))
     if root == "global":
         errors += contract_errors(candidate)
         warnings += client_name_warnings(candidate, topics, svodgit.federation_members(config.topics))
-    touched = touched_records(base, candidate)
-    facts["touched"] = touched
     return Report(ok=not errors, errors=sorted(set(errors)),
-                  warnings=sorted(set(warnings)), facts=facts)
+                  warnings=sorted(set(warnings)))

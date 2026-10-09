@@ -32,7 +32,7 @@ def main() -> int:
     root = args.root.expanduser().resolve()
     try:
         return command(args, root)
-    except (ev.EvalError, mc.MemoryctlError) as exc:
+    except mc.MemoryctlError as exc:
         # Отказ стенда словами и кодом 2, как битая конфигурация: код 1 у
         # compare значит регрессию.
         print(f"memory-eval: {exc}", file=sys.stderr)
@@ -57,7 +57,7 @@ def command(args, root: Path) -> int:
     if args.command == "baseline":
         try:
             заметки = ev.replace_baseline(результат)
-        except (ev.EvalError, ev.svodgit.GitError, OSError) as exc:
+        except (ev.svodgit.GitError, OSError) as exc:
             print(f"memory-eval: {exc}", file=sys.stderr)
             return 3
         for слова in заметки:

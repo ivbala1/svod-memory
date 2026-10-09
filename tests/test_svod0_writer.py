@@ -77,6 +77,10 @@ def sh(root: Path, *args: str, env=None) -> str:
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env).stdout.strip()
 
 
+def write_marker(root: Path, scope: str) -> None:
+    (root / svodgit.MARKER_NAME).write_text(json.dumps({"scope": scope}) + "\n", encoding="utf-8")
+
+
 class Federation:
     """Два сервера, две машины, конфигурация и подменный сканер."""
 
@@ -131,7 +135,7 @@ class Federation:
         (root / "memory" / "feedback_words.md").write_bytes(record(
             "feedback_words", type="feedback", title="Отвечать словами",
             index="отказы и статус словами, без кодов", probe="как объяснять отказы словами", body="Отвечать словами.\n"))
-        svodgit.write_marker(root, "global")
+        write_marker(root, "global")
         sh(root, "add", "-A")
         sh(root, "commit", "--quiet", "-m", "seed")
         sh(root, "remote", "add", "origin", str(self.origins / "global.git"))
@@ -146,7 +150,7 @@ class Federation:
             "reference_printer", type="reference", title="Зелёный принтер",
             index="как чинить зелёный принтер", probe="чем чинить принтер", body="Зелёный принтер чинится молотком.\n"))
         (root / "memory" / "topics" / "home.md").write_text("# Home\n\n## Обзор\n\nДом.\n")
-        svodgit.write_marker(root, "personal")
+        write_marker(root, "personal")
         sh(root, "add", "-A")
         sh(root, "commit", "--quiet", "-m", "seed")
         sh(root, "remote", "add", "origin", str(self.origins / "personal.git"))
@@ -159,7 +163,7 @@ class Federation:
         (root / "memory" / "MEMORY.md").write_text("# Acme\n")
         (root / "memory" / "topics" / "acme.md").write_text(
             "# Acme\n\n## Обзор\n\nЗаказчик Acme.\n\n## Доступы\n\nПо ssh.\n")
-        svodgit.write_marker(root, "clients/acme")
+        write_marker(root, "clients/acme")
         sh(root, "add", "-A")
         sh(root, "commit", "--quiet", "-m", "seed")
         sh(root, "remote", "add", "origin", str(self.origins / "acme.git"))
@@ -177,7 +181,7 @@ class Federation:
         subprocess.run(["git", "clone", "--quiet", str(self.origins / "acme.git"),
                         str(data / "clients" / "acme")], check=True)
         for scope in scopes + ["clients/acme"]:
-            ms.install_hooks(data / scope)
+            svodgit.git(data / scope, "config", "core.hooksPath", str(ms.HOOKS_DIR))
         self.machines[machine] = data
         self.states[machine] = self.base / f"state-{machine}"
         return data
@@ -467,8 +471,9 @@ class WriterTests(Base):
         cand = {"commit": "0" * 40,
                 "result": {"memory/reference_kettle.md": svodgit.blob(root, "HEAD",
                                                                      "memory/reference_kettle.md")}}
-        self.assertTrue(mr.delivered(root, cand))
-        self.assertFalse(mr.delivered(root, {"commit": "0" * 40, "result": {}}),
+        remote = svodgit.remote_head(root)
+        self.assertTrue(mr.reached(root, cand, remote))
+        self.assertFalse(mr.reached(root, {"commit": "0" * 40, "result": {}}, remote),
                          "пустой diff доставкой не считается")
 
     def test_client_record_gets_pointer_in_rollup_section(self):
@@ -508,7 +513,7 @@ class WriterTests(Base):
             "changes": [
                 {"operation": "put", "path": "memory/topics/home.md",
                  "content": "# Home\n\n## Обзор\n\nДом и сад, [[reference_printer]].\n"},
-                {"operation": "put", "area": "memory", "path": "reference_kettle.md",
+                {"operation": "put", "path": "memory/reference_kettle.md",
                  "content": NEW_BODY.decode()},
             ],
         }
@@ -527,7 +532,7 @@ class WriterTests(Base):
 
     def test_wrong_marker_refuses_in_words(self):
         root = self.fed.root("a")
-        svodgit.write_marker(root, "clients/acme")
+        write_marker(root, "clients/acme")
         code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
                                          {"record_slug": "reference_kettle"})
         self.assertEqual(code, mr.EXIT_ERROR)
@@ -592,6 +597,17 @@ class SyncTests(Base):
         cache = svodgit.read_json(svodgit.sync_cache_path("personal", self.fed.states["b"]))
         self.assertIn("конфликт", cache["problems"][0])
 
+    def test_first_publication_to_empty_server(self):
+        root = self.fed.root("a", "clients/acme")
+        empty = self.fed.origins / "empty.git"
+        subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(empty)], check=True)
+        sh(root, "remote", "set-url", "origin", str(empty))
+        outcome = self.fed.sync("a", "clients/acme")
+        head = svodgit.head(root)
+        self.assertEqual(outcome["problems"], [], outcome)
+        self.assertIn(f"опубликовано {head[:12]} (первая публикация)", outcome["done"])
+        self.assertEqual(sh(empty, "rev-parse", "main"), head)
+
     def test_red_local_commit_is_not_published(self):
         root_b = self.fed.root("b")
         self.manual_commit(root_b, "memory/reference_bad.md",
@@ -617,7 +633,7 @@ class SyncTests(Base):
         self.assertEqual(svodgit.branch(root_a), "main")
 
     def test_sync_all_writes_cache_per_scope_and_survives_one_failure(self):
-        svodgit.write_marker(self.fed.root("a", "clients/acme"), "personal")
+        write_marker(self.fed.root("a", "clients/acme"), "personal")
         outcomes = ms.sync_all(data_root=self.fed.machines["a"], today=TODAY,
                                state=self.fed.states["a"])
         by_scope = {o["scope"]: o for o in outcomes}
@@ -901,7 +917,8 @@ class GitToolsTests(Base):
         self.assertIn("сети нет", result["reason"])
         self.assertNotEqual(svodgit.head(root), head)
         self.assert_gone(pid_file)
-        with svodgit.lock(root, exclusive=True, wait=0.5) as taken:
+        with mock.patch.object(svodgit, "EXCLUSIVE_WAIT_SEC", 0.5), \
+             svodgit.lock(root, exclusive=True) as taken:
             self.assertTrue(taken)
 
     def test_fast_forward_moves_only_without_divergence(self):
@@ -1590,7 +1607,7 @@ class ViolationListTests(Base):
             self.assertIn(expected, result["reason"])
 
     def test_projection_names_every_bad_field_at_once(self):
-        code, result = self.dry("a", "personal", "proj-bad", NEW_BODY,
+        code, result = self.dry("a", "clients/acme", "proj-bad", NEW_BODY,
                                 {"record_slug": "Не Slug", "index_line": "   ",
                                  "index_section": ""})
         self.assertEqual(code, mr.EXIT_FAILED)
@@ -1936,18 +1953,25 @@ class ReviewFixTests(Base):
 
 class LateReviewFixTests(Base):
     """Находки второго круга разбора: контракт, доказательство доставки,
-    частичная шапка."""
+    указатель только у клиентской записи."""
 
-    def test_header_with_only_a_type_is_a_partial_header(self):
-        body = record("reference_kettle", type="reference",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="кипятить воду чайник", body="Чайник кипятит воду.\n")
-        code, result = self.dry("a", "personal", "kettle-part", body,
-                                {"record_slug": "reference_kettle",
-                                 "index_section": "Reference",
-                                 "index_line": "- [Чайник](reference_kettle.md) - как кипятить воду"})
+    def test_personal_record_with_pointer_flags_is_refused_in_words(self):
+        # Индекс собирается из шапки: --section и --line у личной записи это
+        # отказ словами, и в том же отказе названо плохое имя записи.
+        code, result = self.dry("a", "personal", "kettle-ptr", NEW_BODY,
+                                {"record_slug": "Не Slug", "index_section": "Reference",
+                                 "index_line": "- [Чайник](reference_kettle.md) - как кипятить"})
         self.assertEqual(code, mr.EXIT_FAILED)
-        self.assertIn("часть полей индекса", result["reason"])
+        self.assertIn("только у клиентской записи", result["reason"])
+        self.assertIn("--record", result["reason"])
+
+    def test_personal_record_with_unclosed_header_is_refused_by_the_check(self):
+        body = "---\ntype: reference\ntitle: \"Чайник\"\n\nЧайник кипятит воду.\n".encode()
+        for подача in (self.dry, self.fed.remember):
+            code, result = подача("a", "personal", "kettle-open", body,
+                                  {"record_slug": "reference_kettle"})
+            self.assertEqual(code, mr.EXIT_FAILED, result)
+            self.assertIn("memory/reference_kettle.md: unclosed frontmatter", result["reason"])
 
     def test_delivery_proof_covers_the_rollup_pointer(self):
         body = record("acme_vpn", type="project", title="VPN", index="vpn acme",
@@ -2020,16 +2044,6 @@ class SecondRoundFixTests(Base):
                               state=self.fed.states["a"], base=полная)
         self.assertEqual(повтор["base"], полная)
 
-    def test_header_with_an_empty_type_is_still_a_partial_header(self):
-        body = ("---\ntype: \nsource: \"разговор\"\nobserved_at: 2026-09-04\n"
-                "probe: \"кипятить воду чайник\"\n---\n\nЧайник.\n").encode("utf-8")
-        code, result = self.dry("a", "personal", "kettle-empty-type", body,
-                                {"record_slug": "reference_kettle",
-                                 "index_section": "Reference",
-                                 "index_line": "- [Чайник](reference_kettle.md) - как кипятить"})
-        self.assertEqual(code, mr.EXIT_FAILED)
-        self.assertIn("часть полей индекса", result["reason"])
-
 
 class ThirdRoundFixTests(Base):
     """Находки третьего круга разбора."""
@@ -2043,18 +2057,6 @@ class ThirdRoundFixTests(Base):
                                  "index_line": "- [[acme_dns]] чужая запись"})
         self.assertEqual(code, mr.EXIT_FAILED)
         self.assertIn("со ссылкой на запись acme_vpn", result["reason"])
-
-    def test_full_header_with_listed_false_is_not_called_partial(self):
-        body = record("reference_kettle", type="reference", title="Чайник",
-                      index="как кипятить воду в чайнике", listed="false",
-                      source="разговор", observed_at="2026-09-04",
-                      probe="кипятить воду чайник", body="Чайник кипятит воду.\n")
-        data, note = mr.apply_index_projection(
-            body, "reference_kettle",
-            {"record_slug": "reference_kettle", "index_section": "Reference",
-             "index_line": "- [Чайник](reference_kettle.md) - как кипятить"})
-        self.assertEqual(data, body)
-        self.assertIn("--line не использована", note)
 
     def test_same_base_written_short_and_full_is_one_base(self):
         root = self.fed.root("a")
@@ -2216,6 +2218,14 @@ class PointerKeepsNeighboursTests(Base):
         self.assertIn("«Обзор»", текст)
         self.assertIn("заморозки", new, "проза раздела не удаляется")
         self.assertIn("в другом разделе", new)
+
+    def test_mentions_above_the_first_heading_and_under_an_empty_one_are_named(self):
+        rollup = ("Вступление про [[acme_dns]].\n## Доступы\n\n- [[acme_dns]] старый\n"
+                  "##  \nПод пустым заголовком [[acme_dns]].\n")
+        _, слова = mr.insert_rollup_pointer(rollup, "Доступы", "- [[acme_dns]] новый")
+        текст = " | ".join(слова)
+        self.assertIn("до первого раздела", текст)
+        self.assertIn("«»", текст, "пустой заголовок это раздел, а не начало сводки")
 
     def test_long_replaced_line_is_marked_as_clipped(self):
         длинная = "Проза про [[acme_dns]] " + "и много фактов " * 20

@@ -13,8 +13,9 @@ def _error(path: Path, topic: object, detail: str) -> ValueError:
 
 
 def placement_from_config(raw, config_path: Path) -> dict[str, tuple[str, str | None]]:
-    """Раскладка из уже разобранного конфига: PolicySnapshot читает байты
-    topics.json ровно один раз, и второе чтение ради раскладки запрещено."""
+    """Раскладка из уже разобранного конфига: memorycontext (_load_topics)
+    читает байты topics.json ровно один раз, и второе чтение ради раскладки
+    запрещено."""
     topics = raw.get("topics") if isinstance(raw, dict) else None
     if not isinstance(topics, dict) or not topics:
         raise _error(config_path, "<topics>", "раздел topics должен быть непустым объектом")
@@ -74,10 +75,3 @@ def archived_from_config(raw, config_path: Path,
             raise _error(config_path, topic, "тема одновременно действующая и архивная")
         archived[filename] = (topic, owner)
     return archived
-
-
-def rollup_relative_source(filename: str, owner: str | None) -> str:
-    """Возвращает путь сводки от корня личной федерации."""
-    if owner is not None:
-        return f"{owner}/memory/topics/{filename}"
-    return f"memory/topics/{filename}"

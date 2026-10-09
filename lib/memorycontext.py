@@ -12,7 +12,6 @@ import os
 import pathlib
 from pathlib import Path, PurePosixPath
 import re
-import sys
 from typing import Iterable
 
 import datetime as dt
@@ -22,17 +21,15 @@ import svodgit
 import topiclayout
 
 from memoryctl import (
-    SLUG_RE,
     MemoryctlError,
     atomic_write,
-    body_without_frontmatter,
     compute_revision,
-    default_root,
     ensure_private_dir,
-    parse_frontmatter,
     reader_locks,
     utc_now,
 )
+from memoryverify import SLUG_RE, body_without_frontmatter, date_passed, parse_frontmatter
+from svodgit import default_root
 
 
 ROUTER_VERSION = "2"
@@ -184,6 +181,7 @@ USER_CATALOG_LIMIT = 3_200
 
 TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 # Приглашение оболочки во вставленном выводе: `user@host acme %`, `devops@host:~$`.
+# В нём имя каталога, а не намерение: иначе каталог в приглашении выбирал бы тему.
 # Съедается только сама префиксная часть до %, $ или #, команда после неё остаётся.
 SHELL_PROMPT_RE = re.compile(
     r"^[ \t]*[\w.\-]+@[\w.\-]+[^\n%$#]{0,80}?[%$#](?=[ \t]|$)",
@@ -269,14 +267,9 @@ def topics_from_config(raw, path) -> dict[str, TopicSpec]:
     # символов, пустой алиас совпал бы с любым текстом, а неполный topicOrder
     # МОЛЧА выкинул бы тему из маршрутизации. Конфиг читается при импорте, то
     # есть до fail-soft роутера, поэтому цена ошибки это сессия без
-    # закрепления.
-    if not isinstance(raw, dict):
-        raise MemoryctlError(f"{path}: корень конфига не объект")
-    topics = raw.get("topics")
-    if not isinstance(topics, dict) or not topics:
-        raise MemoryctlError(f"{path}: раздел topics пуст или не объект")
-    if any(not isinstance(key, str) or not key for key in topics):
-        raise MemoryctlError(f"{path}: имена тем должны быть непустыми строками")
+    # закрепления. Корень, состав тем, их ключи и имена сводок уже проверила
+    # раскладка выше.
+    topics = raw["topics"]
 
     order = raw.get("topicOrder")
     if order is None:
@@ -305,12 +298,9 @@ def topics_from_config(raw, path) -> dict[str, TopicSpec]:
 
     seen_aliases: dict[str, str] = {}
     for key, entry in topics.items():
-        if not isinstance(entry, dict):
-            raise MemoryctlError(f"{path}: тема {key} не объект")
-        for field in ("label", "rollup"):
-            value = entry.get(field)
-            if not isinstance(value, str) or not value.strip():
-                raise MemoryctlError(f"{path}: у темы {key} нет непустого {field}")
+        label = entry.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise MemoryctlError(f"{path}: у темы {key} нет непустого label")
         for field in ("aliases", "cwdNames", "cwdPrefixes", "defaultSections"):
             strings(key, field, entry.get(field, []))
         terms = entry.get("sectionTerms", {})
@@ -364,7 +354,8 @@ def reader_federation(root: Path):
 
     Строится из БАЙТОВ конфига этого процесса (Q7) без git-подпроцессов:
     читателю нужны выбранные деревья и физические границы, а не привязки
-    Git. Кеш процессный, между вызовами хука процесс не живёт.
+    Git. Кеш процессный, между вызовами хука процесс не живёт. Словарь
+    «область -> корень» общий для всех вызывающих: менять его нельзя.
     """
     import memoryctl
     ключ = str(pathlib.Path(root).resolve())
@@ -379,21 +370,20 @@ TOPIC_ORDER = tuple(TOPICS)
 def rollup_relative_source(spec: TopicSpec) -> str:
     """Относительный путь сводки темы от корня федерации.
 
-    Правило пути делегировано общему модулю раскладки. Запасного пути читатель
-    не пробует: чтение старой копии при недоступном владельце запрещено (N10).
+    Запасного пути читатель не пробует: чтение старой копии при недоступном
+    владельце запрещено (N10).
     """
-    return topiclayout.rollup_relative_source(spec.filename, spec.owner)
+    if spec.owner is not None:
+        return f"{spec.owner}/memory/topics/{spec.filename}"
+    return f"memory/topics/{spec.filename}"
 
 
 def default_state_dir() -> Path:
     configured = os.environ.get("MEMORY_CONTEXT_STATE_DIR")
     if configured:
         return Path(configured).expanduser().resolve()
-    memoryctl_state = os.environ.get("MEMORYCTL_STATE_DIR")
-    if memoryctl_state:
-        return (Path(memoryctl_state).expanduser().resolve() / "claude")
-    xdg = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return (xdg / "agent-memory" / "claude").resolve()
+    # Тот же путь строит уборка кэша роутера в memorysync.
+    return svodgit.state_dir() / "claude"
 
 
 def _section_kind(heading: str) -> str | None:
@@ -566,8 +556,6 @@ def contract_block(entries: tuple[IndexEntry, ...]) -> str:
         "Применяй эти правила в любом проекте и в непроектных запросах:",
     ]
     for entry in entries:
-        if entry.section not in INDEX_SECTIONS.values():
-            continue
         detail = f": {entry.summary}" if entry.summary else ""
         lines.append(f"- {entry.label}{detail} [{entry.slug}]")
     return "\n".join(lines)
@@ -586,13 +574,12 @@ def contract_key(hot_contract: str) -> str:
 def topic_key(root: Path, spec: TopicSpec, revision: str) -> str:
     """Повтор сводки зависит от её владельца, а не от личных коммитов.
     При недоступности владельца сохраняем прежний ключ; причину назовёт
-    чтение самой сводки. Карта читателя уже построена и Git не обходит."""
+    чтение самой сводки. Карта читателя уже построена и Git не обходит,
+    области без каталога memory в ней нет."""
     try:
         контекст = reader_federation(root)
-        if spec.owner in контекст.available:
-            владелец = контекст.identities[spec.owner].worktree_root
-            if (владелец / "memory").is_dir():
-                return compute_revision(владелец)
+        if spec.owner in контекст:
+            return compute_revision(контекст[spec.owner])
     except (OSError, ValueError, KeyError, MemoryctlError):
         pass
     return revision
@@ -603,19 +590,10 @@ def index_roots(root: Path) -> tuple[Path, Path | None]:
     (инбокс, записи, поиск) по наличию. root это каталог данных, в нём по
     клону на область."""
     context = reader_federation(root)
-    if "global" not in context.available:
+    if "global" not in context:
         raise MemoryctlError(
             f"{root}: нет глобального репозитория global/memory; без него контракт не отдать")
-    personal = (context.identities["personal"].worktree_root
-                if "personal" in context.available else None)
-    return context.identities["global"].worktree_root, personal
-
-
-def _revision_note(global_revision: str, personal_revision: str | None) -> str:
-    parts = [f"global {global_revision[:12]}"]
-    if personal_revision is not None:
-        parts.append(f"personal {personal_revision[:12]}")
-    return ", ".join(parts)
+    return context["global"], context.get("personal")
 
 
 def _normalized_text(text: str) -> str:
@@ -658,26 +636,26 @@ def title_in_prompt(label: str, prompt: str) -> bool:
     return len(заголовок) >= 5 and f" {заголовок} " in f" {_normalized_text(prompt)} "
 
 
+def entry_hits(prompt_tokens: tuple[str, ...], entry: IndexEntry) -> tuple[list[str], list[str]]:
+    """Слова реплики (score_words), совпавшие со словами заголовка и строки
+    index записи, в порядке реплики. Ими считает _entry_score и их же
+    называет разбор `memory why`, поэтому объяснение не расходится с отбором."""
+    def hits(text: str) -> list[str]:
+        entry_tokens = _tokens(text, SCORE_STOP_TOKENS)
+        return [token for token in prompt_tokens
+                if any(_token_match(token, entry_token) for entry_token in entry_tokens)]
+    return hits(entry.label), hits(entry.summary)
+
+
 def _entry_score(prompt: str, entry: IndexEntry) -> int:
     prompt_tokens = score_words(prompt)
     if not prompt_tokens:
         return 0
-    label_tokens = _tokens(entry.label, SCORE_STOP_TOKENS)
-    summary_tokens = _tokens(entry.summary, SCORE_STOP_TOKENS)
-    label_hits = sum(
-        1
-        for prompt_token in prompt_tokens
-        if any(_token_match(prompt_token, entry_token) for entry_token in label_tokens)
-    )
-    summary_hits = sum(
-        1
-        for prompt_token in prompt_tokens
-        if any(_token_match(prompt_token, entry_token) for entry_token in summary_tokens)
-    )
-    score = (label_hits * 4) + summary_hits
+    label_hits, summary_hits = entry_hits(prompt_tokens, entry)
+    score = (len(label_hits) * 4) + len(summary_hits)
     if title_in_prompt(entry.label, prompt):
         score += 6
-    if label_hits >= 2:
+    if len(label_hits) >= 2:
         score += 2
     return score
 
@@ -693,25 +671,25 @@ def today_utc() -> dt.date:
 HEADER_READ_LIMIT = 262_144
 
 
+def _record_text(root: Path, slug_md: str) -> str:
+    """Начало файла записи в пределах HEADER_READ_LIMIT. Нет файла или он не
+    читается: пустой текст, без шапки и тела, и отбор не падает."""
+    target = _safe_memory_path(root, slug_md)
+    if target is None or not target.is_file():
+        return ""
+    try:
+        return _read_limited(target, HEADER_READ_LIMIT)
+    except OSError:
+        return ""
+
+
 def _entry_expired(root: Path, entry: IndexEntry, today: dt.date) -> bool:
     """Истёк ли valid_until записи. Семантика границы: запись действительна
     ПО дату valid_until включительно (UTC), просрочена со следующего дня.
     Нечитаемый файл или битая дата не скрывают запись: невидимость обязана
     быть объяснимой (R10), а молча спрятать факт хуже, чем показать старый."""
-    target = _safe_memory_path(root, entry.slug)
-    if target is None or not target.is_file():
-        return False
-    try:
-        fields, _ = parse_frontmatter(_read_limited(target, HEADER_READ_LIMIT))
-    except OSError:
-        return False
-    значение = fields.get("valid_until")
-    if not значение:
-        return False
-    try:
-        return today > dt.date.fromisoformat(значение)
-    except ValueError:
-        return False
+    поля = parse_frontmatter(_record_text(root, entry.slug))[0]
+    return date_passed(поля, "valid_until", today) is not None
 
 
 def resolve_final_successor(root: Path, slug: str) -> str | None:
@@ -739,6 +717,13 @@ def resolve_final_successor(root: Path, slug: str) -> str | None:
         цель = поля.get("supersedes")
         if цель:
             назад.setdefault(цель, []).append(собственный)
+    return walk_successor(slug, активные, назад)
+
+
+def walk_successor(slug: str, активные: set[str], назад: dict[str, list[str]]) -> str | None:
+    """Шаг R6 по готовым картам: конечный действующий преемник слага или None.
+    `назад` ведёт от цели supersedes к записям, которые её замещают; карты
+    строит resolve_final_successor с диска."""
     текущий, увидено = slug, {slug}
     while текущий not in активные:
         # Развилка активных преемников запрещена писателем, но у слага могут
@@ -752,140 +737,6 @@ def resolve_final_successor(root: Path, slug: str) -> str | None:
         увидено.add(преемник)
         текущий = преемник
     return текущий
-
-
-def _entry_link_fields(root: Path, slug_md: str) -> dict[str, tuple[str, ...]]:
-    """requires и contradicts записи; slug приходит с расширением .md."""
-    target = _safe_memory_path(root, slug_md)
-    if target is None or not target.is_file():
-        return {}
-    try:
-        поля, _ = parse_frontmatter(_read_limited(target, HEADER_READ_LIMIT))
-    except OSError:
-        return {}
-    результат: dict[str, tuple[str, ...]] = {}
-    for имя in ("requires", "contradicts"):
-        сырое = поля.get(имя)
-        if сырое:
-            цели = tuple(x.strip() for x in сырое.split(",") if x.strip())
-            if цели:
-                результат[имя] = цели
-    return результат
-
-
-def bundle_members(root: Path, seed_slug_md: str, delivered: set[str]) -> tuple[tuple[str, str], ...]:
-    """Замыкание комплекта затравки: обход requires и contradicts (R4, R5).
-
-    Цели разрешаются по цепочке supersedes к действующему преемнику (A6).
-    Обход в ширину со стабильным порядком (вид связи, затем порядок в поле),
-    повторы устранены; запись, уже доставленная другим комплектом или как
-    затравка, второй раз не едет и остаётся за первым (R9). Возвращаются пары
-    (slug.md, вид связи).
-    """
-    члены: list[tuple[str, str]] = []
-    очередь = [seed_slug_md]
-    while очередь:
-        текущий = очередь.pop(0)
-        связи = _entry_link_fields(root, текущий)
-        for вид in ("requires", "contradicts"):
-            for цель in связи.get(вид, ()):
-                разрешённая = resolve_final_successor(root, цель) or цель
-                имя = f"{разрешённая}.md"
-                if имя == seed_slug_md or имя in delivered:
-                    continue
-                delivered.add(имя)
-                члены.append((имя, вид))
-                очередь.append(имя)
-    return tuple(члены)
-
-
-def _member_block(root: Path, slug_md: str, seed_slug_md: str, вид: str) -> str | None:
-    """Блок члена комплекта: ЦЕЛИКОМ, без обрезания (R9).
-
-    Свёрнутый или просроченный член приезжает с пометкой: в выдачу его
-    привела авторская связь действующей записи, а не совпадение слов, но
-    его актуальность ничем не доказана. Срок та же граница, что у отбора
-    (_entry_expired): действительна по дату valid_until включительно."""
-    target = _safe_memory_path(root, slug_md)
-    if target is None or not target.is_file():
-        return None
-    # Шапка тем же пределом, что у отбора: короткий срез терял valid_until.
-    текст = _read_limited(target, HEADER_READ_LIMIT)
-    body = body_without_frontmatter(текст).strip()
-    связь = "противоречие" if вид == "contradicts" else "требуется"
-    heading = (f"[Член комплекта {seed_slug_md}: {связь}]\n"
-               f"Источник: memory/{slug_md}")
-    поля = parse_frontmatter(текст)[0]
-    пометки = ["свёрнута"] if поля.get("listed") == "false" else []
-    срок = поля.get("valid_until")
-    if срок:
-        try:
-            if today_utc() > dt.date.fromisoformat(срок):
-                пометки.append(f"срок истёк (valid_until {срок})")
-        except ValueError:
-            pass
-    if пометки:
-        heading += (". " + ", ".join(пометки).capitalize()
-                    + ": актуальность проверь, полномочий она не даёт.")
-    return f"{heading}\n\n{body}"
-
-
-def _append_bundle(parts: list[str], root: Path, seed_slug_md: str,
-                   члены: tuple[tuple[str, str], ...], *,
-                   record_keys: dict[str, str] | None = None,
-                   seed_repeat: bool = False) -> list[str]:
-    """Доставка комплекта: все члены целиком либо метка и ни одного байта.
-    Возвращает имена членов, чей текст лёг в выдачу или, при указателе
-    повтора, уже лежит выше в сессии.
-
-    Бюджет считается по той же арифметике, что _append_with_budget. Метки
-    ошибок доставки живут вне бюджета содержимого: формат фиксированный и
-    короткий, поэтому метка выводится даже при нулевом остатке (R9). Затравка
-    сама по себе продолжает жить по прежним правилам обрезания: комплектная
-    гарантия «целиком или ничего» относится к замыканию связей, иначе блок 2
-    менял бы выдачу всего корпуса без единой связи (N3).
-
-    `record_keys` есть только у хука с сессией. Затравка уже приехала
-    указателем повтора (`seed_repeat`), а тексты членов те же, что ушли в
-    этой сессии: комплект едет одной строкой, как и затравка. Иначе члены
-    едут целиком, и ключ их текста запоминается.
-    """
-    блоки: list[str] = []
-    доставлены: list[str] = []
-    недоступные: list[str] = []
-    for имя, вид in члены:
-        блок = _member_block(root, имя, seed_slug_md, вид)
-        if блок is None:
-            недоступные.append(имя)
-        else:
-            блоки.append(блок)
-            доставлены.append(имя)
-    for имя in недоступные:
-        parts.append(f"[Член комплекта {seed_slug_md} недоступен: memory/{имя}]")
-    if not блоки:
-        return []
-    имя_ключа = f"комплект:{seed_slug_md}"
-    ключ = (hashlib.sha256("\n\n".join(блоки).encode("utf-8")).hexdigest()[:16]
-            if record_keys is not None else None)
-    if seed_repeat and ключ is not None and record_keys.get(имя_ключа) == ключ:
-        parts.append(
-            f"[Комплект {seed_slug_md} уже в контексте: члены "
-            + ", ".join(f"memory/{имя}" for имя in доставлены)
-            + ", текст выше в этой сессии не менялся; если его выше нет (правка или откат "
-            f"реплики), прочитай их в {root / 'memory'}]")
-        return доставлены
-    used = sum(len(part) for part in parts) + (2 * len(parts))
-    нужно = sum(len(блок) + 2 for блок in блоки)
-    доступно = max(0, BODY_LIMIT - used - 180)
-    if нужно > доступно:
-        parts.append(
-            f"[Комплект {seed_slug_md} не доставлен: нужно {нужно} символов, "
-            f"доступно {доступно}; частичная выдача комплекта запрещена]")
-        return []
-    parts.extend(блоки)
-    if ключ is not None:
-        record_keys[имя_ключа] = ключ
-    return доставлены
 
 
 def _match_key(token: str) -> str:
@@ -903,13 +754,7 @@ def _bm25_documents(root: Path, записи: tuple[tuple[str, str, str], ...]):
     docs: dict[str, list[str]] = {}
     df: Counter = Counter()
     for slug, label, summary in записи:
-        target = _safe_memory_path(root, slug)
-        тело = ""
-        if target is not None and target.is_file():
-            try:
-                тело = body_without_frontmatter(_read_limited(target, HEADER_READ_LIMIT))
-            except OSError:
-                тело = ""
+        тело = body_without_frontmatter(_record_text(root, slug))
         ключи = [_match_key(t) for t in _tokens(f"{label} {summary} {тело}")]
         docs[slug] = ключи
         df.update(set(ключи))
@@ -1004,9 +849,8 @@ def select_index_entries(
     (R8): он не скрывает запись и не меняет её счёт.
     """
     сегодня = today if today is not None else today_utc()
-    видимые = tuple(e for e in entries if e.section in INDEX_SECTIONS.values())
     выбрано: list[tuple[IndexEntry, int]] = []
-    по_индексу = sorted(((e, _entry_score(prompt, e)) for e in видимые),
+    по_индексу = sorted(((e, _entry_score(prompt, e)) for e in entries),
                         key=lambda пара: (-пара[1], пара[0].index))
     for entry, score in по_индексу:
         if score < SELECT_THRESHOLD:
@@ -1016,9 +860,9 @@ def select_index_entries(
         выбрано.append((entry, score))
         break
     занято = {entry.slug for entry, _ in выбрано}
-    по_слагу = {e.slug: e for e in видимые}
+    по_слагу = {e.slug: e for e in entries}
     порог = bm25_threshold(prompt)
-    for slug, счёт in bm25_ranking(root, prompt, видимые):
+    for slug, счёт in bm25_ranking(root, prompt, entries):
         if счёт < порог or slug in занято:
             continue
         entry = по_слагу[slug]
@@ -1063,7 +907,7 @@ def _entry_block(root: Path, entry: IndexEntry, maximum: int = 2_400) -> str | N
     return _clip_block(f"{heading}\n\n{body}", maximum, f"memory/{entry.slug}")
 
 
-def _personal_inbox_block(root: Path, maximum: int = 3_600) -> str | None:
+def _personal_inbox_block(root: Path, maximum: int) -> str | None:
     target = root / "memory" / "personal_inbox.md"
     if not target.is_file():
         return None
@@ -1136,20 +980,10 @@ def _matching_terms(text: str, terms: Iterable[str]) -> tuple[str, ...]:
     return tuple(term for term in terms if _contains(text, term))
 
 
-def _strip_shell_prompts(text: str) -> str:
-    """Убирает приглашения оболочки из вставленного вывода.
-
-    Строка вида `user@host acme % docker ps` содержит имя каталога, а не намерение
-    пользователя: без этого имя каталога в приглашении определяло бы тему.
-    Сама команда после приглашения остаётся, она может нести полезные маркеры.
-    """
-    return SHELL_PROMPT_RE.sub(" ", text)
-
-
 def _explicit_scopes(prompt: str) -> tuple[str, ...]:
     # Ограждённый код (лог, путь, цитата) намерением не считается, как приглашение.
-    lines = _strip_shell_prompts(prompt).splitlines()
-    text = "\n".join(s for s, код in zip(lines, code_fence_mask(lines)) if not код)
+    lines = SHELL_PROMPT_RE.sub(" ", prompt).splitlines()
+    text = "\n".join(s for s, код in zip(lines, scan_code_fences(lines)[0]) if not код)
     matches = []
     for scope in TOPIC_ORDER:
         if _matching_terms(text, TOPICS[scope].aliases):
@@ -1194,19 +1028,11 @@ def _session_record(state_dir: Path, session_id: str) -> dict:
     path = _session_path(state_dir, session_id)
     if path is None:
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return svodgit.read_json(path) or {}
 
 
 def _write_json(path: Path, data: dict) -> None:
-    atomic_write(
-        path,
-        (json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-        0o600,
-    )
+    atomic_write(path, (json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
 def _write_route_metadata(
@@ -1220,10 +1046,8 @@ def _write_route_metadata(
     delivery: str | None = None,
     delivered_full: bool = False,
     delivered_hot: bool = False,
-    reset_full_context: bool = False,
-    hot_revision: str | None = None,
+    hot_revision: str,
     inbox_revision: str | None = None,
-    full_revision: str | None = None,
     record_keys: dict[str, str] | None = None,
 ) -> None:
     session_key = _session_key(session_id)
@@ -1242,8 +1066,9 @@ def _write_route_metadata(
     # В записи сессии остаётся ТОЛЬКО дедупликация доставки. Ни одно поле
     # отсюда больше не выбирает проект: липкий и кешированный scope позволяли
     # памяти одного заказчика остаться в сессии про другого, потому что
-    # переживали смену рабочего каталога.
-    update_session = (delivered_full or delivered_hot or reset_full_context
+    # переживали смену рабочего каталога. Сброс после /clear, сжатия и resume
+    # в Codex уже сделал _forget_delivered в начале SessionStart.
+    update_session = (delivered_full or delivered_hot
                       or inbox_revision is not None or record_keys is not None)
     if update_session and session_id:
         path = _session_path(state_dir, session_id)
@@ -1254,16 +1079,11 @@ def _write_route_metadata(
             hot_context_revision = previous.get("hot_context_revision")
             inbox_context_revision = previous.get("inbox_context_revision")
             record_context_keys = previous.get("record_context_keys")
-            if reset_full_context:
-                full_context_scope = None
-                full_context_revision = None
-                inbox_context_revision = None
-                record_context_keys = None
             if delivered_full:
                 full_context_scope = decision.scope
-                full_context_revision = full_revision if full_revision is not None else revision
+                full_context_revision = revision
             if delivered_hot:
-                hot_context_revision = hot_revision if hot_revision is not None else revision
+                hot_context_revision = hot_revision
             if inbox_revision is not None:
                 inbox_context_revision = inbox_revision
             if record_keys:
@@ -1325,22 +1145,6 @@ def _mark_usage(state_dir: Path, selected: Iterable[str]) -> None:
         путь.touch(mode=0o600)
 
 
-def _environment_scope(scope_hint: str) -> RouteDecision | None:
-    """Scope от вызывающего: Telegram-бот, планировщик.
-
-    Алиасы ищутся во всей подсказке, как в первом сообщении; закрепляет ровно
-    один названный проект. Маркеров нет: рукописный список слов молча протухает,
-    а закрепление сессии слишком дорого ошибается, чтобы опираться на догадку.
-    Не распознали подсказку - сессия станет личной, это безопасный исход.
-    """
-    if not scope_hint:
-        return None
-    explicit = _explicit_scopes(scope_hint)
-    if len(explicit) == 1:
-        return RouteDecision(explicit[0], "env")
-    return None
-
-
 def _pin_mismatch(pinned: str | None, cwd: str) -> str | None:
     """Каталог проекта не совпадает с закреплённым проектом.
 
@@ -1366,11 +1170,7 @@ def _read_pin_record(state_dir: Path, session_id: str) -> dict:
     path = _pin_path(state_dir, session_id)
     if path is None:
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return svodgit.read_json(path) or {}
 
 
 def _pinned_scope(state_dir: Path, session_id: str) -> str | None:
@@ -1411,40 +1211,18 @@ def resolve_pin(prompt: str, scope_hint: str = "") -> tuple[str, str]:
     личный режим: угадывать нельзя, а переспросить некого, если сессию
     запустил бот или планировщик.
     """
-    environment = _environment_scope(scope_hint)
-    if environment is not None and environment.scope:
-        return environment.scope, "caller"
+    # Подсказка вызывающего (Telegram-бот, планировщик): алиасы ищутся в ней
+    # целиком, закрепляет ровно один названный проект. Маркеров нет, догадка
+    # слишком дорога; не распознали подсказку, решает само сообщение.
+    hinted = _explicit_scopes(scope_hint)
+    if len(hinted) == 1:
+        return hinted[0], "caller"
     named = _explicit_scopes(prompt)
     if len(named) == 1:
         return named[0], "first-message"
     if len(named) > 1:
         return PERSONAL_SCOPE, "ambiguous-first-message"
     return PERSONAL_SCOPE, "default-personal"
-
-
-def _sweep_pin_temps(directory: Path, max_age_sec: float = 3600.0) -> None:
-    """Убрать временные файлы от прерванной записи закрепления.
-
-    Прерывание ДО связывания оставляет уникальный временный файл. Следующей
-    попытке он не мешает, но копится вечно. Чистим только заведомо старые:
-    свежий может принадлежать другому процессу, который пишет прямо сейчас.
-    """
-    import time as _time
-
-    try:
-        entries = list(directory.iterdir())
-    except OSError:
-        return
-    now = _time.time()
-    for leftover in entries:
-        name = leftover.name
-        if not name.startswith(".") or name.endswith(".json"):
-            continue
-        try:
-            if now - leftover.stat().st_mtime > max_age_sec:
-                leftover.unlink()
-        except OSError:
-            continue
 
 
 def _write_pin(state_dir: Path, session_id: str, scope: str, source: str,
@@ -1465,16 +1243,14 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str,
     полную запись.
 
     replace заменяет прежнюю запись атомарно: так ответвление разговора
-    сужает любое закрепление до контракта.
+    сужает любое закрепление до контракта. Вызывающие зовут запись только
+    при непустом session_id, поэтому путь закрепления есть всегда.
     """
     path = _pin_path(state_dir, session_id)
-    if path is None:
-        return scope, source
     payload = json.dumps(
         {"version": 1, "scope": scope, "source": source, "at": utc_now()},
         ensure_ascii=False,
     ).encode("utf-8")
-    _sweep_pin_temps(path.parent)
     try:
         if replace:
             svodgit.replace_file(path, payload)
@@ -1557,16 +1333,12 @@ def scan_code_fences(lines) -> tuple[list[bool], bool]:
     return mask, open_char is not None
 
 
-def code_fence_mask(lines) -> list[bool]:
-    return scan_code_fences(lines)[0]
-
-
 def parse_sections(text: str) -> tuple[MarkdownSection, ...]:
     """Разделы по заголовкам `## `; строка `## …` внутри ограждённого кода
     заголовком не считается, иначе хвост раздела уезжал бы в раздел-призрак,
     который роутер никогда не выберет. Та же маска у писателя указателей."""
     lines = text.splitlines(keepends=True)
-    fenced = code_fence_mask(lines)
+    fenced = scan_code_fences(lines)[0]
     starts = [index for index, line in enumerate(lines)
               if not fenced[index] and re.match(r"^##\s+", line)]
     sections = []
@@ -1775,12 +1547,11 @@ def _topic_context(
         # обслуживает и чтение. Фабрика контекста отбрасывает область, чей
         # каталог или memory это ссылка; метку .svod.json читатель не сверяет.
         контекст = reader_federation(root)
-        if spec.owner not in контекст.available:
+        if spec.owner not in контекст:
             raise MemoryctlError(
                 f"{spec.owner}: настроенный владелец отсутствует в федерации")
         relative_source = rollup_relative_source(spec)
-        topic_path = (контекст.identities[spec.owner].worktree_root
-                      / "memory" / "topics" / spec.filename)
+        topic_path = контекст[spec.owner] / "memory" / "topics" / spec.filename
     else:
         # Сводка без владельца читается от переданного корня: так проверка
         # крючка выкладывает дерево. Хук и recall передают каталог данных, где
@@ -1861,15 +1632,11 @@ def _nonproject_context(
     include_inbox: bool = True,
     inbox: str | None = None,
     ranked: tuple[tuple[IndexEntry, int], ...] | None = None,
-    members: list[str] | None = None,
     record_keys: dict[str, str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
-    """Личная выдача. `members` (необязательный выход) получает членов
-    комплектов, чей текст лёг в выдачу или уже лежит выше: след маршрута их
-    не называет, а метки использования ставятся и им. `record_keys` есть
-    только у хука с сессией: ключ блока каждой записи и текста комплекта,
-    уже ушедших в этой сессии; тот же блок второй раз едет одной
-    строкой-указателем, словарь дополняется.
+    """Личная выдача. `record_keys` есть только у хука с сессией: ключ
+    блока каждой записи, уже ушедшей в этой сессии; тот же блок второй раз
+    едет одной строкой-указателем, словарь дополняется.
 
     Обвязка сжата: путь к индексу есть на SessionStart, оговорка о
     полномочиях в CLAUDE.md. Строка ревизии и маршрута остаётся дословно:
@@ -1910,7 +1677,6 @@ def _nonproject_context(
     else:
         if ranked is None:
             ranked = select_index_entries(root, prompt, entries)
-        доставленные = {entry.slug for entry, _ in ranked} | {"personal_inbox.md"}
         for entry, _score in ranked:
             if entry.slug == "personal_inbox.md":
                 continue  # текст или указатель уже отдан выше
@@ -1921,26 +1687,15 @@ def _nonproject_context(
                 # Откат реплики у Claude Code (Esc Esc, /rewind, правка) хука
                 # не вызывает и ключи не сбрасывает, поэтому указатель несёт
                 # полный путь: блока выше может уже не быть.
-                повтор = False
                 if record_keys is not None:
                     ключ = hashlib.sha256(parts[-1].encode("utf-8")).hexdigest()[:16]
                     if record_keys.get(entry.slug) == ключ:
                         parts[-1] = (f"[Совпавшая запись индекса уже в контексте: memory/{entry.slug}, "
                                      "текст выше в этой сессии не менялся; если его выше нет "
                                      f"(правка или откат реплики), прочитай {root / 'memory' / entry.slug}]")
-                        повтор = True
                     record_keys[entry.slug] = ключ
                 included.append(entry.slug)
                 retrievals += 1
-                # Комплект затравки (R4/R5/R9): члены целиком или метка.
-                # Порядок списания бюджета: комплект первой затравки, затем
-                # второй; общая запись остаётся за первым комплектом.
-                члены = bundle_members(root, entry.slug, доставленные)
-                if члены:
-                    положены = _append_bundle(parts, root, entry.slug, члены,
-                                              record_keys=record_keys, seed_repeat=повтор)
-                    if members is not None:
-                        members.extend(положены)
         if retrievals == 0:
             parts.append(
                 "Проектный scope и релевантная запись индекса не определены. "
@@ -1980,6 +1735,20 @@ def _contract_only_context(
     return "\n\n".join(parts), tuple(included)
 
 
+def with_banner(banner: str, body: str, scope: str | None) -> str:
+    """Шапка над телом выдачи: хук и recall склеивают их одним кодом.
+
+    Тело собрано под свой бюджет, шапка добавляется сверху. Обрезка ниже
+    сторожит только жёсткий потолок: при шапке в пределах запаса она не
+    срабатывает никогда. Источник обрезки у заказчика его сводка, у личной
+    области и без области memory/MEMORY.md."""
+    room = HARD_CONTEXT_LIMIT - len(banner) - 2
+    if len(body) > room:
+        body = _clip_block(body, room, rollup_relative_source(TOPICS[scope])
+                           if scope and scope != PERSONAL_SCOPE else "memory/MEMORY.md")
+    return f"{banner}\n\n{body}"
+
+
 def _output(event: str, context: str) -> dict:
     if len(context) >= HARD_CONTEXT_LIMIT:
         context = context[: HARD_CONTEXT_LIMIT - 1]
@@ -2002,7 +1771,6 @@ def _fail_soft(event: str, reason: str) -> dict:
 
 def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
     try:
-        cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else ""
         session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
         source = payload.get("source") if isinstance(payload.get("source"), str) else ""
         source = source.casefold()
@@ -2050,7 +1818,7 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
         global_root, personal_root = index_roots(root)
         # Замки на все корни чтения: сводка темы приходит из клиентского
         # корня, а его писатель держит только свой замок.
-        with reader_locks(reader_federation(root).available_roots):
+        with reader_locks(reader_federation(root).values()):
             index = (personal_root or global_root) / "memory" / "MEMORY.md"
             if not index.is_file():
                 raise FileNotFoundError(index)
@@ -2059,7 +1827,8 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
             global_revision = compute_revision(global_root)
             personal_revision = compute_revision(personal_root) if personal_root else None
             revision = personal_revision or global_revision
-            revision_note = _revision_note(global_revision, personal_revision)
+            revision_note = f"global {global_revision[:12]}" + (
+                f", personal {personal_revision[:12]}" if personal_revision is not None else "")
             # Старт сессии проект НЕ выбирает: это работа первого сообщения.
             # Здесь только сообщаем состояние защёлки. После resume и compact
             # закрепление сохраняется, и его надо показать заново, потому что
@@ -2127,7 +1896,6 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
                 sections=selected,
                 delivery=delivery,
                 delivered_hot=include_hot,
-                reset_full_context=reset_full_context,
                 hot_revision=hot_key,
             )
         except (OSError, MemoryctlError):
@@ -2176,7 +1944,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             pin_source = _pin_source(state_dir, session_id)
 
         global_root, personal_root = index_roots(root)
-        with reader_locks(reader_federation(root).available_roots):
+        with reader_locks(reader_federation(root).values()):
             index = (personal_root or global_root) / "memory" / "MEMORY.md"
             if not index.is_file():
                 raise FileNotFoundError(index)
@@ -2192,10 +1960,8 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             include_hot = отметки.get("hot_context_revision") != hot_key
             inbox_key = None
             record_keys = None
-            full_key = None
 
             ranked = ()
-            члены: list[str] = []
             contract_only = CONTRACT_ONLY_NOTES.get(pin_source)
             if pinned != PERSONAL_SCOPE:
                 decision = RouteDecision(pinned, f"pinned:{pin_source}")
@@ -2236,7 +2002,6 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     include_inbox=include_inbox,
                     inbox=inbox,
                     ranked=ranked,
-                    members=члены,
                     record_keys=record_keys,
                 )
                 # В запись сессии идёт только приращение этой реплики, то есть
@@ -2296,14 +2061,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                     "Если закрепление ошибочно, нужен /clear и новая заявка: "
                     "внутри сессии проект не меняется."
                 )
-            # Тело собрано под свой бюджет, шапка добавляется сверху. Обрезка
-            # ниже сторожит только жёсткий потолок: при шапке в пределах
-            # запаса она не срабатывает никогда.
-            room = HARD_CONTEXT_LIMIT - len(banner) - 2
-            if len(context) > room:
-                context = _clip_block(context, room, rollup_relative_source(TOPICS[pinned])
-                                      if pinned != PERSONAL_SCOPE else "memory/MEMORY.md")
-            context = f"{banner}\n\n{context}"
+            context = with_banner(banner, context, pinned)
 
         try:
             _write_route_metadata(
@@ -2318,7 +2076,6 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 delivered_hot=include_hot,
                 hot_revision=hot_key,
                 inbox_revision=inbox_key if "personal_inbox.md" in selected else None,
-                full_revision=full_key,
                 record_keys=record_keys,
             )
         except (OSError, MemoryctlError):
@@ -2328,7 +2085,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
         # метит: человека в нём нет.
         if decision.scope is None and decision.source in USAGE_ROUTES and not scheduled_run():
             try:
-                _mark_usage(state_dir, (*selected, *члены))
+                _mark_usage(state_dir, selected)
             except (OSError, MemoryctlError):
                 pass
         return _output(PROMPT_EVENT, context)
@@ -2337,7 +2094,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
 
 
 def process_json(command: str, raw: str, root: Path, state_dir: Path) -> dict:
-    event = SESSION_EVENT if command in ("session-start", "session") else PROMPT_EVENT
+    event = SESSION_EVENT if command == "session-start" else PROMPT_EVENT
     if TOPICS_ERROR:
         return _fail_soft(event, TOPICS_ERROR)
     try:
@@ -2353,24 +2110,7 @@ def process_json(command: str, raw: str, root: Path, state_dir: Path) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deterministic read-only Claude memory context router")
-    parser.add_argument("command", choices=("session-start", "user-prompt", "session", "prompt"))
+    parser.add_argument("command", choices=("session-start", "user-prompt"))
     parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument("--state-dir", type=Path, default=default_state_dir())
     return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    result = process_json(
-        args.command,
-        sys.stdin.read(),
-        args.root.expanduser().resolve(),
-        args.state_dir.expanduser().resolve(),
-    )
-    json.dump(result, sys.stdout, ensure_ascii=False, separators=(",", ":"))
-    sys.stdout.write("\n")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

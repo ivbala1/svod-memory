@@ -25,8 +25,6 @@ EXTERNAL_ENTRY_POINTS = {
     "memoryctl.collect_memory_files",
     "memoryctl.countable_link_warnings",
     "memoryctl.validate_links",
-    "memorysync.install_hooks",
-    "svodgit.write_marker",
 }
 # Одноимённые функции с заведомо разным смыслом: точки входа команд.
 SAME_NAME_ALLOWED = {"main", "build_parser"}
