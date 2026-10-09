@@ -17,7 +17,8 @@ import memoryverify as mv
 
 def probes_for_root(laid_out: Path, *, today=None) -> dict:
     """Крючки одного корня общего индекса (global или personal). Свёрнутые
-    записи не считаются: их автоматический отбор не выдаёт по построению."""
+    и истёкшие (valid_until) записи не считаются: их автоматический отбор не
+    выдаёт по построению, и писатель их крючки пропускает (probe_errors)."""
     сегодня = today if today is not None else mc.today_utc()
     записи = mc.parse_index(mc.build_index(laid_out))
     по_слагу = {Path(e.slug).stem: e for e in записи}
@@ -27,7 +28,8 @@ def probes_for_root(laid_out: Path, *, today=None) -> dict:
             continue
         поля, ошибка = mv.parse_frontmatter(файл.read_text(encoding="utf-8", errors="replace"))
         probe = (поля.get("probe") or "").strip()
-        if ошибка or not probe or поля.get("listed") == "false":
+        if (ошибка or not probe or поля.get("listed") == "false"
+                or mv.date_passed(поля, "valid_until", сегодня)):
             continue
         slug = файл.stem
         if slug not in по_слагу:
@@ -54,15 +56,17 @@ def probes_for_root(laid_out: Path, *, today=None) -> dict:
 
 
 def report(root: Path, *, today=None) -> dict:
-    """По обоим корням общего индекса этой машины."""
+    """По обоим корням общего индекса этой машины, на одну дату: прогон
+    через полночь UTC не считает корни по разным дням."""
+    сегодня = today if today is not None else mc.today_utc()
     try:
         global_root, personal = mc.index_roots(root)
     except ValueError as exc:
         # Битый federationMembers: отказ словами, как у стенда.
         raise mc.MemoryctlError(str(exc)) from exc
-    out = {"global": probes_for_root(global_root, today=today)}
+    out = {"global": probes_for_root(global_root, today=сегодня)}
     if personal is not None:
-        out["personal"] = probes_for_root(personal, today=today)
+        out["personal"] = probes_for_root(personal, today=сегодня)
     return out
 
 

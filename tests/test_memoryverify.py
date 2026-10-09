@@ -330,6 +330,45 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(any("не содержит ссылки" in e for e in report.errors), report.errors)
 
 
+class ProbesReportTests(unittest.TestCase):
+    """`memory-eval probes` считает те же крючки, что проверяет писатель."""
+
+    def test_expired_record_is_not_a_miss(self):
+        """Истёкшую запись отбор не выдаёт, писатель её крючок пропускает, и
+        отчёт её не считает: иначе до свёртки автоматом (а запись стенда,
+        hotKeep и глобальную он не сворачивает вовсе) отчёт красный при
+        исправном крючке. Граница та же: срок действует по свой день."""
+        import memorycontext
+        import memoryprobes
+        for срок, считается in (("2026-09-03", False), ("2026-09-04", True),
+                                ("2026-09-05", True)):
+            with self.subTest(valid_until=срок), tempfile.TemporaryDirectory() as tmp:
+                tree = base_tree()
+                tree["memory/reference_printer.md"] = record(
+                    "reference_printer", type="reference", title="Зелёный принтер",
+                    index="как чинить зелёный принтер", valid_until=срок,
+                    probe="чем чинить принтер зелёного цвета",
+                    body="Зелёный принтер чинится молотком.\n")
+                memorycontext._bm25_documents.cache_clear()
+                итог = memoryprobes.probes_for_root(mv.lay_out(tree, Path(tmp)), today=TODAY)
+                memorycontext._bm25_documents.cache_clear()
+                self.assertEqual(итог["total"], int(считается), итог)
+                self.assertEqual(итог["hit2"], int(считается), итог)
+                self.assertEqual(итог["misses"], [], итог)
+
+    def test_report_counts_both_roots_on_one_date(self):
+        """Прогон через полночь UTC не считает global и personal по разным дням."""
+        import memorycontext
+        import memoryprobes
+        корни = (Path("global"), Path("personal"))
+        with mock.patch.object(memorycontext, "today_utc",
+                               side_effect=[TODAY, TODAY + dt.timedelta(days=1)]), \
+                mock.patch.object(memorycontext, "index_roots", return_value=корни), \
+                mock.patch.object(memoryprobes, "probes_for_root", return_value={}) as корень:
+            memoryprobes.report(Path("федерация"))
+        self.assertEqual([вызов.kwargs["today"] for вызов in корень.call_args_list],
+                         [TODAY, TODAY])
+
 class ConfigTests(unittest.TestCase):
     def test_topics_are_parsed_once_per_bytes(self):
         """Один разбор на версию байтов: писатель и статус зовут load_topics

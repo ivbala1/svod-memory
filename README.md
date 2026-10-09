@@ -86,9 +86,11 @@ public suite covers the writer, verifier, sync and config paths, and of
 `memoryeval` only the baseline commit (`tests/test_configpaths.py`) and
 the measurement fingerprint, through the real `memory-eval` CLI on a
 neutral fixture (`StandFingerprintTests`); the
-router (`memorycontext`), `memoryrecall`, `memoryprobes` and the rest of
-`memoryeval` are covered only by the author's private suite, which reads a
-private corpus. The export script runs every `bin/*` with `--help`
+router (`memorycontext`), `memoryrecall` and the rest of `memoryeval` are
+covered only by the author's private suite, which reads a private corpus;
+of `memoryprobes` the public suite checks only that expired records stay
+out of the count and that one run uses one date (`ProbesReportTests`).
+The export script runs every `bin/*` with `--help`
 against `public/config`, so a module missing from the package fails the
 export. A hygiene test (`tests/test_hygiene.py`) keeps `lib/` free of
 functions without callers, unused imports and helpers defined twice.
