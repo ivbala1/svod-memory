@@ -343,6 +343,12 @@ def submit(*, scope: str, candidate_id: str, source: str, session: str,
     candidate = make_candidate(scope=scope, candidate_id=candidate_id, source=source,
                                session=session, content_type=content_type, body=body,
                                projection=projection, root=root, base=base)
+    # Узнаваемый секрет не попадает даже в pending/ до замка. Манифест
+    # уже развернул file в content (ревью 11.10.2026).
+    text = "\n".join(data.decode("utf-8") for data in compute_files(candidate).values()
+                     if data is not None)
+    found = [name for name, pattern in memoryverify.SECRET_PATTERNS if pattern.search(text)]
+    refuse_all([f"похоже на секрет ({name}); убери его из записи" for name in found])
     path = candidate_path(scope, candidate_id, state)
     data = json.dumps(candidate, ensure_ascii=False, indent=1, sort_keys=True).encode("utf-8")
     if not svodgit.create_file(path, data):
@@ -369,6 +375,7 @@ def refuse_before_submit(*, scope: str, candidate_id: str, source: str, session:
         # Под этим id уже ждёт другое намерение: его не стирать и не
         # заслонять отказом, слова отказа уходят вызывающему.
         return None
+    reason = memoryverify.redact_secrets(reason)
     candidate = {
         "scope": scope, "id": candidate_id, "source": source, "session": session,
         "content_type": content_type, "projection": None, "body": None,
@@ -386,6 +393,7 @@ def save_candidate(path: Path, candidate: dict) -> None:
 
 
 def fail_candidate(path: Path, candidate: dict, reason: str, state: Path | None = None) -> Path:
+    reason = memoryverify.redact_secrets(reason)
     candidate = dict(candidate, reason=reason)
     if "на секрет" in reason or "possible secret" in reason:
         candidate["body"] = None  # отказ лежит до удаления, секрет в нём не хранить
@@ -459,7 +467,8 @@ def run_dry(*, scope: str, candidate_id: str, source: str, session: str,
         checked = precheck(candidate, root=root, scope=scope, config=config,
                            scanner=scanner, today=today)
     except Refusal as exc:
-        return EXIT_FAILED, {**result, "state": "failed", "reason": str(exc)}
+        return EXIT_FAILED, {**result, "state": "failed",
+                             "reason": memoryverify.redact_secrets(str(exc))}
     except svodgit.GitError as exc:
         return EXIT_ERROR, {**result, "state": "error", "reason": f"git отказал: {exc}"}
     except Exception as exc:  # noqa: BLE001 - закрытый ответ словами, не трассировка
@@ -550,7 +559,15 @@ def _write(root: Path, files: dict[str, bytes | None]) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-    svodgit.git(root, "add", "-A", "--", *sorted(files))
+    # Удаление пути, которого уже нет (другая машина удалила раньше), это
+    # пустая операция: `git add` на нём падал «pathspec did not match», и
+    # кандидат висел вечно (ревью 11.10.2026).
+    removed = sorted(path for path, data in files.items() if data is None)
+    put = sorted(path for path, data in files.items() if data is not None)
+    if removed:
+        svodgit.git(root, "rm", "--cached", "--quiet", "--ignore-unmatch", "--", *removed)
+    if put:
+        svodgit.git(root, "add", "-A", "--", *put)
 
 
 def verify_trees(root: Path, scope: str, new: str, old: str | None,
@@ -569,6 +586,7 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
     до замка; он берётся только когда входы проверки вышли теми же."""
     notes: list[str] = []
     written = False
+    committed = False
     files: dict[str, bytes | None] = {}
     head_tree: dict[str, bytes] = {}
     try:
@@ -608,7 +626,18 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
             raise Refusal("; ".join(checked.report.errors))
         written = True
         _write(root, files)
+        # Чужое в индексе (ревью 11.10.2026): ручной `git add` во время fetch
+        # ушёл бы в коммит memory:<id>, а сверка вердикта видит только memory/.
         tree = svodgit.write_tree(root)
+        # Сверяем уже зафиксированное дерево, а не подвижный общий индекс:
+        # git add между diff и write-tree тоже не уедет (ревью 11.10.2026).
+        staged = set(svodgit.out(root, "diff-tree", "--no-commit-id", "--name-only",
+                                "-r", "-z", head or svodgit.out(root, "mktree", data=b""),
+                                tree).split("\0"))
+        foreign = sorted(staged - set(files) - {""})
+        if foreign:
+            _restore(root, files, head_tree)
+            raise Wait("в репозитории правят руками, кандидат ждёт: " + ", ".join(foreign))
         report = memoryverify.Report(ok=True, errors=[], warnings=[])
         if head and tree == svodgit.tree_of(root, head):
             # Всё уже в HEAD: след упавшего прохода после update-ref либо
@@ -645,6 +674,7 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
             commit = svodgit.out(root, "commit-tree", tree, *(["-p", head] if head else []),
                                  "-m", COMMIT_PREFIX + candidate["id"])
             svodgit.update_ref(root, "refs/heads/main", commit, head)
+        committed = True
         candidate["commit"] = commit
         candidate["result"] = {p: svodgit.blob(root, commit, p) for p in files}
         candidate["reason"] = None if fetched else "сети нет; коммит локальный, таймер отправит"
@@ -665,14 +695,23 @@ def apply(path: Path, candidate: dict, *, root: Path, scope: str,
         return {"state": "pending", "commit": final, "reason": words, "notes": notes,
                 "warnings": report.warnings}
     except Refusal as exc:
-        target = fail_candidate(path, candidate, str(exc), state)
-        return {"state": "failed", "reason": str(exc), "file": str(target), "notes": notes}
+        reason = memoryverify.redact_secrets(str(exc))
+        target = fail_candidate(path, candidate, reason, state)
+        return {"state": "failed", "reason": reason, "file": str(target), "notes": notes}
     except Wait as exc:
         candidate["reason"] = str(exc)
         save_candidate(path, candidate)
         return {"state": "pending", "commit": candidate.get("commit"), "reason": str(exc),
                 "notes": notes}
     except svodgit.GitError:
+        # Сбой git между записью и коммитом не оставляет дерево грязным: иначе
+        # таймер считал бы его ручной правкой и вставала вся область
+        # (ревью 11.10.2026). После коммита файлы равны HEAD, откатывать нечего.
+        if written and not committed:
+            try:
+                _restore(root, files, head_tree)
+            except svodgit.GitError:
+                pass
         raise
     except Exception as exc:  # noqa: BLE001 - закрытый ответ словами, не трассировка
         words = f"{type(exc).__name__}: {exc}"
@@ -772,7 +811,8 @@ def publish(root: Path, scope: str, commit: str, config: memoryverify.Config, *,
 
 def reached(root: Path, candidate: dict, tip: str | None) -> bool:
     """Коммит кандидата дошёл до вершины, и доказывает это git: хеш достижим
-    из неё либо blob каждого файла результата в ней равен результату коммита.
+    из неё, blob каждого файла результата равен результату коммита либо
+    git узнаёт тот же патч после rebase (ревью 11.10.2026).
     Вершина сервера (origin/main) доказывает доставку, HEAD локальный коммит.
     Пустой result доставкой не считается."""
     commit = candidate.get("commit")
@@ -781,7 +821,22 @@ def reached(root: Path, candidate: dict, tip: str | None) -> bool:
     if svodgit.rev(root, commit) and svodgit.is_ancestor(root, commit, tip):
         return True
     result = candidate.get("result") or {}
-    return bool(result) and all(svodgit.blob(root, tip, p) == oid for p, oid in result.items())
+    if result and all(svodgit.blob(root, tip, p) == oid for p, oid in result.items()):
+        return True
+    # Rebase таймера или следующей подачи переписывает хеш, а слияние с чужой
+    # правкой того же файла меняет и blob: доставленное шло в ложный отказ
+    # «запись менялась» (ревью 11.10.2026). Сравниваем git patch-id без
+    # контекста: соседняя чужая правка меняет строки контекста, но не патч
+    # кандидата. Автор, время и тема у разных подач с тем же id могут совпасть.
+    patch = svodgit.git(root, "show", "--format=medium", "--no-ext-diff", "--unified=0",
+                        commit, "--", check=False).stdout
+    own = svodgit.out(root, "patch-id", "--stable", data=patch).split()
+    if not own:
+        return False
+    patches = svodgit.git(root, "log", "--no-merges", "--format=medium", "--no-ext-diff",
+                          "--unified=0", "-p", tip, f"^{commit}", "--", check=False).stdout
+    return own[0] in {line.split()[0] for line in svodgit.out(
+        root, "patch-id", "--stable", data=patches).splitlines()}
 
 
 def drop_settled_failures(root: Path, scope: str, config: memoryverify.Config, *,
@@ -900,10 +955,11 @@ def run_remember(*, scope: str, candidate_id: str, source: str, session: str,
                                  session=session, content_type=content_type, body=body,
                                  projection=projection, root=root, state=state, base=base)
     except Refusal as exc:
+        reason = memoryverify.redact_secrets(str(exc))
         target = refuse_before_submit(scope=scope, candidate_id=candidate_id, source=source,
                                       session=session, content_type=content_type,
-                                      reason=str(exc), state=state)
-        result = {"state": "failed", "reason": str(exc)}
+                                      reason=reason, state=state)
+        result = {"state": "failed", "reason": reason}
         if target is not None:
             result["file"] = str(target)
         return EXIT_FAILED, result
@@ -914,6 +970,11 @@ def run_remember(*, scope: str, candidate_id: str, source: str, session: str,
         # Отказ или сбой проверки до замка окончательным не является: основу
         # обновляет fetch уже под замком, и слова скажет проход apply.
         checked = None
+    reason = "; ".join(checked.report.errors) if checked is not None else ""
+    if "на секрет" in reason or "possible secret" in reason:
+        # Находка внешнего сканера тоже не ждёт замка (ревью 11.10.2026).
+        target = fail_candidate(path, candidate, reason, state)
+        return EXIT_FAILED, {"state": "failed", "reason": reason, "file": str(target)}
     try:
         with svodgit.lock(root, exclusive=True):
             result = apply(path, candidate, root=root, scope=scope, config=config,

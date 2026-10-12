@@ -12,6 +12,7 @@ import contextlib
 import datetime as dt
 import os
 from pathlib import Path
+import time
 
 import configpaths
 import svodgit
@@ -60,12 +61,16 @@ def collect_memory_files(root: Path) -> list[Path]:
     return files
 
 
-def compute_revision(root: Path) -> str:
+def compute_revision(root: Path, timeout: float = svodgit.GIT_TIMEOUT_SEC) -> str:
     """Ревизия корпуса это хеш коммита HEAD; без git-репозитория (выложенное
     дерево, фикстура) отпечаток содержимого. Один запуск git на корень:
-    вершина несуществующего репозитория это просто None."""
+    вершина несуществующего репозитория это просто None. `timeout` это срок
+    git: хук отдаёт остаток своего бюджета; не уложился, значит отказ
+    (TimeoutError), а не отпечаток вместо вершины (ревью 11.10.2026)."""
     try:
-        head = svodgit.head(root)
+        head = svodgit.head(root, timeout=timeout)
+    except svodgit.GitTimeout as exc:
+        raise TimeoutError(str(exc)) from exc
     except svodgit.GitError:
         head = None
     if head:
@@ -173,14 +178,20 @@ def federation_context(data_root: Path, *, topics_raw: bytes | None = None) -> d
 
 
 @contextlib.contextmanager
-def reader_locks(roots):
+def reader_locks(roots, wait: float | None = None):
     """Разделяемые замки на все корни чтения сразу: сводка темы читается из
     клиентского корня, и его писатель держит только свой замок. Отдаёт
     True, когда взяты все имеющиеся замки; False, если хоть один корень с
     замком читается без него (истёк срок ожидания, файл не открывается).
-    Корень без git (выложенное дерево) замка не имеет и итог не портит."""
+    Корень без git (выложенное дерево) замка не имеет и итог не портит.
+    Срок ожидания `wait` (по умолчанию svodgit.SHARED_WAIT_SEC) общий на все
+    корни, а не на каждый: по сроку на корень два занятых корня ждались
+    20 с при сроке хука 10 с (ревью 12.10.2026)."""
+    deadline = time.monotonic() + (svodgit.SHARED_WAIT_SEC if wait is None else wait)
     with contextlib.ExitStack() as stack:
         taken = True
         for root in roots:
-            taken = stack.enter_context(svodgit.lock(root, exclusive=False)) is not False and taken
+            остаток = max(0.0, deadline - time.monotonic())
+            taken = stack.enter_context(
+                svodgit.lock(root, exclusive=False, wait=остаток)) is not False and taken
         yield taken

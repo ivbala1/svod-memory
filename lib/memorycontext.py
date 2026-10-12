@@ -12,6 +12,7 @@ import os
 import pathlib
 from pathlib import Path, PurePosixPath
 import re
+import time
 from typing import Iterable
 
 import datetime as dt
@@ -76,13 +77,18 @@ PERSONAL_REASONS = {
     "ambiguous-first-message":
         "Сессия личная: в первом сообщении названо несколько проектов, "
         "выбирать за тебя нельзя. Проектная память не подмешивается.",
+    # Сбой и порча закрепления дают только контракт, как отказ записи на
+    # SessionStart: личная выдача здесь смешалась бы с проектом, который
+    # закрепит следующая реплика после восстановления диска (ревью 12.10.2026).
     "io-error":
-        "⚠️ Сессия личная ВЫНУЖДЕННО: закрепление не удалось записать "
-        "(ошибка файловой системы). Проектная память не подмешивается, "
-        "проверь состояние каталога ~/.local/state/agent-memory.",
+        "⚠️ Сессию продолжать НЕЛЬЗЯ: закрепление не удалось записать "
+        "(ошибка файловой системы). Отдаётся только глобальный контракт: ни "
+        "проектная, ни личная память не подмешиваются. Начни новую сессию и "
+        "проверь ~/.local/state/agent-memory.",
     "unreadable-pin":
-        "⚠️ Сессия личная ВЫНУЖДЕННО: запись закрепления повреждена. "
-        "Нужен /clear и новая сессия.",
+        "⚠️ Сессию продолжать НЕЛЬЗЯ: запись закрепления повреждена. Отдаётся "
+        "только глобальный контракт: ни проектная, ни личная память не "
+        "подмешиваются. Нужен /clear и новая сессия.",
     "retired-pin":
         "⚠️ Проект этой сессии снят с конфигурации памяти (заказчик в архиве). "
         "Отдаётся только глобальный контракт: ни проектная, ни личная память "
@@ -100,9 +106,30 @@ PERSONAL_REASONS = {
 CONTRACT_ONLY_NOTES = {
     "retired-pin": "Проект сессии снят с конфигурации: инбокс и записи не отдаются, только контракт.",
     "forked": "Ответвление разговора: инбокс и записи не отдаются, только контракт.",
+    "io-error": "Закрепление не записано: инбокс и записи не отдаются, только контракт.",
+    "unreadable-pin": "Запись закрепления повреждена: инбокс и записи не отдаются, только контракт.",
+    # Субагент не отличит упавший хук корня от несостоявшейся записи
+    # закрепления (сбой диска следа не оставляет), поэтому без закрепления
+    # корня ему тоже только контракт (ревью 11.10.2026).
+    "subagent-without-pin": "Корень сессии ещё не закреплён: инбокс и записи не отдаются, только контракт.",
 }
 SESSION_EVENT = "SessionStart"
 PROMPT_EVENT = "UserPromptSubmit"
+# Общий срок ожидания разделяемых замков хуком на все корни. Срок самого
+# хука 10 с (~/.claude/settings.json, hooks.json Codex): ожидание по 10 с на
+# корень его убивало без всякой выдачи. Остаток уходит на сборку выдачи; не
+# взяв замки, хук отвечает мягким отказом, а не читает дерево посреди
+# транзакции писателя (ревью 12.10.2026).
+HOOK_LOCK_WAIT_SEC = 4.0
+# Бюджет хука от входа в обработчик на git-вызовы: срок git по умолчанию
+# 60 с, и медленный git выводил хук за его 10 с (ревью 11.10.2026). Запас до
+# 10 с остаётся на запуск интерпретатора и вывод.
+HOOK_BUDGET_SEC = 8.0
+
+
+def _hook_left(deadline: float) -> float:
+    """Остаток бюджета хука как срок одного git-вызова."""
+    return max(0.1, deadline - time.monotonic())
 
 
 @dataclass(frozen=True)
@@ -188,8 +215,14 @@ TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
 # Приглашение оболочки во вставленном выводе: `user@host acme %`, `devops@host:~$`.
 # В нём имя каталога, а не намерение: иначе каталог в приглашении выбирал бы тему.
 # Съедается только сама префиксная часть до %, $ или #, команда после неё остаётся.
+# Между хостом и знаком либо путь без пробелов после двоеточия любой длины,
+# либо одно слово (каталог zsh): проза после адреса почты приглашением не
+# считается, а длинный путь срезается (ревью 12.10.2026). После пути
+# допускается метка ветки git в скобках: `(main)`, `git:(main)`, `(main *)`
+# (ревью 11.10.2026).
 SHELL_PROMPT_RE = re.compile(
-    r"^[ \t]*[\w.\-]+@[\w.\-]+[^\n%$#]{0,80}?[%$#](?=[ \t]|$)",
+    r"^[ \t]*[\w.\-]+@[\w.\-]+(?::[^\s%$#]*|[ \t]+[^\s%$#]+)?"
+    r"(?:[ \t]+(?:git:)?\([^()\n%$#]{1,60}\))?[ \t]*[%$#](?=[ \t]|$)",
     re.MULTILINE,
 )
 # Базовый стоп-список общей токенизации. Им пользуется и BM25 второго места:
@@ -453,8 +486,10 @@ def parse_index(text: str) -> tuple[IndexEntry, ...]:
 # невозможно по построению.
 
 INDEX_TYPES = tuple(kind for kind in INDEX_SECTIONS if kind != "inbox")
+# Заголовок разбирается нежадно до `](файл.md)`: «]» внутри заголовка
+# (`Вход [ssh] на роутер`) раньше выкидывал строку из индекса (ревью 12.10.2026).
 INDEX_ITEM_RE = re.compile(
-    r"^\s*-\s+\[([^\]]+)\]\(([^)]+\.md)(?:#[^)]*)?\)\s*(?:[—–-]\s*)?(.*)$")
+    r"^\s*-\s+\[(.+?)\]\(([^)]+\.md)(?:#[^)]*)?\)\s*(?:[—–-]\s*)?(.*)$")
 
 
 def record_index_line(name: str, fields: dict[str, str]) -> tuple[str, str] | None:
@@ -530,6 +565,10 @@ def build_index(root: Path) -> str:
     записей memory/*.md. Отсутствие преамбулы - FileNotFoundError, как
     прежде отсутствие файла индекса."""
     memory_root = root / "memory"
+    if (memory_root / "MEMORY.md").is_symlink():
+        # Преамбула-ссылка привела бы чужие строки в индекс и контракт, как
+        # запись-ссылка ниже (ревью 12.10.2026).
+        raise FileNotFoundError(f"{memory_root / 'MEMORY.md'}: символическая ссылка")
     преамбула = (memory_root / "MEMORY.md").read_text(encoding="utf-8")
     тексты = []
     for файл in memory_root.glob("*.md"):
@@ -575,7 +614,12 @@ def contract_block(entries: tuple[IndexEntry, ...]) -> str:
     return "\n".join(lines)
 
 
-def _hot_contract(entries: tuple[IndexEntry, ...]) -> str:
+def _hot_contract(global_root: Path) -> str:
+    """Контракт к доставке. Правило с истёкшим valid_until уходит молча, как
+    личная запись: граница _entry_expired (ревью 12.10.2026)."""
+    сегодня = today_utc()
+    entries = tuple(entry for entry in parse_index(build_index(global_root))
+                    if not _entry_expired(global_root, entry, сегодня))
     return _clip_block(contract_block(entries), CONTRACT_LIMIT, "memory/MEMORY.md")
 
 
@@ -585,7 +629,8 @@ def contract_key(hot_contract: str) -> str:
     return hashlib.sha256(hot_contract.encode("utf-8")).hexdigest()[:16]
 
 
-def topic_key(root: Path, spec: TopicSpec, revision: str) -> str:
+def topic_key(root: Path, spec: TopicSpec, revision: str,
+              timeout: float = svodgit.GIT_TIMEOUT_SEC) -> str:
     """Повтор сводки зависит от её владельца, а не от личных коммитов.
     При недоступности владельца сохраняем прежний ключ; причину назовёт
     чтение самой сводки. Карта читателя уже построена и Git не обходит,
@@ -593,7 +638,12 @@ def topic_key(root: Path, spec: TopicSpec, revision: str) -> str:
     try:
         контекст = reader_federation(root)
         if spec.owner in контекст:
-            return compute_revision(контекст[spec.owner])
+            return compute_revision(контекст[spec.owner], timeout)
+    except TimeoutError:
+        # Git владельца не уложился в бюджет хука: это мягкий отказ всего
+        # ответа, а не повод выдать сводку под ключом личного корпуса
+        # (ревью 11.10.2026).
+        raise
     except (OSError, ValueError, KeyError, MemoryctlError):
         pass
     return revision
@@ -612,6 +662,12 @@ def index_roots(root: Path) -> tuple[Path, Path | None]:
 
 def _normalized_text(text: str) -> str:
     return " ".join(TOKEN_RE.findall(text.casefold().replace("ё", "е")))
+
+
+def _folded(text: str) -> str:
+    """Регистр и ё как е, тем же правилом, что у отбора записей: термины,
+    алиасы и селекторы разделов сравниваются так же (ревью 12.10.2026)."""
+    return text.casefold().replace("ё", "е")
 
 
 def _tokens(text: str, stop: frozenset[str] | set[str] | None = None) -> tuple[str, ...]:
@@ -978,7 +1034,8 @@ def _entry_block(root: Path, entry: IndexEntry, maximum: int = 2_400) -> str | N
 
 def _personal_inbox_block(root: Path, maximum: int) -> str | None:
     target = root / "memory" / "personal_inbox.md"
-    if not target.is_file():
+    # Инбокс-ссылка на чужой файл не свой инбокс, как запись-ссылка (ревью 12.10.2026).
+    if target.is_symlink() or not target.is_file():
         return None
     text = _read_limited(target)
     lines = [
@@ -1030,7 +1087,7 @@ def _user_catalog_block(entries: tuple[IndexEntry, ...], maximum: int = USER_CAT
 
 
 def _phrase_pattern(phrase: str, *, prefix: bool = False) -> re.Pattern[str]:
-    escaped = re.escape(phrase.casefold())
+    escaped = re.escape(_folded(phrase))
     left = r"(?<!\w)" if phrase and phrase[0].isalnum() else ""
     if prefix:
         right = r"\w*"
@@ -1042,7 +1099,7 @@ def _phrase_pattern(phrase: str, *, prefix: bool = False) -> re.Pattern[str]:
 def _contains(text: str, term: str) -> bool:
     prefix = term.endswith("*")
     value = term[:-1] if prefix else term
-    return bool(_phrase_pattern(value, prefix=prefix).search(text.casefold()))
+    return bool(_phrase_pattern(value, prefix=prefix).search(_folded(text)))
 
 
 def _matching_terms(text: str, terms: Iterable[str]) -> tuple[str, ...]:
@@ -1192,11 +1249,33 @@ def scheduled_run() -> bool:
 # Реплики, которые Claude Code присылает сам, без человека: уведомление о
 # завершении фоновой задачи. Отбор по их словам давал треть всех выдач личной
 # памяти, к месту 4 из 40 (замер на живых репликах 24.09.2026).
+# Сообщение соседнего агента, сессии или канала тоже пишет не человек:
+# ни записей по его словам, ни меток и в закреплённой сессии. Плановое
+# пробуждение (loop, schedule) сюда не входит (решение владельца 12.10.2026).
 SERVICE_PROMPT_PREFIXES = ("<task-notification>",)
+# Сообщения соседних агентов, сессий и каналов (решение владельца 12.10.2026).
+PEER_PROMPT_PREFIXES = ("Another Claude session sent a message",
+                        "The coordinator sent a message", "<agent-message ",
+                        "<channel ", "<channel>")
+# Поля происхождения реплики, если Claude Code их передаёт: в журнале у
+# сообщений соседей стоит promptSource system.
+PROMPT_SOURCE_FIELDS = ("source", "prompt_source", "promptSource")
 
 
-def service_prompt(prompt: str) -> bool:
-    return prompt.lstrip().startswith(SERVICE_PROMPT_PREFIXES)
+def service_prompt(prompt: str, payload: dict | None = None) -> bool:
+    текст = prompt.lstrip()
+    if текст.startswith(SERVICE_PROMPT_PREFIXES):
+        return True
+    if not текст.startswith(PEER_PROMPT_PREFIXES):
+        return False
+    # Реплика человека, начатая такой же фразой (вставленный текст), память
+    # не теряет: при явном происхождении не system это человек (решение
+    # владельца 12.10.2026).
+    for поле in PROMPT_SOURCE_FIELDS:
+        значение = (payload or {}).get(поле)
+        if isinstance(значение, str) and значение and значение != "system":
+            return False
+    return True
 
 
 def _mark_usage(state_dir: Path, selected: Iterable[str]) -> None:
@@ -1239,7 +1318,12 @@ def _read_pin_record(state_dir: Path, session_id: str) -> dict:
     path = _pin_path(state_dir, session_id)
     if path is None:
         return {}
-    return svodgit.read_json(path) or {}
+    record = svodgit.read_json(path) or {}
+    # Поле не той природы (список вместо строки) это повреждённая запись, как
+    # нечитаемый JSON, а не TypeError в хуке (ревью 11.10.2026).
+    if not all(isinstance(record.get(field, ""), str) for field in ("scope", "source")):
+        return {}
+    return record
 
 
 def _pinned_scope(state_dir: Path, session_id: str) -> str | None:
@@ -1340,7 +1424,7 @@ def _write_pin(state_dir: Path, session_id: str, scope: str, source: str,
         return PERSONAL_SCOPE, "retired-pin"
     # Запись есть, но нечитаемая: это поломка состояния, а не «ещё не
     # закреплено». Молча начинать заново нельзя, иначе защёлка перестаёт быть
-    # односторонней; отдаём личный режим как безопасный исход.
+    # односторонней; отдаём только контракт как безопасный исход.
     return PERSONAL_SCOPE, "unreadable-pin"
 
 
@@ -1447,10 +1531,10 @@ def section_cap(section: MarkdownSection) -> int:
 
 
 def _section_terms(spec: TopicSpec, title: str) -> tuple[str, ...]:
-    normalized = title.casefold()
+    normalized = _folded(title)
     terms = []
     for selector, configured_terms in spec.section_terms:
-        if selector.casefold() in normalized:
+        if _folded(selector) in normalized:
             terms.extend(configured_terms)
     return tuple(terms)
 
@@ -1488,7 +1572,7 @@ def select_sections(
             # Попав ещё и в defaults, раздел уехал бы дважды.
             if _is_mandatory(section):
                 continue
-            if selector.casefold() in section.title.casefold() and section not in defaults:
+            if _folded(selector) in _folded(section.title) and section not in defaults:
                 defaults.append(section)
                 break
     return tuple(defaults[:3])
@@ -1588,7 +1672,7 @@ def selectable_sections(
     """
     def is_default(section: MarkdownSection) -> bool:
         return any(
-            selector.casefold() in section.title.casefold()
+            _folded(selector) in _folded(section.title)
             for selector in spec.default_sections
         )
 
@@ -1604,8 +1688,10 @@ def selectable_sections(
 def section_records(owner_root: Path) -> dict[str, tuple[IndexEntry, ...]]:
     """Записи корня-владельца сводки по полю section шапки: заголовок раздела
     (casefold) -> записи. Только memory/*.md этого корня: запись другого
-    корня с тем же section в список чужой сводки не попадает."""
+    корня с тем же section в список чужой сводки не попадает. Запись с
+    истёкшим valid_until в список не входит, как в личный отбор (ревью 12.10.2026)."""
     разделы: dict[str, list[IndexEntry]] = {}
+    сегодня = today_utc()
     for файл in sorted((owner_root / "memory").glob("*.md")):
         if файл.name == "MEMORY.md" or файл.is_symlink():
             continue
@@ -1614,7 +1700,7 @@ def section_records(owner_root: Path) -> dict[str, tuple[IndexEntry, ...]]:
         except (OSError, UnicodeError):
             continue
         раздел = поля.get("section", "").strip().casefold()
-        if раздел:
+        if раздел and date_passed(поля, "valid_until", сегодня) is None:
             свои = разделы.setdefault(раздел, [])
             свои.append(IndexEntry(раздел, _clean_inline(поля.get("title", "")), файл.name,
                                    _clean_inline(поля.get("index", "")), len(свои)))
@@ -1664,6 +1750,10 @@ def _topic_context(
         # её нет: тема без owner в конфигурации не работает, код это не запрещает.
         relative_source = rollup_relative_source(spec)
         topic_path = root / relative_source
+    if topic_path.is_symlink() or topic_path.parent.is_symlink():
+        # Сводка или каталог topics ссылкой: чужая сводка уехала бы под шапкой
+        # этого заказчика. Корень и memory проверила фабрика контекста (ревью 12.10.2026).
+        raise MemoryctlError(f"{topic_path}: сводка или каталог topics это символическая ссылка")
     text = topic_path.read_text(encoding="utf-8")
     sections = parse_sections(text)
     mandatory = tuple(section for section in sections if _is_mandatory(section)) if full_context else ()
@@ -1891,6 +1981,7 @@ def _fail_soft(event: str, reason: str) -> dict:
 
 
 def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
+    срок = time.monotonic() + HOOK_BUDGET_SEC
     try:
         session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
         source = payload.get("source") if isinstance(payload.get("source"), str) else ""
@@ -1939,14 +2030,17 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
         global_root, personal_root = index_roots(root)
         # Замки на все корни чтения: сводка темы приходит из клиентского
         # корня, а его писатель держит только свой замок.
-        with reader_locks(reader_federation(root).values()):
+        with reader_locks(reader_federation(root).values(), HOOK_LOCK_WAIT_SEC) as все_взяты:
+            if not все_взяты:
+                raise TimeoutError("корпус занят писателем дольше срока ожидания")
             index = (personal_root or global_root) / "memory" / "MEMORY.md"
             if not index.is_file():
                 raise FileNotFoundError(index)
-            hot_contract = _hot_contract(parse_index(build_index(global_root)))
+            hot_contract = _hot_contract(global_root)
             hot_key = contract_key(hot_contract)
-            global_revision = compute_revision(global_root)
-            personal_revision = compute_revision(personal_root) if personal_root else None
+            global_revision = compute_revision(global_root, _hook_left(срок))
+            personal_revision = (compute_revision(personal_root, _hook_left(срок))
+                                 if personal_root else None)
             revision = personal_revision or global_revision
             revision_note = f"global {global_revision[:12]}" + (
                 f", personal {personal_revision[:12]}" if personal_revision is not None else "")
@@ -2027,9 +2121,10 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
 
 
 def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
+    срок = time.monotonic() + HOOK_BUDGET_SEC
     try:
         prompt = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
-        if service_prompt(prompt):
+        if service_prompt(prompt, payload):
             # Служебной реплике память ничего не добавляет: ни записей, ни
             # следа маршрута. Контракт и инбокс уйдут со следующей репликой.
             return {}
@@ -2053,11 +2148,25 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             # первым. Отдаём личный режим: без опоры выбирать проект
             # опаснее, чем не выбрать.
             pinned, pin_source = PERSONAL_SCOPE, "no-session-id"
+        elif pinned is None and _retired_pin(state_dir, session_id):
+            # Проект сессии снят с конфигурации: только контракт и корню, и
+            # субагенту, ветка ниже приняла бы её за незакреплённую (ревью 12.10.2026).
+            pinned, pin_source = PERSONAL_SCOPE, "retired-pin"
         elif pinned is None and marks_id != session_id:
             # Субагент в сессии, которую корень не закрепил (его хук упал
             # до записи). Текст субагента пишет модель, проект он не
-            # выбирает: личный режим без записи, закрепит реплика корня.
-            pinned, pin_source = PERSONAL_SCOPE, "subagent-without-pin"
+            # выбирает: личный режим без записи и только контракт, закрепит
+            # реплика корня (ревью 11.10.2026).
+            # Повреждённая запись корня это не «не закрепил» (ревью 12.10.2026).
+            pinned = PERSONAL_SCOPE
+            pin_source = ("unreadable-pin" if _pin_path(state_dir, session_id).exists()
+                          else "subagent-without-pin")
+        elif pinned is None and payload.get("source") == "system":
+            # Машинная реплика Claude Code (source system: сообщения соседних
+            # агентов и каналов, автопродолжение) проект не закрепляет: в
+            # незакреплённой сессии ей ничего, закрепит реплика человека
+            # (ревью 12.10.2026).
+            return {}
         elif pinned is None:
             pinned, pin_source = resolve_pin(prompt, scope_hint)
             pinned, pin_source = _write_pin(state_dir, session_id, pinned, pin_source)
@@ -2065,17 +2174,19 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
             pin_source = _pin_source(state_dir, session_id)
 
         global_root, personal_root = index_roots(root)
-        with reader_locks(reader_federation(root).values()):
+        with reader_locks(reader_federation(root).values(), HOOK_LOCK_WAIT_SEC) as все_взяты:
+            if not все_взяты:
+                raise TimeoutError("корпус занят писателем дольше срока ожидания")
             index = (personal_root or global_root) / "memory" / "MEMORY.md"
             if not index.is_file():
                 raise FileNotFoundError(index)
             # Глобальный репозиторий отдаётся только контрактом и в поиске не
             # участвует: правила приходят всегда, им незачем соперничать с
             # личными записями за два места совпавших записей.
-            hot_contract = _hot_contract(parse_index(build_index(global_root)))
+            hot_contract = _hot_contract(global_root)
             hot_key = contract_key(hot_contract)
             entries = parse_index(build_index(personal_root)) if personal_root else ()
-            revision = compute_revision(personal_root or global_root)
+            revision = compute_revision(personal_root or global_root, _hook_left(срок))
             # Без сессии (как у recall и стенда) отметок нет, всё едет целиком.
             отметки = _session_record(state_dir, marks_id)
             include_hot = отметки.get("hot_context_revision") != hot_key
@@ -2135,7 +2246,7 @@ def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
                 delivered_full = False
             else:
                 spec = TOPICS[decision.scope]
-                full_key = topic_key(root, spec, revision)
+                full_key = topic_key(root, spec, revision, _hook_left(срок))
                 # В закреплённой сессии ревизия это вершина репозитория
                 # заказчика: она и печатается, и пишется в след маршрута.
                 # Агент берёт этот хеш для --base клиентской подачи, и хеш

@@ -200,7 +200,7 @@ def build_body(root: Path, scope: str | None, prompt: str) -> tuple[str, tuple[s
     index = (personal_root or global_root) / "memory" / "MEMORY.md"
     if not index.is_file():
         raise RecallError(f"нет индекса памяти {index}")
-    hot_contract = mc._hot_contract(mc.parse_index(mc.build_index(global_root)))
+    hot_contract = mc._hot_contract(global_root)
     entries = mc.parse_index(mc.build_index(personal_root)) if personal_root else ()
     revision = compute_revision(personal_root or global_root)
 
@@ -285,8 +285,8 @@ def recall(
         if not все_взяты:
             # Писатель держит корень дольше срока ожидания: ревизии по HEAD
             # не видят его незакоммиченную запись, так что читать сейчас
-            # значит рисковать половиной сводки. Хук читает всегда (его
-            # контракт), команде честнее отказать словами.
+            # значит рисковать половиной сводки. Хук в этом случае отвечает
+            # мягким отказом, команде честнее отказать словами.
             raise RecallError("корпус занят писателем дольше срока ожидания, повтори запрос")
         body, _ = build_body(root, итог, prompt)
 
@@ -364,6 +364,24 @@ def explain(
         e.slug for e in mc.folded_entries(найденный_корень, mc.second_place_whitelist())})
     доставка = not в_архиве and (проиндексирована or в_списке) and просрочена is None
 
+    # У заказчика доставка определяется разделом сводки, а не индексом;
+    # listed: false этому не мешает (ревью 12.10.2026).
+    раздел_доставки = None
+    if not в_архиве and найденный_корень not in (personal_root, global_root):
+        контекст = mc.reader_federation(root)
+        for spec in mc.TOPICS.values():
+            if контекст.get(spec.owner) != найденный_корень:
+                continue
+            путь = найденный_корень / "memory" / "topics" / spec.filename
+            try:
+                разделы = mc.selectable_sections(
+                    spec, mc.parse_sections(путь.read_text(encoding="utf-8")))
+            except (OSError, UnicodeError):
+                continue
+            раздел_доставки = next((s.title for s in разделы
+                                   if s.title.strip().casefold() == поля.get("section", "").strip().casefold()), None)
+        доставка = раздел_доставки is not None and просрочена is None
+
     # Запись без строки индекса может быть свёрнута в сводку темы, и после
     # переезда сводок каноническая формулировка живёт у владельца. Называть
     # такую запись «сиротой» значит путать штатное замещение с потерей (R10:
@@ -399,6 +417,8 @@ def explain(
         причина = "в архиве без преемника"
     elif просрочена:
         причина = f"просрочена: {просрочена}"
+    elif раздел_доставки:
+        причина = f"в списке раздела {раздел_доставки}: до шести записей под вопрос"
     elif в_списке:
         причина = ("свёрнута, в белом списке второго места: приходит только вторым "
                    f"местом с пометкой «{mc.FOLDED_MARK}»")
@@ -407,6 +427,8 @@ def explain(
     elif (not проиндексирована and найденный_корень == personal_root
           and поля.get("listed") == "false"):
         причина = "свёрнута: вне индекса, находится поиском по корпусу"
+    elif найденный_корень not in (personal_root, global_root):
+        причина = "не указан достижимый раздел сводки"
     elif not проиндексирована:
         причина = "не проиндексирована (сирота)"
     else:
@@ -667,6 +689,42 @@ def _visible(итог: dict, потолок: str | None) -> dict:
     return итог
 
 
+def _nudge_ceiling(потолок: str | None) -> tuple[str | None, bool]:
+    """Пересечь потолок с закреплением хука; fork без подсказки
+    (ревью 12.10.2026). Без события остаётся ручной вызов по каталогу."""
+    try:
+        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        if not raw.strip():
+            return потолок, False
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return None, False
+        source = str(payload.get("source", "")).casefold()
+        if source == "fork":
+            return None, True
+        if source in {"startup", "clear"}:
+            return потолок, False
+        session = payload.get("session_id")
+        if not isinstance(session, str) or not session:
+            return None, False
+        pin = mc._read_pin_record(mc.default_state_dir(), session)
+        path = mc._pin_path(mc.default_state_dir(), session)
+        if not pin and path and path.exists():
+            return None, False
+        if pin.get("source") == "forked":
+            return None, True
+        scope = pin.get("scope")
+        if scope is None and source in {"resume", "compact"}:
+            scope = PERSONAL
+        if scope == PERSONAL:
+            return потолок, False
+        if scope in mc.TOPICS and потолок in {PERSONAL, scope}:
+            return scope, False
+        return None, False
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None, False
+
+
 def _refused_early(args, reason: str, *, keep: bool = True) -> int:
     """Отказ до подачи (тело не прочитано): в failed/, как у проверок. Сухой
     прогон и подача в чужую область (keep=False) следа не оставляют."""
@@ -742,8 +800,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             import memorysync
             if args.nudge:
-                # Хук старта зовёт подсказку до закрепления, поэтому она видит
-                # только области потолка каталога, как recall. Заметки месяца
+                # Resume и compact уже закреплены: пересекаем их область
+                # с потолком, fork не получает подсказку (ревью 12.10.2026).
+                # Заметки месяца
                 # (UTC) только при личном потолке и человеку; месяц это
                 # локальный файл, удобство показа, а не состояние памяти.
                 метка = svodgit.state_dir() / "nudge-month"
@@ -751,11 +810,14 @@ def main(argv: list[str] | None = None) -> int:
                 безлюдный = (mc.scheduled_run() or os.environ.get(
                     "CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"))
                 потолок, беда = _cwd_ceiling()
+                потолок, fork = _nudge_ceiling(потолок)
+                if fork:
+                    return 0
                 try:
                     месячная = (потолок == PERSONAL and not безлюдный
                                 and метка.read_text(encoding="utf-8").strip() != месяц)
                 except OSError:
-                    месячная = True
+                    месячная = потолок == PERSONAL and not безлюдный
                 try:
                     итог = _visible(memorysync.status(fetch=False), потолок)
                     строка = memorysync.format_nudge(итог, monthly=месячная)

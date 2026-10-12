@@ -89,10 +89,20 @@ MEASUREMENT_FILES = (
 )
 
 
-def load_questions(path: Path = QUESTIONS_PATH) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not data.get("questions") or not data.get("negatives"):
+def load_questions(path: Path | None = None) -> dict:
+    path = path or QUESTIONS_PATH
+    # Ошибка файла и его формы не регрессия отбора (ревью 12.10.2026).
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise mc.MemoryctlError(f"{path}: не удалось прочитать вопросы: {exc}") from exc
+    if not isinstance(data, dict) or any(
+            not isinstance(data.get(k), list) or not data[k] for k in ("questions", "negatives")):
         raise mc.MemoryctlError(f"{path}: пустые questions или negatives")
+    for q in data["questions"] + data["negatives"]:
+        if (not isinstance(q, dict) or not isinstance(q.get("id"), str) or not q["id"]
+                or not isinstance(q.get("text"), str) or not q["text"]):
+            raise mc.MemoryctlError(f"{path}: вопрос должен иметь непустые строки id и text")
     ids = [q["id"] for q in data["questions"]] + [n["id"] for n in data["negatives"]]
     if len(ids) != len(set(ids)):
         raise mc.MemoryctlError(f"{path}: повторяющиеся идентификаторы вопросов")
@@ -103,8 +113,14 @@ def load_questions(path: Path = QUESTIONS_PATH) -> dict:
         if not isinstance(expect, str) or not memoryverify.SLUG_RE.fullmatch(expect):
             raise mc.MemoryctlError(f"{path}: у вопроса {q['id']} нет ожидаемой записи expect "
                                     "(имя одной записи без .md)")
-        if not q.get("markers"):
+        if (not isinstance(q.get("markers"), list) or not q["markers"]
+                or any(not isinstance(m, str) or not m for m in q["markers"])):
             raise mc.MemoryctlError(f"{path}: у вопроса {q['id']} нет признаков ответа markers")
+        try:
+            for marker in q["markers"]:
+                re.compile(marker)
+        except re.error as exc:
+            raise mc.MemoryctlError(f"{path}: у вопроса {q['id']} неверный markers: {exc}") from exc
         forbid = q.get("forbid", [])
         if (not isinstance(forbid, list)
                 or any(not isinstance(f, str) or not memoryverify.SLUG_RE.fullmatch(f)

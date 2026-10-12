@@ -89,8 +89,20 @@ SECRET_PATTERNS = (
     ("telegram-bot-token", re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b")),
 )
 
+
+def redact_secrets(text: str) -> str:
+    """Диагностика не повторяет узнаваемые секреты (ревью 11.10.2026)."""
+    for _, pattern in SECRET_PATTERNS:
+        text = pattern.sub("<скрыто>", text)
+    return text
+
 SUPERSEDED_RE = re.compile(r"(?:Свёрнуто в сводку|Замещено записью)\s*\[([^\]]+)\]")
 FENCE_RE = re.compile(r"^(?P<indent>[ \t]{0,3})(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+# Индикатор блочного скаляра YAML (`>-`, `|`, `>2+`): шапка разбирается
+# построчно, и продолжение такого значения терялось молча (ревью 11.10.2026).
+BLOCK_SCALAR_RE = re.compile(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?")
+# Заголовок списка в выдаче memorycontext.section_list (ревью 11.10.2026).
+SECTION_LIST_HEADER = "Записи раздела:"
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +435,26 @@ def index_field_errors(frontmatter: dict[str, str], label: str) -> list[str]:
     return errors
 
 
+def index_line_errors(base: dict[str, bytes], candidate: dict[str, bytes]) -> list[str]:
+    """Строка индекса, собранная из шапки изменённой записи, разбирается
+    обратно в ту же запись. Заголовок со скобкой ] давал строку, которую
+    разбор индекса не видит: запись выпадала из индекса, а отказ уверял, что
+    нет type, title, index (ревью 11.10.2026). Только общие корни: запись
+    заказчика доставляет список раздела, а не индекс."""
+    import memorycontext as mc
+    old = _records(base)
+    errors: list[str] = []
+    for slug, text in sorted(_records(candidate).items()):
+        if old.get(slug) == text:
+            continue
+        fields, error = parse_frontmatter(text)
+        line = None if error else mc.record_index_line(f"{slug}.md", fields)
+        if line and [e.slug for e in mc.parse_index(f"## {line[0]}\n{line[1]}\n")] != [f"{slug}.md"]:
+            errors.append(f"memory/{slug}.md: строка индекса из title не разбирается, запись "
+                          "в индекс не попадёт; убери из title квадратную скобку ]")
+    return errors
+
+
 def shape_errors(candidate: dict[str, bytes]) -> list[str]:
     errors: list[str] = []
     for path, data in sorted(candidate.items()):
@@ -459,13 +491,65 @@ def touched_records(base: dict[str, bytes], candidate: dict[str, bytes]) -> dict
     return out
 
 
+def multiline_fields(text: str) -> list[str]:
+    """Поля шапки, чьё значение не уместилось в строку: блочный скаляр YAML
+    либо продолжение строкой с отступом. Разбор шапки построчный и такое
+    продолжение терял молча (ревью 11.10.2026). Вложенное под полем без
+    значения (metadata) и комментарии законны."""
+    if not text.startswith("---\n"):
+        return []
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return []
+    bad: list[str] = []
+    key, value = "", ""
+    for line in text[4:end].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith((" ", "\t")):
+            if key and (value or key != "metadata"):
+                bad.append(key)
+            continue
+        key, _, value = line.partition(":") if ":" in line else ("", "", "")
+        key, value = key.strip(), value.strip()
+        if key and BLOCK_SCALAR_RE.fullmatch(value.split(" #", 1)[0].rstrip()):
+            bad.append(key)
+    return list(dict.fromkeys(bad))
+
+
 def header_errors(base: dict[str, bytes], candidate: dict[str, bytes]) -> list[str]:
     errors: list[str] = []
     touched = touched_records(base, candidate)
+    old = _records(base)
     for slug, text in sorted(_records(candidate).items()):
         label = f"memory/{slug}.md"
+        if old.get(slug) == text:
+            continue
+        # BOM и CRLF прятали шапку целиком, и отказ называл пропавшими поля,
+        # которые есть (ревью 11.10.2026): причина словами, без ложных следствий.
+        # Только изменённые записи: старый файл не блокирует чужую подачу
+        # (ревью 11.10.2026).
+        if text.startswith("\ufeff") or "\r\n" in text:
+            errors.append(f"{label}: шапка не читается: файл "
+                          + ("начинается с метки BOM" if text.startswith("\ufeff")
+                             else "с переводами строк CRLF")
+                          + "; сохрани его в UTF-8 без BOM с переводами строк LF")
+            continue
         fields, error = parse_frontmatter(text)
-        if error or slug not in touched:
+        if error:
+            continue
+        for name in multiline_fields(text):
+            errors.append(f"{label}: значение поля {name} пишется одной строкой; "
+                          "продолжение на следующих строках разбор шапки теряет")
+        if slug not in touched:
+            # Правка одной шапки (ревью 11.10.2026): опечатка в имени нового
+            # поля (valid_untill) молча выключала бы срок. Храповик против
+            # основы: поля, что уже были в её шапке, правку не останавливают.
+            unknown = sorted(set(fields) - KNOWN_TOP_FIELDS - set(parse_frontmatter(old[slug])[0]))
+            if unknown:
+                errors.append(
+                    f"{label}: поля шапки без читателя: {', '.join(unknown)}; "
+                    "правка шапки добавляет только name, description, metadata и поля схемы")
             continue
         what = "новая запись" if touched[slug] == "new" else "переписанная запись"
         unknown = sorted(set(fields) - KNOWN_TOP_FIELDS)
@@ -584,6 +668,12 @@ def link_errors(candidate: dict[str, bytes], topics: Topics | None = None,
             if inside.startswith("topics/") and "/" not in inside[len("topics/"):]:
                 place = placement.get(inside[len("topics/"):])
                 if place is not None and place[1] and place[1] != root:
+                    if client_name(root) is not None:
+                        # Предупреждение по решению владельца, в архиве тоже:
+                        # старый указатель не блокирует постороннюю подачу
+                        # (ревью 11.10.2026).
+                        warnings.append(f"{path}: ссылка на сводку {clean} другого заказчика "
+                                        f"({place[1]}) это межклиентская утечка; убери её")
                     continue
             name = PurePosixPath(clean).name
             relocated = [p for p in candidate if PurePosixPath(p).name == name]
@@ -785,6 +875,14 @@ def delivered_link_present(delivered_text: str, slug: str) -> bool:
     на файл либо целая вики-ссылка. Голое вхождение имени в прозе не
     считается."""
     name = f"{slug}.md"
+    # Строку списка раздела строит сам роутер, кодом она не бывает. Ищем её
+    # построчно без strip_code: ограждение, незакрытое обрезкой прозы раздела
+    # выше, гасило бы ссылки всех следующих разделов (ревью 11.10.2026).
+    in_list = False
+    for line in delivered_text.splitlines():
+        if in_list and (line == f"- [[{slug}]]" or line.startswith(f"- [[{slug}]] ")):
+            return True
+        in_list = line == SECTION_LIST_HEADER or (in_list and line.startswith("- "))
     clean = strip_code(delivered_text)
     for target in MARKDOWN_LINK_RE.findall(clean):
         if Path(target).name == name:
@@ -817,6 +915,11 @@ def probe_errors(candidate: dict[str, bytes], *,
     spec, sections = None, ()
     if client is not None:
         spec = next((s for s in topics.specs.values() if s.owner == root), None)
+    if spec is not None and f"memory/topics/{spec.filename}" not in candidate:
+        # Сводки нет: доставку считать не из чего, а её отсутствие уже назвал
+        # rollup_placement_errors; иначе отказ тонул в FileNotFoundError
+        # (ревью 11.10.2026).
+        spec = None
     if spec is not None:
         сводка = candidate.get(f"memory/topics/{spec.filename}", b"")
         sections = mc.parse_sections(_decode(сводка) or "")
@@ -833,9 +936,10 @@ def probe_errors(candidate: dict[str, bytes], *,
             # глобальном свёртки нет (контракт отказывает); крючок молчит.
             # Клиентскую запись ищут через сводку, listed ей не указ.
             continue
-        if client is None and date_passed(fields, "valid_until", today):
-            # Истёкшую запись отбор тоже не выдаёт (граница _entry_expired):
-            # её крючок не находит ничего, и без этого пропуска первый же
+        if date_passed(fields, "valid_until", today):
+            # Истёкшую запись отбор тоже не выдаёт (граница _entry_expired),
+            # у заказчика её нет в списке раздела (ревью 12.10.2026): её
+            # крючок не находит ничего, и без этого пропуска первый же
             # истёкший valid_until отказывал бы каждой подаче в корень.
             continue
         label = f"memory/{slug}.md"
@@ -1145,12 +1249,14 @@ def stand_errors(old_root: Path | None, new_root: Path, questions: bytes,
 # ---------------------------------------------------------------------------
 # 9. Глобальный репозиторий это контракт целиком (цели 2, 3)
 
-def contract_errors(candidate: dict[str, bytes]) -> list[str]:
+def contract_errors(candidate: dict[str, bytes],
+                    base: dict[str, bytes] | None = None) -> list[str]:
     """Контракт из глобального дерева строится, непуст, помещается в потолок
     доставки и включает каждый файл дерева: свёрнутых записей, архива и
     сводок в глобальном нет. Иначе правило уехало бы на машину заказчика
     и не дошло бы до сессии."""
     import memorycontext as mc
+    old = _records(base or {})
     text = mc.build_index_from_snapshot(candidate)
     if text is None:
         return ["memory/MEMORY.md: у глобального репозитория нет преамбулы индекса"]
@@ -1175,6 +1281,22 @@ def contract_errors(candidate: dict[str, bytes]) -> list[str]:
         elif name not in listed:
             errors.append(f"{path}: не входит в контракт (свёрнута или без type, title, index); "
                           "глобальный репозиторий это контракт целиком")
+        else:
+            text = _decode(candidate[path]) or ""
+            # Старое длинное поле не блокирует постороннюю подачу; проверяем
+            # весь текст изменённой записи, включая правку одной шапки
+            # (ревью 11.10.2026).
+            if old.get(name[:-3]) == text:
+                continue
+            # Разбор индекса режет title и index до предела строки, и потолок
+            # выше мерил уже обрезанное: конец правила терялся молча
+            # (ревью 11.10.2026).
+            fields = parse_frontmatter(text)[0]
+            for key in ("title", "index"):
+                value = fields.get(key, "")
+                if mc._clean_inline(value) != mc._clean_inline(value, 10**6):
+                    errors.append(f"{path}: {key} длиннее строки контракта, его конец до "
+                                  "сессии не доедет; сократи его или раздели правило на два")
     return errors
 
 
@@ -1216,7 +1338,8 @@ def lay_out(tree: dict[str, bytes], where: Path) -> Path:
         target = where / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-    (where / "memory").mkdir(exist_ok=True)
+    # Пустое дерево (манифест удаляет всё) выкладывается тоже (ревью 11.10.2026).
+    (where / "memory").mkdir(parents=True, exist_ok=True)
     return where
 
 
@@ -1234,7 +1357,16 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
     errors += secret_errors(base, candidate,
                             scanner if scanner is not None else svodgit.find_gitleaks())
     errors += shape_errors(candidate)
+    # Остальные проверки могут процитировать секрет или упасть до очистки
+    # отчёта. Не считаем их до подачи без секрета (ревью 11.10.2026).
+    found = [redact_secrets(e) for e in errors if "на секрет" in e or "possible secret" in e]
+    if found:
+        return Report(ok=False, errors=sorted(set(found)) + [
+            "прочие нарушения назовёт подача без секрета: их слова могли бы его повторить"],
+            warnings=[])
     errors += header_errors(base, candidate)
+    if client_name(root) is None:
+        errors += index_line_errors(base, candidate)
     errors += probe_required_errors(candidate, root)
     link_bad, link_warn = link_errors(candidate, topics, root)
     errors += link_bad
@@ -1247,7 +1379,10 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
     errors += section_field_errors(base, candidate, topics, root)
     with tempfile.TemporaryDirectory(prefix="svod-check-") as tmp:
         new_root = lay_out(candidate, Path(tmp) / "new")
-        old_root = lay_out(base, Path(tmp) / "old") if base else None
+        # Основа без преамбулы индекса (её случайно удалили, подача
+        # восстанавливает) стенда не имеет: сравнение идёт с самим кандидатом,
+        # абсолютные проверки стенда остаются (ревью 11.10.2026).
+        old_root = lay_out(base, Path(tmp) / "old") if "memory/MEMORY.md" in base else None
         # Индекс кандидата строится один раз на подачу: его читают и
         # крючки, и предупреждение о доставке.
         entries = (mc.parse_index(router_index_text(candidate))
@@ -1264,7 +1399,7 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
             errors += stand_errors(old_root, new_root, config.questions, today, warnings,
                                    changed_records(base, candidate), topics.second_place)
     if root == "global":
-        errors += contract_errors(candidate)
+        errors += contract_errors(candidate, base)
         warnings += client_name_warnings(candidate, topics, svodgit.federation_members(config.topics))
-    return Report(ok=not errors, errors=sorted(set(errors)),
-                  warnings=sorted(set(warnings)))
+    return Report(ok=not errors, errors=sorted({redact_secrets(e) for e in errors}),
+                  warnings=sorted({redact_secrets(w) for w in warnings}))

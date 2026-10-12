@@ -67,8 +67,20 @@ def command(args, root: Path) -> int:
     if not ev.BASELINE_PATH.is_file():
         print("memory-eval: исходная точка не снята, запусти baseline", file=sys.stderr)
         return 2
-    базис = json.loads(ev.BASELINE_PATH.read_text(encoding="utf-8"))
-    сравнение = ev.compare(базис, результат)
+    # Повреждённая точка не должна выглядеть регрессией (ревью 12.10.2026).
+    try:
+        базис = json.loads(ev.BASELINE_PATH.read_text(encoding="utf-8"))
+        if (not isinstance(базис, dict)
+                or any(not isinstance(базис.get(k), dict) for k in ("versions", "questions", "negatives"))
+                or any(not isinstance(базис["versions"].get(k), str)
+                       for k in ("questions_sha256", "measurement_sha256"))
+                or any(not isinstance(r, dict) or not isinstance(r.get(field), bool)
+                       for kind, field in (("questions", "found"), ("negatives", "fired"))
+                       for r in базис[kind].values())):
+            raise ValueError("неверная форма versions, questions или negatives")
+        сравнение = ev.compare(базис, результат)
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise mc.MemoryctlError(f"{ev.BASELINE_PATH}: неверная исходная точка: {exc}") from exc
     print(json.dumps({"сводка": сводка, "сравнение": сравнение}, ensure_ascii=False, indent=1))
     return 0 if сравнение["ok"] else 1
 

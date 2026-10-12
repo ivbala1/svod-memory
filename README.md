@@ -200,13 +200,15 @@ the lock, the commit, or any trace in the state directory.
 list and optional `base_revision` from the actual read. Each change has
 `operation` (`put` or `remove`) and a unique `path` under `memory/`;
 `put` carries either string `content` or `file`, a path to a local file
-holding that text. A call affects one repository.
+holding that text. Removing an already absent path is a no-op. A call
+affects one repository.
 
 The writer checks the exact staged tree and outgoing commit range.
 `saved` (exit 0) means the server accepted the commit. `pending` (4)
 preserves a local candidate for retry, `failed` (2) preserves the refusal
-with its reason (without the body when it looks like a secret), and
-`busy` (3) means the lock remained occupied.
+with its reason (without the body, and naming only the scanner findings,
+when it looks like a secret), and `busy` (3) means the lock remained
+occupied; a secret found before the lock fails at once instead.
 Other startup errors are reported separately.
 
 ## Synchronization and recovery

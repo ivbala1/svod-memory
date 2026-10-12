@@ -185,12 +185,18 @@ def prune_router_cache(state: Path | None = None, days: int = ROUTER_CACHE_DAYS)
 
 AUTO_CLOSE_LIMIT = 10
 AUTO_CLOSE_ID = "auto-close-"
-# Свёртка автомата первой строкой шапки; по ней же возврат узнаёт его свёртку.
-AUTO_FOLD = "---\nlisted: false\n"
 AUTO_REOPEN_ID = "auto-reopen-"
 # Коммиты автомата: их правка не считается правкой человека.
 AUTO_SUBJECTS = tuple(memoryremember.COMMIT_PREFIX + вид for вид in (AUTO_CLOSE_ID, AUTO_REOPEN_ID))
 MAINTENANCE_MODES = ("on", "observe", "off")
+
+
+def _fold_text(text: str) -> str:
+    """Отделить свёртку от встречной правки первого срока (ревью 12.10.2026)."""
+    строки = text.splitlines(keepends=True)
+    место = 3 if строки[1].startswith("valid_until:") else 1
+    строки.insert(место, "listed: false\n")
+    return "".join(строки)
 
 
 def maintenance_from_config(topics_raw: bytes) -> dict:
@@ -265,7 +271,7 @@ def _fold_origin(root: Path, path: str) -> str:
 def reopen_candidates(root: Path, tree: dict[str, bytes], today: dt.date) -> dict[str, str]:
     """Свёрнутое автоматом, чей срок продлили или сняли на другой машине
     (rebase сливает правки без конфликта в любом порядке): одна строка listed
-    первой в шапке, как её ставит автомат, срок в будущем или снят, и поле
+    в шапке, как её ставит автомат, срок в будущем или снят, и поле
     последним менял коммит свёртки (_fold_origin). slug -> текст без listed."""
     итог = {}
     for slug, text in sorted(mv._records(tree).items()):
@@ -276,9 +282,12 @@ def reopen_candidates(root: Path, tree: dict[str, bytes], today: dt.date) -> dic
                 continue
         except ValueError:
             continue  # битую дату называет проверка формы
-        без = "---\n" + text.removeprefix(AUTO_FOLD)
-        # Подпись автомата дёшево отсекает ручные свёртки: историю читаем мало.
-        if (text.startswith(AUTO_FOLD) and "listed" not in mv.parse_frontmatter(без)[0]
+        # Положение поля меняется при первом valid_until; тело не трогаем
+        # и двойную ручную свёртку не возвращаем (ревью 12.10.2026).
+        конец = text.find("\n---", 4)
+        шапка = text[:конец].replace("\nlisted: false", "", 1)
+        без = шапка + text[конец:]
+        if (конец >= 0 and без != text and "listed" not in mv.parse_frontmatter(без)[0]
                 and _fold_origin(root, f"memory/{slug}.md").startswith(AUTO_SUBJECTS[0])):
             итог[slug] = без
     return итог
@@ -353,10 +362,10 @@ def close_expired(root: Path, config, *, current: bool = True, data_root: Path |
         if слаги and режим == "observe":
             итог["done"].append("свернул бы по сроку: " + ", ".join(слаги))
         elif слаги:
-            # Строка первая, а не у срока: встречная правка срока дала бы
-            # конфликт rebase и расходящуюся main; слияние чинит возврат.
+            # Между listed и сроком остаётся строка для слияния, в том числе
+            # при первом valid_until (ревью 12.10.2026).
             _auto_submit(итог, AUTO_CLOSE_ID, ("свёрнуто по сроку", "свёртка по сроку"),
-                         {s: AUTO_FOLD + tree[f"memory/{s}.md"].decode("utf-8")[4:]
+                         {s: _fold_text(tree[f"memory/{s}.md"].decode("utf-8"))
                           for s in слаги}, head=head, **писатель)
     except Exception as exc:  # noqa: BLE001 - шаг не роняет таймер, слова в итог
         итог["problems"].append(f"автомат закрытого: {type(exc).__name__}: {exc}")
@@ -587,6 +596,12 @@ def repo_health(scope: str, root: Path, config,
     spec = next((s for s in topics.specs.values() if s.owner == scope), None)
     data = tree.get(f"memory/topics/{spec.filename}") if spec is not None else None
     if data is None:
+        if spec is not None:
+            # Клон области есть, а сводки в HEAD нет: роутер отказывает
+            # каждой закреплённой за темой сессии. Прежде это ловил только
+            # тест на живом корпусе (ревью 12.10.2026).
+            findings.append(f"сводка: memory/topics/{spec.filename} нет в HEAD, "
+                            "закреплённая за темой сессия не получит памяти")
         return findings, notes
     for section in mc.parse_sections(data.decode("utf-8", "replace")):
         cap = mc.section_cap(section)

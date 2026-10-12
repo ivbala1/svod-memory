@@ -1371,17 +1371,51 @@ class CodexRoundTests(Base):
         root = self.fed.root("a", "clients/acme")
         lock_file = root / ".git" / svodgit.LOCK_NAME
         lock_file.touch()
-        lock_file.chmod(0)
+        # Только чтение: разделяемый замок берётся и так; неоткрываемый файл
+        # это «не взят», его проверка рядом (ревью 11.10.2026).
+        lock_file.chmod(0o400)
         try:
             with svodgit.lock(root, exclusive=False) as taken:
-                self.assertIsNone(taken, "замка нет, это не занятость")
+                self.assertIs(taken, True, "свободный замок взят на чтение")
             with memoryctl.reader_locks([self.fed.root("a"), root]) as all_taken:
-                self.assertTrue(all_taken, "чтение без замка там, где замка нет, согласовано")
+                self.assertTrue(all_taken, "замок на чтение читателю не помеха")
             with self.assertRaises(svodgit.GitError):
                 with svodgit.lock(root, exclusive=True):
                     pass
         finally:
             lock_file.chmod(0o600)
+
+    def test_read_only_lock_file_held_by_writer_is_not_taken(self):
+        """Файл замка есть, но O_RDWR запрещён: читатель считал замка нет и
+        читал под писателем (ревью 11.10.2026). Разделяемый замок берётся и
+        на файле только для чтения, а неоткрываемый файл это «не взят»."""
+        import fcntl
+        root = self.fed.root("a", "clients/acme")
+        lock_file = root / ".git" / svodgit.LOCK_NAME
+        lock_file.touch()
+        lock_file.chmod(0o400)
+        try:
+            with svodgit.lock(root, exclusive=False) as taken:
+                self.assertIs(taken, True, "свободный замок берётся и только на чтение")
+            fd = os.open(lock_file, os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                with svodgit.lock(root, exclusive=False, wait=0.3) as taken:
+                    self.assertIs(taken, False, "писатель держит замок")
+            finally:
+                os.close(fd)
+            lock_file.chmod(0)
+            with svodgit.lock(root, exclusive=False, wait=0.3) as taken:
+                self.assertIs(taken, False, "замок есть, но не открывается")
+            lock_file.chmod(0o600)
+            lock_file.unlink()
+            (root / ".git").chmod(0o500)
+            with svodgit.lock(root, exclusive=False) as taken:
+                self.assertIsNone(taken, "неписаный клон без файла замка: замка нет")
+        finally:
+            (root / ".git").chmod(0o700)
+            if lock_file.exists():
+                lock_file.chmod(0o600)
 
     def test_heal_aborts_only_the_engine_marked_rebase(self):
         root_b = self.fed.root("b")
@@ -2747,3 +2781,206 @@ class StandFingerprintTests(Base):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("federationMembers", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+
+class OctoberTwelveWriterTests(Base):
+    """Ревью 11.10.2026: удаление уже удалённого, чужое в индексе, секрет
+    при занятом замке и в причине отказа, доставка после rebase со слиянием."""
+
+    TOKEN = "ghp_" + "a" * 30  # синтетический, не настоящий (ревью 11.10.2026)
+    REMOVE = json.dumps({"changes": [{"operation": "remove",
+                                      "path": "memory/reference_kettle.md"}]}).encode("utf-8")
+
+    def test_removing_already_removed_path_is_saved_not_stuck(self):
+        self.fed.remember("a", "personal", "kettle-1", NEW_BODY, {"record_slug": "reference_kettle"})
+        self.fed.sync("b")
+        base_b = svodgit.head(self.fed.root("b"))
+        code, result = self.fed.remember("a", "personal", "rm-a", self.REMOVE,
+                                         content_type="manifest",
+                                         base=svodgit.head(self.fed.root("a")))
+        self.assertEqual(result["state"], "saved", result)
+        code, result = self.fed.remember("b", "personal", "rm-b", self.REMOVE,
+                                         content_type="manifest", base=base_b)
+        self.assertEqual((code, result["state"]), (mr.EXIT_SAVED, "saved"), result)
+        self.assertEqual(self.pending("b"), [])
+        self.assertEqual(svodgit.dirty_paths(self.fed.root("b")), set())
+
+    def test_mixed_manifest_with_absent_remove_is_saved(self):
+        manifest = json.dumps({"changes": [
+            {"operation": "put", "path": "memory/reference_kettle.md", "content": NEW_BODY.decode()},
+            {"operation": "remove", "path": "memory/reference_gone.md"}]}).encode("utf-8")
+        code, result = self.fed.remember("a", "personal", "mix-1", manifest, content_type="manifest")
+        self.assertEqual((code, result["state"]), (mr.EXIT_SAVED, "saved"), result)
+        self.assertIn("memory/reference_kettle.md", self.fed.origin_tree())
+        self.assertEqual(svodgit.dirty_paths(self.fed.root("a")), set())
+
+    def test_git_failure_before_commit_leaves_tree_clean(self):
+        root = self.fed.root("a")
+        with mock.patch.object(svodgit, "write_tree", side_effect=svodgit.GitError("сбой")):
+            code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
+                                             {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_ERROR, result)
+        self.assertEqual(svodgit.dirty_paths(root), set())
+        self.assertEqual(len(self.pending("a")), 1)
+        self.assertEqual([c["state"] for c in self.fed.sync("a")["candidates"]], ["saved"])
+
+    def test_path_staged_by_hand_during_fetch_does_not_ride_along(self):
+        root = self.fed.root("a")
+        fetch = svodgit.fetch
+
+        def racing_fetch(where, *args, **kwargs):
+            if Path(where).resolve() == root.resolve():
+                (root / "README.md").write_bytes(b"manual\n")
+                sh(root, "add", "--", "README.md")
+            return fetch(where, *args, **kwargs)
+
+        with mock.patch.object(svodgit, "fetch", racing_fetch):
+            code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
+                                             {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        self.assertIn("правят руками", result["reason"])
+        self.assertIn("README.md", result["reason"])
+        self.assertNotIn("memory/reference_kettle.md", self.fed.origin_tree())
+        self.assertEqual(svodgit.dirty_paths(root), {"README.md"})
+        self.assertEqual(sh(root, "diff", "--cached", "--name-only"), "README.md")
+
+    def test_secret_found_before_busy_lock_leaves_no_body(self):
+        root = self.fed.root("a")
+        old = svodgit.EXCLUSIVE_WAIT_SEC
+        svodgit.EXCLUSIVE_WAIT_SEC = 0.3
+        self.addCleanup(setattr, svodgit, "EXCLUSIVE_WAIT_SEC", old)
+        body = fresh_record("reference_kettle", "как кипятить воду в чайнике",
+                            "кипятить воду чайник", f"Токен {self.TOKEN}.\n")
+        with svodgit.lock(root, exclusive=True), mock.patch.object(
+                mr, "precheck", side_effect=RuntimeError("сбой проверки")), mock.patch.object(
+                svodgit, "lock", side_effect=svodgit.Busy("замок занят")) as lock:
+            code, result = self.fed.remember("a", "personal", "sec-1", body,
+                                             {"record_slug": "reference_kettle"})
+        lock.assert_not_called()
+        self.assertEqual((code, result["state"]), (mr.EXIT_FAILED, "failed"), result)
+        self.assertEqual(self.pending("a"), [])
+        stored = self.failed("a")[0].read_text()
+        self.assertIsNone(json.loads(stored)["body"])
+        self.assertNotIn(self.TOKEN, stored)
+
+    def test_secret_in_manifest_file_is_not_saved_in_pending(self):
+        source = self.fed.base / "input.md"
+        source.write_bytes(NEW_BODY + f"Токен {self.TOKEN}.\n".encode())
+        manifest = json.dumps({"changes": [{"operation": "put",
+            "path": "memory/reference_kettle.md", "file": str(source)}]}).encode()
+        with mock.patch.object(svodgit, "create_file", wraps=svodgit.create_file) as create:
+            code, result = self.fed.remember("a", "personal", "sec-file", manifest,
+                                             content_type="manifest")
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        create.assert_not_called()
+        self.assertEqual(self.pending("a"), [])
+        self.assertNotIn(self.TOKEN, self.failed("a")[0].read_text())
+
+    def test_external_scanner_secret_does_not_wait_for_lock(self):
+        self.fed.set_scanner(9)
+        with mock.patch.object(svodgit, "lock", side_effect=svodgit.Busy("замок занят")) as lock:
+            code, result = self.fed.remember("a", "personal", "sec-scan", NEW_BODY,
+                                             {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        lock.assert_not_called()
+        self.assertEqual(self.pending("a"), [])
+        self.assertIsNone(json.loads(self.failed("a")[0].read_text())["body"])
+
+    def test_path_staged_at_write_tree_does_not_ride_along(self):
+        root = self.fed.root("a")
+        write_tree = svodgit.write_tree
+
+        def racing_write_tree(where):
+            (root / "README.md").write_bytes(b"manual\n")
+            sh(root, "add", "--", "README.md")
+            return write_tree(where)
+
+        with mock.patch.object(svodgit, "write_tree", racing_write_tree):
+            code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
+                                             {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        self.assertIn("README.md", result["reason"])
+        self.assertEqual(sh(root, "diff", "--cached", "--name-only"), "README.md")
+        self.assertNotIn("memory/reference_kettle.md", self.fed.origin_tree())
+
+    def test_secret_in_header_field_stays_out_of_failure_reason(self):
+        body = record("reference_kettle", type="reference", title="Как кипятить воду в чайнике",
+                      index="как кипятить воду в чайнике", source="разговор",
+                      observed_at=self.TOKEN, probe="кипятить воду чайник", body="Чайник.\n")
+        code, result = self.fed.remember("a", "personal", "sec-2", body,
+                                         {"record_slug": "reference_kettle"})
+        self.assertEqual(code, mr.EXIT_FAILED, result)
+        self.assertNotIn(self.TOKEN, result["reason"])
+        stored = json.loads(Path(result["file"]).read_text())
+        self.assertIsNone(stored["body"])
+        self.assertNotIn(self.TOKEN, stored["reason"])
+
+    def test_offline_commit_merged_by_timer_rebase_is_delivered(self):
+        self._merged_rebase_is_delivered(11, 0)
+
+    def test_nearby_edits_merged_by_timer_rebase_are_delivered(self):
+        self._merged_rebase_is_delivered(6, 4)
+
+    def _merged_rebase_is_delivered(self, a_index, b_index):
+        lines = [f"Строка {i} про зелёный принтер.\n" for i in range(12)]
+        projection = {"record_slug": "reference_printer"}
+
+        def body(rows):
+            return fresh_record("reference_printer", "как чинить зелёный принтер",
+                                "чем чинить принтер", "".join(rows))
+
+        root_a = self.fed.root("a")
+        self.fed.remember("a", "personal", "pr-0", body(lines), projection,
+                          base=svodgit.head(root_a))
+        self.fed.sync("b")
+        sh(root_a, "remote", "set-url", "origin", str(self.fed.base / "nowhere.git"))
+        rows_a = list(lines)
+        rows_a[a_index] = f"Строка {a_index}: машина А добавила молоток.\n"
+        code, result = self.fed.remember("a", "personal", "pr-a", body(rows_a), projection,
+                                         base=svodgit.head(root_a))
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        rows_b = list(lines)
+        rows_b[b_index] = f"Строка {b_index}: машина Б сменила картридж.\n"
+        code, result = self.fed.remember("b", "personal", "pr-b", body(rows_b), projection,
+                                         base=svodgit.head(self.fed.root("b")))
+        self.assertEqual(result["state"], "saved", result)
+        sh(root_a, "remote", "set-url", "origin", str(self.fed.origins / "personal.git"))
+        outcome = self.fed.sync("a")
+        self.assertEqual(outcome["candidates"], [{"id": "pr-a", "state": "delivered"}], outcome)
+        self.assertEqual(self.failed("a"), [])
+        server = self.fed.origin_tree()["memory/reference_printer.md"].decode("utf-8")
+        self.assertIn("машина А", server)
+        self.assertIn("машина Б", server)
+
+    def test_same_id_rewritten_offline_is_not_taken_for_delivered(self):
+        root = self.fed.root("a")
+        projection = {"record_slug": "reference_kettle"}
+        self.fed.remember("a", "personal", "kettle-1", NEW_BODY, projection)
+        sh(root, "remote", "set-url", "origin", str(self.fed.base / "nowhere.git"))
+        other = fresh_record("reference_kettle", "как кипятить воду в чайнике",
+                             "кипятить воду чайник", "Чайник кипятит воду быстро.\n")
+        code, result = self.fed.remember("a", "personal", "kettle-1", other, projection,
+                                         base=svodgit.head(root))
+        self.assertEqual(code, mr.EXIT_PENDING, result)
+        candidate = json.loads(self.pending("a")[0].read_text())
+        self.assertFalse(mr.reached(root, candidate, svodgit.remote_head(root)))
+
+    def test_same_id_author_and_time_do_not_prove_other_patch_delivered(self):
+        root_a = self.fed.root("a")
+        projection = {"record_slug": "reference_printer"}
+        with mock.patch.dict(os.environ, {"GIT_AUTHOR_DATE": "2026-09-04T10:00:00Z"}):
+            sh(root_a, "remote", "set-url", "origin", str(self.fed.base / "nowhere.git"))
+            body_a = fresh_record("reference_printer", "как чинить зелёный принтер",
+                                  "чем чинить принтер", "Зелёный принтер чинится отвёрткой.\n")
+            code, result = self.fed.remember("a", "personal", "pr-same", body_a, projection,
+                                             base=svodgit.head(root_a))
+            self.assertEqual(code, mr.EXIT_PENDING, result)
+            body_b = body_a.replace("отвёрткой".encode(), "молотком и клеем".encode())
+            code, result = self.fed.remember("b", "personal", "pr-same", body_b, projection,
+                                             base=svodgit.head(self.fed.root("b")))
+            self.assertEqual(code, mr.EXIT_SAVED, result)
+        sh(root_a, "remote", "set-url", "origin", str(self.fed.origins / "personal.git"))
+        sh(root_a, "fetch", "--quiet", "origin")
+        candidate = json.loads(self.pending("a")[0].read_text())
+        self.assertFalse(mr.reached(root_a, candidate, svodgit.remote_head(root_a)))
+        self.assertTrue(mr.reached(root_a, candidate, svodgit.head(root_a)))

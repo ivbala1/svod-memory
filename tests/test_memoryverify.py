@@ -359,6 +359,29 @@ class ProbeTests(unittest.TestCase):
         report = check(cand, base, root="clients/acme")
         self.assertTrue(any("не содержит ссылки" in e for e in report.errors), report.errors)
 
+    def test_expired_client_record_probe_is_silent(self):
+        """Истёкшей клиентской записи нет в списке раздела, её крючок молчит,
+        как у личной: иначе срок отказывал бы каждой подаче (ревью 12.10.2026)."""
+        rollup = "# Acme\n\n## Обзор\n\nУстройство.\n\n## Доступы\n\nSSH через бастион.\n"
+        base = {"memory/topics/acme.md": rollup.encode("utf-8")}
+        cand = dict(base)
+        cand["memory/reference_acme_bastion.md"] = record(
+            "reference_acme_bastion", source="разговор", observed_at="2026-09-04",
+            section="доступы", probe="как попасть по ssh на серверы", valid_until="2020-01-01",
+            body="Бастион.\n")
+        import memorycontext
+        self.assertEqual({}, memorycontext.section_records(self._laid_out(cand)))
+        report = check(cand, base, root="clients/acme")
+        self.assertFalse(any("не содержит ссылки" in e for e in report.errors), report.errors)
+
+    def _laid_out(self, tree: dict[str, bytes]) -> Path:
+        каталог = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, каталог)
+        for путь, байты in tree.items():
+            (каталог / путь).parent.mkdir(parents=True, exist_ok=True)
+            (каталог / путь).write_bytes(байты)
+        return каталог
+
     def test_client_probe_also_through_the_session_continuation(self):
         """Полная выдача доносит шестую строку списка, продолжение сессии с
         бюджетом 4 200 срезает её: крючок обязан дойти в обоих режимах."""
@@ -809,3 +832,284 @@ class FoldedReachTests(unittest.TestCase):
         report = check(cand, base, root="clients/acme")
         self.assertTrue(any("reference_gate.md" in e and "недостижим" in e
                             for e in report.errors), report.errors)
+
+
+class OctoberTwelveReviewTests(unittest.TestCase):
+    """Ревью 11.10.2026: шапка, ссылки, доставка и стенд называют причину
+    отказа словами, не падают исключением и не повторяют секрет."""
+
+    TOKEN = "ghp_" + "a" * 30  # синтетический, не настоящий (ревью 11.10.2026)
+    ACME = "# Acme\n\n## Обзор\n\nУстройство системы.\n\n## Доступы\n\nSSH идёт через бастион.\n"
+
+    def client_record(self, slug="reference_acme_bastion", body="Бастион.\n", **extra):
+        поля = dict(source="разговор", observed_at="2026-09-04", section="Доступы",
+                    probe="как попасть по ssh на серверы")
+        поля.update(extra)
+        return record(slug, body=body, **поля)
+
+    def test_header_only_edit_with_field_typo_is_refused(self):
+        base = base_tree()
+        old = base["memory/reference_printer.md"].decode("utf-8")
+        for поле in ("valid_untill", "vaild_until", "review-after"):
+            cand = dict(base)
+            cand["memory/reference_printer.md"] = old.replace(
+                "probe:", f"{поле}: 2026-09-04\nprobe:", 1).encode("utf-8")
+            errors = mv.header_errors(base, cand)
+            self.assertTrue(any(поле in e and "без читателя" in e for e in errors), errors)
+        # Прежнее поле правку одной шапки не останавливает (ревью 11.10.2026).
+        base["memory/reference_printer.md"] = old.replace(
+            "probe:", "legacy: x\nprobe:", 1).encode("utf-8")
+        cand = dict(base)
+        cand["memory/reference_printer.md"] = base["memory/reference_printer.md"].replace(
+            b"probe:", b"valid_until: 2026-09-04\nprobe:", 1)
+        self.assertEqual(mv.header_errors(base, cand), [])
+
+    def test_title_with_bracket_is_named_in_common_roots_only(self):
+        # Скобки в title индекс разбирает (ревью 11.10.2026, S20); отказ только
+        # там, где строка индекса всё же не разбирается: title со ссылкой внутри.
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/reference_nas.md"] = record(
+            "reference_nas", type="reference", title="Доступ к хранилищу [NAS] дома",
+            index="адрес и порт файлового хранилища", probe="как зайти на домашнее хранилище",
+            source="разговор", observed_at="2026-09-01", body="Хранилище по адресу.\n")
+        report = check(cand, base)
+        self.assertFalse(any("скобку ]" in e for e in report.errors), report.errors)
+        cand["memory/reference_nas.md"] = record(
+            "reference_nas", type="reference", title="Хранилище](other.md) дома",
+            index="адрес и порт файлового хранилища", probe="как зайти на домашнее хранилище",
+            source="разговор", observed_at="2026-09-01", body="Хранилище по адресу.\n")
+        report = check(cand, base)
+        self.assertTrue(any("reference_nas.md" in e and "скобку ]" in e
+                            for e in report.errors), report.errors)
+        правило = {"memory/MEMORY.md": "# Индекс\n\n## Feedback\n".encode("utf-8"),
+                   "memory/feedback_a.md": record("feedback_a", type="feedback",
+                                                  title="Правило](other.md) [важно]", index="правило")}
+        with Scanner(0) as scanner:
+            report = mv.check(правило, {}, root="global", today=TODAY, scanner=scanner,
+                              config=mv.Config(topics=json.dumps(dict(
+                                  TOPICS, federationMembers=["acme"])).encode()))
+        self.assertTrue(any("скобку ]" in e for e in report.errors), report.errors)
+        правило["memory/feedback_a.md"] = правило["memory/feedback_a.md"].replace(
+            "Правило](other.md) [важно]".encode("utf-8"), "Правило важно".encode("utf-8"))
+        self.assertEqual(mv.contract_errors(правило), [])
+        base = {"memory/topics/acme.md": self.ACME.encode("utf-8")}
+        cand = dict(base)
+        cand["memory/reference_acme_bastion.md"] = self.client_record(
+            type="reference", title="Бастион [SSH]", index="вход по ssh")
+        report = check(cand, base, root="clients/acme")
+        self.assertFalse(any("скобку" in e for e in report.errors), report.errors)
+
+    def test_multiline_header_value_is_refused(self):
+        base = base_tree()
+        text = ("---\ntype: reference\ntitle: Роутер на даче\nindex: >-\n  микротик, wifi,\n"
+                "  провайдер ростелеком\nprobe: как перезагрузить роутер на даче\n"
+                "source: разговор\nobserved_at: 2026-09-01\n---\n\n# Роутер\n\nВ шкафу.\n")
+        cand = dict(base, **{"memory/reference_router.md": text.encode("utf-8")})
+        errors = mv.header_errors(base, cand)
+        self.assertTrue(any("reference_router.md" in e and "поля index" in e for e in errors), errors)
+        continued = text.replace("index: >-\n  микротик, wifi,", "index: микротик, wifi,")
+        cand["memory/reference_router.md"] = continued.encode("utf-8")
+        self.assertTrue(any("поля index" in e for e in mv.header_errors(base, cand)))
+        nested = text.replace("index: >-\n  микротик, wifi,\n  провайдер ростелеком\n",
+                              "index: микротик, wifi\nmetadata:\n  # заметка\n  author: x\n")
+        cand["memory/reference_router.md"] = nested.encode("utf-8")
+        self.assertEqual(mv.header_errors(base, cand), [])
+        # Правка одной шапки тоже не сохраняет теряемое значение (ревью 11.10.2026).
+        base["memory/reference_router.md"] = text.encode("utf-8")
+        cand["memory/reference_router.md"] = text.replace(
+            "probe:", "listed: false\nprobe:", 1).encode("utf-8")
+        self.assertTrue(any("поля index" in e for e in mv.header_errors(base, cand)))
+
+    def test_empty_or_commented_multiline_value_is_refused(self):
+        base = base_tree()
+        old = base["memory/reference_printer.md"].decode()
+        for value in ("", ">- # продолжение", "|2+ # продолжение"):
+            with self.subTest(value=value):
+                text = old.replace("index: как чинить зелёный принтер",
+                                   f"index: {value}\n  как чинить зелёный принтер")
+                cand = dict(base, **{"memory/reference_printer.md": text.encode()})
+                self.assertTrue(any("поля index" in e for e in mv.header_errors(base, cand)))
+
+    def test_fence_clipped_in_earlier_section_does_not_hide_record_list(self):
+        обзор = ("## Обзор\n\nУстройство системы.\n\n```\n"
+                 + "\n".join(f"команда номер {i:04d} для устройства" for i in range(120))
+                 + "\n```\n\nХвост.\n")
+        base = {"memory/topics/acme.md": ("# Acme\n\n" + обзор
+                                          + "\n## Доступы\n\nSSH идёт через бастион.\n").encode("utf-8")}
+        cand = dict(base)
+        cand["memory/reference_acme_bastion.md"] = self.client_record(
+            probe="обзор устройства и доступ по ssh")
+        report = check(cand, base, root="clients/acme")
+        self.assertTrue(report.ok, report.errors)
+        self.assertFalse(mv.delivered_link_present(
+            "Записи раздела:\n- [[reference_acme_basti", "reference_acme_bastion"))
+        self.assertFalse(mv.delivered_link_present(
+            "Проза\n```\n- [[reference_acme_bastion]]\n```\n", "reference_acme_bastion"))
+
+    def test_missing_client_rollup_refuses_in_words(self):
+        base = {"memory/topics/acme.md": self.ACME.encode("utf-8"),
+                "memory/reference_acme_bastion.md": self.client_record()}
+        cand = dict(base)
+        del cand["memory/topics/acme.md"]
+        report = check(cand, base, root="clients/acme")
+        self.assertTrue(any("каноническая сводка" in e for e in report.errors), report.errors)
+
+    def test_empty_client_tree_refuses_in_words(self):
+        base = {"memory/topics/acme.md": self.ACME.encode("utf-8"),
+                "memory/reference_acme_bastion.md": self.client_record()}
+        report = check({}, base, root="clients/acme")
+        self.assertTrue(any("каноническая сводка" in e for e in report.errors), report.errors)
+
+    def test_base_without_index_can_be_repaired(self):
+        base = base_tree()
+        del base["memory/MEMORY.md"]
+        report = check(base_tree(), base)
+        self.assertTrue(report.ok, report.errors)
+
+    def test_bom_and_crlf_are_named_instead_of_missing_fields(self):
+        base = base_tree()
+        good = record("reference_router", type="reference", title="Роутер на даче",
+                      index="микротик, wifi", probe="как перезагрузить роутер на даче",
+                      source="разговор", observed_at="2026-09-01", body="В шкафу.\n").decode("utf-8")
+        for name, text in (("CRLF", good.replace("\n", "\r\n")), ("BOM", "\ufeff" + good)):
+            with self.subTest(name=name):
+                cand = dict(base, **{"memory/reference_router.md": text.encode("utf-8")})
+                report = check(cand, base)
+                errors = report.errors
+                self.assertFalse(report.ok)
+                # Единственная причина, без дубля проверки всего дерева
+                # (ревью 11.10.2026).
+                self.assertEqual(len([e for e in errors if name in e]), 1, errors)
+                self.assertFalse(any("обязана нести" in e for e in errors), errors)
+                self.assertFalse(any(name in e for e in mv.file_errors("reference_router.md", text)))
+
+    def test_legacy_bom_and_crlf_do_not_block_unrelated_record(self):
+        # Старые запись, архив, индекс и сводка не останавливают новую
+        # постороннюю запись (ревью 11.10.2026).
+        for path in ("memory/reference_printer.md", "memory/archive/reference_old.md",
+                     "memory/MEMORY.md", "memory/topics/home.md"):
+            for name in ("BOM", "CRLF"):
+                with self.subTest(path=path, name=name):
+                    base = base_tree()
+                    good = base.get(path, "# Архив\n\nСтарый факт.\n".encode("utf-8"))
+                    base[path] = (b"\xef\xbb\xbf" + good if name == "BOM"
+                                  else good.replace(b"\n", b"\r\n"))
+                    cand = dict(base)
+                    cand["memory/reference_router.md"] = record(
+                        "reference_router", type="reference", title="Роутер на даче",
+                        index="микротик, wifi", probe="как перезагрузить роутер на даче",
+                        source="разговор", observed_at="2026-09-01", body="В шкафу.\n")
+                    report = check(cand, base, questions=False)
+                    self.assertTrue(report.ok, report.errors)
+                    if path == "memory/reference_printer.md":
+                        cand[path] += "Ещё факт.\n".encode("utf-8")
+                        report = check(cand, base, questions=False)
+                        self.assertFalse(report.ok)
+                        self.assertEqual(len([e for e in report.errors
+                                              if path in e and name in e]), 1, report.errors)
+
+    def test_secret_refusal_does_not_quote_field_values(self):
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/reference_ci.md"] = record(
+            "reference_ci", type="reference", title="Сборка в CI", index="конвейер сборки",
+            probe=f"какой токен {self.TOKEN} у сборки", source="разговор",
+            observed_at="2026-09-01", valid_until=self.TOKEN, body="Сборка идёт ночью.\n")
+        report = check(cand, base)
+        reason = "; ".join(report.errors)
+        self.assertFalse(report.ok)
+        self.assertIn("на секрет", reason)
+        self.assertNotIn(self.TOKEN, reason)
+
+    def test_secret_refusal_does_not_quote_links_in_warnings(self):
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/reference_ci.md"] = record(
+            "reference_ci", type="reference", title="Сборка в CI", index="конвейер сборки",
+            probe="как работает сборка ci", source="разговор", observed_at="2026-09-01",
+            body=f"Сборка, подробности [[{self.TOKEN}]].\n")
+        report = check(cand, base)
+        self.assertFalse(report.ok)
+        self.assertNotIn(self.TOKEN, str(report))
+        self.assertEqual(report.warnings, [])
+
+    def test_markdown_link_to_other_client_rollup_stays_a_warning(self):
+        topics = dict(TOPICS, topics=dict(TOPICS["topics"], beta=dict(
+            TOPICS["topics"]["acme"], rollup="beta.md", owner="clients/beta", label="Beta",
+            tokens=["beta"], aliases=["beta"], cwdNames=["beta"])))
+        topics["topicOrder"] = TOPICS["topicOrder"] + ["beta"]
+        topics["archivedRollups"] = {"gone.md": "clients/gone"}
+        raw = json.dumps(topics, ensure_ascii=False).encode("utf-8")
+        loaded = mv.load_topics(raw)
+        # Предупреждение и для прежней ссылки, и для новой либо изменённой,
+        # в действующей записи и архиве (ревью 11.10.2026).
+        for path in ("memory/reference_old.md", "memory/archive/reference_old.md"):
+            for target in ("beta.md", "gone.md"):
+                with self.subTest(path=path, target=target):
+                    link = ("../" if "/archive/" in path else "") + "topics/" + target
+                    old = self.client_record(
+                        "reference_old", body=f"Свёрнуто в сводку [topics/{target}]({link}).\n")
+                    base = {"memory/topics/acme.md": self.ACME.encode("utf-8"), path: old}
+                    cand = dict(base)
+                    cand["memory/reference_acme_bastion.md"] = self.client_record()
+                    for state in ("legacy", "new", "changed"):
+                        before = dict(base)
+                        if state == "new":
+                            del before[path]
+                        cand[path] = old + ("Ещё факт.\n".encode("utf-8")
+                                            if state == "changed" else b"")
+                        with Scanner(0) as scanner:
+                            report = mv.check(cand, before, root="clients/acme", today=TODAY,
+                                              scanner=scanner, config=mv.Config(topics=raw))
+                        self.assertTrue(report.ok, (state, report.errors))
+                        self.assertTrue(any(path in w and target in w and "межклиентская" in w
+                                            for w in report.warnings), (state, report.warnings))
+                    self.assertEqual(mv.link_errors(cand, loaded, "personal"), ([], []))
+
+    def test_global_title_or_index_longer_than_contract_line_is_refused(self):
+        def tree(index):
+            return {"memory/MEMORY.md": "# Индекс\n\n## Feedback\n".encode("utf-8"),
+                    "memory/feedback_rule.md": record("feedback_rule", type="feedback",
+                                                      title="Правило", index=index)}
+        errors = mv.contract_errors(tree("принтер " * 45 + "не слать пароль"))
+        self.assertTrue(any("feedback_rule.md" in e and "index длиннее" in e for e in errors), errors)
+        self.assertEqual(mv.contract_errors(tree("принтер " * 30)), [])
+        cand = tree("правило")
+        cand["memory/feedback_rule.md"] = cand["memory/feedback_rule.md"].replace(
+            "title: Правило".encode(), ("title: " + "правило " * 45).encode())
+        self.assertTrue(any("title длиннее" in e for e in mv.contract_errors(cand)))
+
+    def test_legacy_long_contract_fields_do_not_block_unrelated_rule(self):
+        # Любая правка длинного правила, в том числе одной шапки, всё ещё
+        # отказывает; нетронутое правило подаче не мешает (ревью 11.10.2026).
+        config = mv.Config(topics=json.dumps(dict(TOPICS, federationMembers=["acme"])).encode())
+
+        def global_check(candidate, base):
+            with Scanner(0) as scanner:
+                return mv.check(candidate, base, root="global", config=config,
+                                today=TODAY, scanner=scanner)
+
+        for key in ("title", "index"):
+            with self.subTest(key=key):
+                fields = dict(type="feedback", title="Принтер", index="зелёный принтер",
+                              probe="как настроить зелёный принтер", source="разговор",
+                              observed_at="2026-09-01")
+                fields[key] = "принтер " * 45
+                path = "memory/feedback_printer.md"
+                base = {"memory/MEMORY.md": "# Индекс\n\n## Feedback\n".encode("utf-8"),
+                        path: record("feedback_printer", **fields)}
+                cand = dict(base)
+                cand["memory/feedback_router.md"] = record(
+                    "feedback_router", type="feedback", title="Роутер",
+                    index="дачный роутер", probe="как настроить роутер на даче",
+                    source="разговор", observed_at="2026-09-01")
+                report = global_check(cand, base)
+                self.assertTrue(report.ok, report.errors)
+                for body in ("Факт.\n", "Новый факт.\n"):
+                    cand[path] = record("feedback_printer", body=body,
+                                        valid_until="2026-10-31", **fields)
+                    report = global_check(cand, base)
+                    self.assertFalse(report.ok)
+                    self.assertTrue(any(path in e and f"{key} длиннее" in e
+                                        for e in report.errors), report.errors)

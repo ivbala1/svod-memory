@@ -99,8 +99,8 @@ def out(root: Path, *args: str, **kw) -> str:
     return git(root, *args, **kw).stdout.decode("utf-8", "replace").strip()
 
 
-def git_dir(root: Path) -> Path:
-    path = Path(out(root, "rev-parse", "--git-dir"))
+def git_dir(root: Path, *, timeout: float = GIT_TIMEOUT_SEC) -> Path:
+    path = Path(out(root, "rev-parse", "--git-dir", timeout=timeout))
     return path if path.is_absolute() else (root / path).resolve()
 
 
@@ -114,15 +114,16 @@ def is_repo(root: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Ссылки, деревья, объекты
 
-def rev(root: Path, name: str) -> str | None:
-    result = git(root, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}", check=False)
+def rev(root: Path, name: str, *, timeout: float = GIT_TIMEOUT_SEC) -> str | None:
+    result = git(root, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}", check=False,
+                 timeout=timeout)
     if result.returncode != 0:
         return None
     return result.stdout.decode().strip()
 
 
-def head(root: Path) -> str | None:
-    return rev(root, "HEAD")
+def head(root: Path, *, timeout: float = GIT_TIMEOUT_SEC) -> str | None:
+    return rev(root, "HEAD", timeout=timeout)
 
 
 def branch(root: Path) -> str | None:
@@ -400,21 +401,29 @@ def scan_range(root: Path, old: str | None, new: str, scanner: str | None = None
 # Замок
 
 @contextlib.contextmanager
-def lock(root: Path, *, exclusive: bool):
+def lock(root: Path, *, exclusive: bool, wait: float | None = None):
     """flock на .git/svod.lock. Эксклюзивный ждёт до 60 секунд, дальше Busy;
-    разделяемый ждёт до 10 секунд и отдаёт управление даже без замка
-    (читатель читает всегда). Отдаёт True, если замок взят; False, если
+    разделяемый ждёт до 10 секунд (или `wait`: остаток общего срока
+    читателя на все корни) и отдаёт управление даже без замка; что делать
+    без замка, решает читатель. Отдаёт True, если замок взят; False, если
     замок есть, но не взят (срок вышел, файл не открывается); None, если
     замка у корня нет (выложенное дерево, фикстура без git)."""
-    limit = EXCLUSIVE_WAIT_SEC if exclusive else SHARED_WAIT_SEC
+    limit = wait if wait is not None else EXCLUSIVE_WAIT_SEC if exclusive else SHARED_WAIT_SEC
     path = None
     try:
         # Обычный клон: каталог .git известен без подпроцесса; читатель берёт
         # замок на каждый корень федерации на каждом запросе.
-        path = ((root / ".git") if (root / ".git").is_dir() else git_dir(root)) / LOCK_NAME
-    except GitError:
+        # Читатель ищет каталог git в пределах своего срока, а не 60 с
+        # (ревью 11.10.2026).
+        path = ((root / ".git") if (root / ".git").is_dir() else git_dir(
+            root, timeout=GIT_TIMEOUT_SEC if exclusive else max(limit, 0.1))) / LOCK_NAME
+    except GitError as exc:
         if exclusive:
             raise
+        if isinstance(exc, GitTimeout):
+            # Git не ответил в срок: замок не взят, а не «замка нет».
+            yield False
+            return
     if path is None:
         # Читатель без git-репозитория (выложенное дерево, фикстура) читает без замка.
         yield None
@@ -422,12 +431,20 @@ def lock(root: Path, *, exclusive: bool):
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as exc:
-        # Неписаный клон: замка у читателя здесь нет (None, как без git),
-        # писателю отказ словами. False остаётся за занятым замком.
         if exclusive:
             raise GitError(f"{root}: замок {path.name} не открывается: {exc}") from exc
-        yield None
-        return
+        # Файл замка есть, но на запись не открывается: разделяемый flock
+        # берётся и на дескрипторе только для чтения, а неоткрываемый файл
+        # это «не взят», иначе хук читал бы под писателем (ревью 11.10.2026).
+        # Файла нет и не создаётся (неписаный клон): замка нет, None как без git.
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            yield None
+            return
+        except OSError:
+            yield False
+            return
     taken = False
     try:
         deadline = time.monotonic() + limit
