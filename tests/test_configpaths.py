@@ -127,12 +127,41 @@ class ПересдачаТочки(unittest.TestCase):
             self.assertEqual(json.loads(git("show", "HEAD^:eval_baseline.json")), {"old": 1})
             self.assertEqual(git("show", ":unrelated"), "staged")
             self.assertEqual((root / "unrelated").read_text(), "unstaged")
-            self.assertIn("закоммичено локально", notes)
-            self.assertTrue(any("не отправлено" in n for n in notes))
+            self.assertTrue(any(n.startswith("закоммичено локально") for n in notes))
+            self.assertFalse(any("отправлено" in n or "опубликовано" in n for n in notes))
             self.assertEqual(list(root.glob("eval_baseline.*.json")), [])
 
-    def test_push_failure_is_named_and_commit_survives(self):
-        from unittest import mock
+    def test_commit_only_no_push_even_with_remote(self):
+        """Точка лежит в подкаталоге технического репозитория: отправка из
+        команды унесла бы всю ветку, поэтому команда только коммитит, а
+        сервер остаётся нетронутым."""
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            def git(cwd, *args):
+                return subprocess.check_output(["git", "-C", str(cwd), *args], text=True,
+                                               stderr=subprocess.DEVNULL).strip()
+            subprocess.check_call(["git", "init", "--quiet", "--bare", "-b", "main",
+                                   str(base / "srv.git")])
+            subprocess.check_call(["git", "clone", "--quiet", str(base / "srv.git"),
+                                   str(base / "work")], stderr=subprocess.DEVNULL)
+            work = base / "work"
+            git(work, "symbolic-ref", "HEAD", "refs/heads/main")
+            git(work, "config", "user.name", "Test")
+            git(work, "config", "user.email", "test@example.invalid")
+            git(work, "config", "commit.gpgsign", "false")
+            (work / "config").mkdir()
+            (work / "config" / "eval_baseline.json").write_text('{"old": 1}\n')
+            git(work, "add", ".")
+            git(work, "commit", "--quiet", "-m", "seed")
+            git(work, "push", "--quiet", "-u", "origin", "main")
+            server_before = git(base / "srv.git", "rev-parse", "main")
+            notes = memoryeval.replace_baseline({"new": 2}, work / "config" / "eval_baseline.json")
+            self.assertEqual(json.loads(git(work, "show", "HEAD:config/eval_baseline.json")), {"new": 2})
+            self.assertEqual(git(base / "srv.git", "rev-parse", "main"), server_before)
+            self.assertNotEqual(git(work, "rev-parse", "HEAD"), server_before)
+            self.assertTrue(any("отправка обычным порядком" in n for n in notes))
+
+    def test_unchanged_baseline_makes_no_commit(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             def git(*args):
@@ -141,37 +170,14 @@ class ПересдачаТочки(unittest.TestCase):
             git("config", "user.name", "Test")
             git("config", "user.email", "test@example.invalid")
             git("config", "commit.gpgsign", "false")
-            git("remote", "add", "origin", str(root / "missing.git"))
-            notes = memoryeval.replace_baseline({"new": 2}, root / "eval_baseline.json")
-            self.assertTrue(any(n.startswith("не отправлено:") for n in notes))
-            self.assertNotIn("опубликовано", notes)
-            self.assertEqual(json.loads(git("show", "HEAD:eval_baseline.json")), {"new": 2})
-
-    def test_push_refusal_names_the_cause_not_the_hint(self):
-        """Сервер ушёл вперёд: последней строкой отказа идёт hint:, а причина
-        это строка ссылки выше неё."""
-        with tempfile.TemporaryDirectory() as d:
-            base = Path(d)
-            def git(cwd, *args):
-                return subprocess.check_output(["git", "-C", str(cwd), *args], text=True,
-                                               stderr=subprocess.DEVNULL).strip()
-            subprocess.check_call(["git", "init", "--quiet", "--bare", "-b", "main",
-                                   str(base / "srv.git")])
-            for name in ("a", "b"):
-                if name == "b":
-                    git(base / "a", "push", "--quiet", "-u", "origin", "main")
-                subprocess.check_call(["git", "clone", "--quiet", str(base / "srv.git"),
-                                       str(base / name)], stderr=subprocess.DEVNULL)
-                git(base / name, "symbolic-ref", "HEAD", "refs/heads/main")
-                git(base / name, "config", "user.name", "Test")
-                git(base / name, "config", "user.email", "test@example.invalid")
-                git(base / name, "config", "commit.gpgsign", "false")
-                (base / name / f"{name}.txt").write_text(name)
-                git(base / name, "add", ".")
-                git(base / name, "commit", "--quiet", "-m", name)
-            git(base / "b", "push", "--quiet")
-            notes = memoryeval.replace_baseline({"new": 2}, base / "a" / "eval_baseline.json")
-            self.assertIn("не отправлено: ! [rejected] main -> main (fetch first)", notes)
+            path = root / "eval_baseline.json"
+            path.write_bytes((json.dumps({"same": 1}, ensure_ascii=False, indent=1) + "\n").encode())
+            git("add", ".")
+            git("commit", "--quiet", "-m", "seed")
+            head = git("rev-parse", "HEAD")
+            notes = memoryeval.replace_baseline({"same": 1}, path)
+            self.assertEqual(git("rev-parse", "HEAD"), head)
+            self.assertIn("точка не изменилась, коммита нет", notes)
 
 
 if __name__ == "__main__":
