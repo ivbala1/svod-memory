@@ -906,9 +906,35 @@ def date_passed(fields: dict, key: str, today: dt.date) -> str | None:
         return None
 
 
+def first_place_hint(laid_out: Path, probe: str, slug: str, entries: tuple,
+                     today: dt.date, changed: set[str]) -> str | None:
+    """Кто сейчас держит первое место по крючку, не нашедшему свою запись.
+    Без этого отказ называл только пострадавшую запись, и агент 22.10.2026
+    счёл её сломанной, хотя место держала его же подаваемая запись."""
+    import memorycontext as mc
+    первое = mc.first_place(laid_out, probe, entries, today)
+    if первое is None:
+        return None
+    entry, счёт = первое
+    своя = next((e for e in entries if e.slug == f"{slug}.md"), None)
+    мой = mc._entry_score(probe, своя) if своя is not None else 0
+    вопрос = mc.score_words(probe)
+    совпали = set().union(*mc.entry_hits(вопрос, entry))
+    слова = ", ".join(t for t in вопрос if t in совпали)
+    итог = f"{счёт} против {мой}" + (
+        ", при равенстве выигрывает стоящая раньше в индексе" if счёт == мой else "")
+    if entry.slug in {f"{s}.md" for s in changed}:
+        return (f"первое место по этому вопросу сейчас у подаваемой записи memory/{entry.slug} "
+                f"({итог}; совпали слова вопроса: {слова}); убери эти слова из её title и "
+                f"index либо добавь слова вопроса в title или index записи memory/{slug}.md")
+    return (f"первое место по этому вопросу у memory/{entry.slug} ({итог}; совпали слова "
+            f"вопроса: {слова}); добавь слова вопроса в title или index записи "
+            f"memory/{slug}.md или перепиши её крючок")
+
+
 def probe_errors(candidate: dict[str, bytes], *,
                  root: str, topics: Topics, laid_out: Path, today: dt.date,
-                 entries: tuple) -> list[str]:
+                 entries: tuple, changed: set[str] = frozenset()) -> list[str]:
     import memorycontext as mc
     errors: list[str] = []
     client = client_name(root)
@@ -954,6 +980,8 @@ def probe_errors(candidate: dict[str, bytes], *,
                                              whitelist=topics.second_place)
             found = f"{slug}.md" in {entry.slug for entry, _ in chosen}
             hint = "отбор роутера по индексу его не выбирает; перепиши крючок или строку index"
+            if not found:
+                hint = first_place_hint(laid_out, probe, slug, entries, today, changed) or hint
         elif spec is None:
             continue
         else:
@@ -974,6 +1002,50 @@ def probe_errors(candidate: dict[str, bytes], *,
         if not found:
             errors.append(f"{label}: крючок «{probe}» не находит запись: {hint}")
     return errors
+
+
+# Счёт первого места, который новая запись набирает одним словом вопроса в
+# заголовке и одним-двумя в index (4 + 1, 4 + 2). Запись про Immich держалась
+# на 5, и новая запись с тем же счётом отняла её крючок (22.10.2026); таких
+# было 18 из 249, а ничьих с существующими записями только 8.
+WEAK_FIRST_PLACE = 6
+
+
+def probe_weak_warnings(candidate: dict[str, bytes], changed: set[str], *,
+                        laid_out: Path, today: dt.date, entries: tuple) -> list[str]:
+    """Изменённая запись личного корня берёт свой крючок первым местом на
+    ничьей или со слабым счётом. Только предупреждение: новая запись с тем же
+    счётом, стоящая в индексе раньше, займёт первое место, и если эта запись
+    не пройдёт вторым местом (BM25), подача новой получит отказ за неё."""
+    import memorycontext as mc
+    warnings: list[str] = []
+    записи = _records(candidate)
+    for slug in sorted(changed):
+        fields, error = parse_frontmatter(записи.get(slug, ""))
+        probe = "" if error else fields.get("probe", "").strip()
+        if (not probe or fields.get("listed") == "false"
+                or date_passed(fields, "valid_until", today)):
+            continue
+        первое = mc.first_place(laid_out, probe, entries, today)
+        if первое is None or первое[0].slug != f"{slug}.md":
+            continue
+        соперники = [e.slug for e in entries if e.slug != f"{slug}.md"
+                     and mc._entry_score(probe, e) == первое[1]
+                     and not mc._entry_expired(laid_out, e, today)]
+        if соперники:
+            ещё = f" и ещё {len(соперники) - 1}" if len(соперники) > 1 else ""
+            warnings.append(
+                f"memory/{slug}.md: крючок берёт первое место только на ничьей ({первое[1]}) "
+                f"с memory/{соперники[0]}{ещё}: при равенстве решает место в индексе, и такое "
+                "первое место уязвимо; добавь в title или index слово, которым об этом спросят")
+        elif первое[1] <= WEAK_FIRST_PLACE:
+            warnings.append(
+                f"memory/{slug}.md: крючок берёт первое место со слабым счётом ({первое[1]}): "
+                "новая запись, у которой с этим вопросом совпадут одно слово заголовка и "
+                "одно-два слова index и которая встанет в индексе раньше, займёт его; если эта "
+                "запись не пройдёт и вторым местом, подача новой получит отказ; добавь в title "
+                "или index слово, которым об этом спросят")
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1387,17 +1459,22 @@ def check(candidate: dict[str, bytes], base: dict[str, bytes] | None, *,
         # крючки, и предупреждение о доставке.
         entries = (mc.parse_index(router_index_text(candidate))
                    if client_name(root) is None else ())
+        изменённые = changed_records(base, candidate)
         errors += probe_errors(candidate, root=root, topics=topics,
-                               laid_out=new_root, today=today, entries=entries)
+                               laid_out=new_root, today=today, entries=entries,
+                               changed=изменённые)
         warnings += delivery_warnings(base, candidate, root=root, laid_out=new_root,
                                       entries=entries)
+        if root == "personal":
+            warnings += probe_weak_warnings(candidate, изменённые, laid_out=new_root,
+                                            today=today, entries=entries)
         if (config.questions is not None and root == "personal"
                 and "memory/MEMORY.md" in candidate):
             # Стенд меряет отбор по индексу личного корня, в нём роутер и
             # ищет; глобальный отдаётся контрактом целиком, клиентский
             # доставляется сводкой, его проверяют крючки.
             errors += stand_errors(old_root, new_root, config.questions, today, warnings,
-                                   changed_records(base, candidate), topics.second_place)
+                                   изменённые, topics.second_place)
     if root == "global":
         errors += contract_errors(candidate, base)
         warnings += client_name_warnings(candidate, topics, svodgit.federation_members(config.topics))

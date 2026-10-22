@@ -289,6 +289,107 @@ class ProbeTests(unittest.TestCase):
         report = check(cand, base)
         self.assertTrue(any("не находит запись" in e for e in report.errors), report.errors)
 
+    def _twin(self) -> bytes:
+        """Запись с тем же заголовком и index, что у reference_printer: по
+        любому вопросу ничья, и раздел Feedback стоит в индексе раньше."""
+        return record("feedback_printer_twin", type="feedback", title="Зелёный принтер",
+                      index="как чинить зелёный принтер", source="разговор",
+                      observed_at="2026-09-04", probe="зелёный принтер чем чинить")
+
+    def test_refusal_names_submitted_record_holding_first_place(self):
+        """22.10.2026 отказ называл только пострадавшую запись, и агент счёл
+        её сломанной, хотя место на ничьей держала его же подача."""
+        base = base_tree()
+        cand = dict(base)
+        cand["memory/feedback_printer_twin.md"] = self._twin()
+        report = check(cand, base)
+        отказ = next(e for e in report.errors if e.startswith("memory/reference_printer.md:"))
+        self.assertIn("первое место по этому вопросу сейчас у подаваемой записи "
+                      "memory/feedback_printer_twin.md (6 против 6, при равенстве выигрывает "
+                      "стоящая раньше в индексе; совпали слова вопроса: чинить, принтер)", отказ)
+        self.assertIn("добавь слова вопроса в title или index записи "
+                      "memory/reference_printer.md", отказ)
+        self.assertTrue(any(w.startswith("memory/feedback_printer_twin.md: крючок берёт первое "
+                                         "место только на ничьей (") for w in report.warnings),
+                        report.warnings)
+
+    def test_refusal_does_not_blame_untouched_holder(self):
+        base = base_tree()
+        base["memory/feedback_printer_twin.md"] = self._twin()
+        cand = dict(base)
+        cand["memory/user_cat.md"] = record(
+            "user_cat", type="user", title="Кот", index="как зовут кота",
+            source="разговор", observed_at="2026-09-04", probe="какое имя у кота")
+        report = check(cand, base)
+        отказ = next(e for e in report.errors if e.startswith("memory/reference_printer.md:"))
+        self.assertIn("первое место по этому вопросу у memory/feedback_printer_twin.md", отказ)
+        self.assertIn("добавь слова вопроса в title или index записи "
+                      "memory/reference_printer.md", отказ)
+        self.assertNotIn("подаваемой", отказ)
+        self.assertFalse(any("на ничьей" in w for w in report.warnings), report.warnings)
+
+    def test_archived_holder_is_not_called_submitted(self):
+        """Держатель из архива с тем же именем, что у изменённой записи, не
+        подаваемая запись: сравнивается путь целиком (ревью Codex 22.10.2026)."""
+        import memorycontext as mc
+        entries = mc.parse_index(PREAMBLE + "- [Зелёный принтер](archive/reference_printer_twin.md)"
+                                            " - как чинить зелёный принтер\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            hint = mv.first_place_hint(Path(tmp), "чем чинить принтер", "reference_printer",
+                                       entries, TODAY, {"reference_printer_twin"})
+        self.assertIn("первое место по этому вопросу у memory/archive/reference_printer_twin.md",
+                      hint)
+        self.assertNotIn("подаваемой", hint)
+
+    def test_weak_first_place_warns_without_tie(self):
+        """Крючок без ничьей, но со счётом 5 (слово заголовка и слово index)
+        новая запись с тем же счётом отберёт: так 22.10.2026 потеряла крючок
+        запись про Immich. Сильный крючок молчит."""
+        def kettle(title: str, index: str, probe: str) -> dict[str, bytes]:
+            cand = base_tree()
+            cand["memory/reference_kettle.md"] = record(
+                "reference_kettle", type="reference", title=title, index=index,
+                source="разговор", observed_at="2026-09-04", probe=probe,
+                body="Накипь снимается лимонной кислотой.\n")
+            return cand
+        слабый = check(kettle("Чайник на кухне", "накипь", "чем снять накипь в чайнике"),
+                       base_tree())
+        self.assertTrue(слабый.ok, слабый.errors)
+        self.assertTrue(any(w.startswith("memory/reference_kettle.md: крючок берёт первое место "
+                                         "со слабым счётом (5)") for w in слабый.warnings),
+                        слабый.warnings)
+        сильный = check(kettle("Накипь в чайнике", "лимонная кислота",
+                               "чем снять накипь в чайнике лимонной кислотой"), base_tree())
+        self.assertTrue(сильный.ok, сильный.errors)
+        self.assertFalse(any("reference_kettle.md: крючок берёт первое место" in w
+                             for w in сильный.warnings), сильный.warnings)
+        # Граница WEAK_FIRST_PLACE: 6 ещё слабый, 7 уже нет (ревью Codex 23.10.2026).
+        шесть = check(kettle("Чайник на кухне", "накипь, лимонная",
+                             "чем снять накипь в чайнике лимонной"), base_tree())
+        self.assertTrue(any("со слабым счётом (6)" in w for w in шесть.warnings), шесть.warnings)
+        семь = check(kettle("Чайник на кухне", "накипь, лимонная, кислота",
+                            "чем снять накипь в чайнике лимонной кислотой"), base_tree())
+        self.assertTrue(семь.ok, семь.errors)
+        self.assertFalse(any("reference_kettle.md: крючок берёт первое место" in w
+                             for w in семь.warnings), семь.warnings)
+
+    def test_tie_warns_above_weak_score(self):
+        """Ничья предупреждает и при счёте выше слабого: при равенстве решает
+        место в индексе, а не счёт."""
+        base = base_tree()
+        base["memory/reference_kettle_twin.md"] = record(
+            "reference_kettle_twin", type="reference", title="Накипь в чайнике", index="посуда",
+            body="Накипь снимается лимонной кислотой.\n")
+        cand = dict(base)
+        cand["memory/feedback_kettle.md"] = record(
+            "feedback_kettle", type="feedback", title="Накипь в чайнике", index="уксус",
+            source="разговор", observed_at="2026-09-04",
+            probe="чем снять накипь из старого чайника")
+        report = check(cand, base)
+        self.assertTrue(any(w.startswith("memory/feedback_kettle.md: крючок берёт первое место "
+                                         "только на ничьей (10)") for w in report.warnings),
+                        report.warnings)
+
     def test_tautology_is_red(self):
         report = check(self._tree("как чинить зелёный принтер"), base_tree())
         self.assertTrue(any("повторяет" in e for e in report.errors), report.errors)

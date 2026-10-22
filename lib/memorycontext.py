@@ -944,6 +944,21 @@ def second_place_candidates(root: Path, entries: tuple[IndexEntry, ...],
                                   if e.slug not in в_индексе)
 
 
+def first_place(root: Path, prompt: str, entries: tuple[IndexEntry, ...],
+                today: dt.date) -> tuple[IndexEntry, int] | None:
+    """Первое место отбора: лучший счёт не ниже порога, ничью решает место в
+    индексе (раздел преамбулы, затем имя), истёкшие пропускаются. Одно на
+    роутер и на объяснения писателя, чтобы они не расходились."""
+    по_индексу = sorted(((e, _entry_score(prompt, e)) for e in entries),
+                        key=lambda пара: (-пара[1], пара[0].index))
+    for entry, score in по_индексу:
+        if score < SELECT_THRESHOLD:
+            return None
+        if not _entry_expired(root, entry, today):
+            return entry, score
+    return None
+
+
 def select_index_entries(
     root: Path,
     prompt: str,
@@ -972,16 +987,8 @@ def select_index_entries(
     свою версию конфигурации).
     """
     сегодня = today if today is not None else today_utc()
-    выбрано: list[tuple[IndexEntry, int]] = []
-    по_индексу = sorted(((e, _entry_score(prompt, e)) for e in entries),
-                        key=lambda пара: (-пара[1], пара[0].index))
-    for entry, score in по_индексу:
-        if score < SELECT_THRESHOLD:
-            break
-        if _entry_expired(root, entry, сегодня):
-            continue
-        выбрано.append((entry, score))
-        break
+    первое = first_place(root, prompt, entries, сегодня)
+    выбрано: list[tuple[IndexEntry, int]] = [первое] if первое else []
     занято = {entry.slug for entry, _ in выбрано}
     кандидаты = second_place_candidates(root, entries, whitelist)
     по_слагу = {e.slug: e for e in кандидаты}
