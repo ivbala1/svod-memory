@@ -871,10 +871,11 @@ class GitToolsTests(Base):
 
     def silent_ssh(self, root: Path) -> Path:
         """origin по ssh, а ssh молчит, как при неподтверждённом окне
-        ssh-агента. Отдаёт файл, куда ssh запишет свой pid."""
-        pid_file = self.fed.base / "ssh.pid"
+        ssh-агента. Отдаёт путь поддельного ssh: он свой у каждого теста."""
         fake = self.fed.base / "silent-ssh"
-        fake.write_text(f"#!/bin/sh\necho $$ > '{pid_file}'\nexec sleep 600\n")
+        # Оболочка ждёт sleep, а не заменяется им: пока ssh жив, путь
+        # подделки виден в её командной строке.
+        fake.write_text("#!/bin/sh\nsleep 600\nexit\n")
         fake.chmod(0o755)
         sh(root, "remote", "set-url", "origin", "ssh://git@example.invalid/personal.git")
         patches = [mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": str(fake)}),
@@ -882,42 +883,45 @@ class GitToolsTests(Base):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        return pid_file
+        return fake
 
-    def assert_gone(self, pid_file: Path) -> None:
-        pid = int(pid_file.read_text())
+    def assert_gone(self, fake: Path) -> None:
+        # Поиск по пути, а не по pid: под нагрузкой git гасится раньше, чем
+        # ssh записал бы pid, а номер мог бы занять чужой процесс. pgrep есть
+        # и на macOS, где нет /proc; у зомби вместо командной строки имя, пути
+        # в нём нет. Шаблон pgrep это регулярное выражение, поэтому берётся
+        # только имя каталога от tempfile: в TMPDIR могут быть метасимволы.
+        marker = f"{fake.parent.name}/{fake.name}"
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            except (ProcessLookupError, FileNotFoundError):
+            found = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)
+            if found.returncode == 1:
                 return
-            if state == "Z":
-                return
+            self.assertEqual(found.returncode, 0, found.stderr)
             time.sleep(0.1)
-        self.fail(f"ssh {pid} пережил git")
+        self.fail(f"ssh {' '.join(found.stdout.split())} пережил git")
 
     def test_silent_ssh_is_no_network_and_dies_with_git(self):
         root = self.fed.root("a")
-        pid_file = self.silent_ssh(root)
+        fake = self.silent_ssh(root)
         started = time.monotonic()
         fetched, why = svodgit.fetch(root)
         self.assertFalse(fetched)
         self.assertIn("не ответил", why)
         self.assertLess(time.monotonic() - started, 10)
-        self.assert_gone(pid_file)
+        self.assert_gone(fake)
 
     def test_writer_behind_silent_ssh_commits_locally_and_frees_the_lock(self):
         root = self.fed.root("a")
-        pid_file = self.silent_ssh(root)
+        fake = self.silent_ssh(root)
         head = svodgit.head(root)
         code, result = self.fed.remember("a", "personal", "kettle-1", NEW_BODY,
                                          {"record_slug": "reference_kettle"})
         self.assertEqual(code, mr.EXIT_PENDING, result)
         self.assertIn("сети нет", result["reason"])
+        self.assertTrue(any("не ответил" in note for note in result["notes"]), result["notes"])
         self.assertNotEqual(svodgit.head(root), head)
-        self.assert_gone(pid_file)
+        self.assert_gone(fake)
         with mock.patch.object(svodgit, "EXCLUSIVE_WAIT_SEC", 0.5), \
              svodgit.lock(root, exclusive=True) as taken:
             self.assertTrue(taken)
