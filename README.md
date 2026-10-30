@@ -53,7 +53,7 @@ does not depend on any particular corpus.
 
 ## Requirements
 
-Linux or macOS, Python 3.10+, Git, and gitleaks supporting `detect` and
+Linux or macOS, Python 3.14+, Git, and gitleaks supporting `detect` and
 `git`. Python dependencies are from the standard library. Local drills
 have been exercised with gitleaks 8.30.1. Git credentials and agent
 configuration are managed separately.

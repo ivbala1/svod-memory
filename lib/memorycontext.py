@@ -1269,6 +1269,18 @@ PEER_PROMPT_PREFIXES = ("Another Claude session sent a message",
 PROMPT_SOURCE_FIELDS = ("source", "prompt_source", "promptSource")
 
 
+# Настольное приложение Claude ставит перед репликой свои напоминания
+# (связанные сессии, отчёт сессии): их слова отбирали записи мимо темы
+# (замер 30.10.2026, 260 реплик мака с 09.10, все в начале реплики).
+APP_REMINDER_RE = re.compile(r"\s*<system-reminder>.*?</system-reminder>\s*", re.DOTALL)
+
+
+def without_app_reminders(prompt: str) -> str:
+    while (напоминание := APP_REMINDER_RE.match(prompt)):
+        prompt = prompt[напоминание.end():]
+    return prompt
+
+
 def service_prompt(prompt: str, payload: dict | None = None) -> bool:
     текст = prompt.lstrip()
     if текст.startswith(SERVICE_PROMPT_PREFIXES):
@@ -2130,8 +2142,9 @@ def handle_session(payload: dict, root: Path, state_dir: Path) -> dict:
 def handle_prompt(payload: dict, root: Path, state_dir: Path) -> dict:
     срок = time.monotonic() + HOOK_BUDGET_SEC
     try:
-        prompt = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
-        if service_prompt(prompt, payload):
+        исходная = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
+        prompt = without_app_reminders(исходная)
+        if service_prompt(prompt, payload) or (исходная.strip() and not prompt.strip()):
             # Служебной реплике память ничего не добавляет: ни записей, ни
             # следа маршрута. Контракт и инбокс уйдут со следующей репликой.
             return {}

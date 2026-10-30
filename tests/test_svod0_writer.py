@@ -1113,20 +1113,21 @@ class SplitTests(Base):
 class ReviewRegressionTests(Base):
     """Ревью публикации 07.09.2026: каждый тест это воспроизведённый дефект."""
 
-    def _older_pythons(self) -> list[str]:
+    def _minimum_pythons(self) -> list[str]:
+        # Минимум Свода 3.14 (29.10.2026, ПК на Ubuntu 26.04); на маке
+        # python3 новее, и код под него не должен ломать ПК.
         found = []
-        for name in ("python3.10", "python3.11"):
-            path = shutil.which(name)
-            if path:
-                found.append(path)
-        for path in sorted(Path.home().glob(".local/share/uv/python/cpython-3.1[01]*/bin/python3.1?")):
+        path = shutil.which("python3.14")
+        if path:
+            found.append(path)
+        for path in sorted(Path.home().glob(".local/share/uv/python/cpython-3.14*/bin/python3.14")):
             found.append(str(path))
         return found
 
-    def test_sources_compile_on_python_310_and_311(self):
-        interpreters = self._older_pythons()
+    def test_sources_compile_on_minimum_python(self):
+        interpreters = self._minimum_pythons()
         if not interpreters:
-            self.skipTest("нет интерпретатора 3.10/3.11 для проверки синтаксиса")
+            self.skipTest("нет интерпретатора 3.14 для проверки синтаксиса")
         files = [f for f in (*(REPO_SOURCE / "lib").glob("*.py"), *(REPO_SOURCE / "bin").iterdir(),
                              *(REPO_SOURCE / "githooks").iterdir(), *(REPO_SOURCE / "tests").glob("*.py"))
                  if f.is_file()]
