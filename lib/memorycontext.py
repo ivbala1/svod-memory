@@ -1259,7 +1259,11 @@ def scheduled_run() -> bool:
 # Сообщение соседнего агента, сессии или канала тоже пишет не человек:
 # ни записей по его словам, ни меток и в закреплённой сессии. Плановое
 # пробуждение (loop, schedule) сюда не входит (решение владельца 12.10.2026).
-SERVICE_PROMPT_PREFIXES = ("<task-notification>",)
+# События настольного приложения: связанные сессии, сообщения между сессиями,
+# слежение за PR (замер 30.10.2026: к месту 5 различий из 118). Поле источника
+# у них не проверено, поэтому они здесь, а не в списке соседей.
+SERVICE_PROMPT_PREFIXES = ("<task-notification>", "<side-sessions-event>",
+                           "<ci-monitor-event>", "<cross-session-message ")
 # Сообщения соседних агентов, сессий и каналов (решение владельца 12.10.2026).
 PEER_PROMPT_PREFIXES = ("Another Claude session sent a message",
                         "The coordinator sent a message", "<agent-message ",
